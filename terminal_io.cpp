@@ -1,12 +1,71 @@
 #include "terminal_io.h"
 #include "terminal_hooks.h"
 #include "stdlib_hooks.h"
+#include "xhci.h"
 
 // Global terminal I/O object
 TerminalIO kout;
 
 // Global formatting state
 bool use_hex = false;
+
+// USB input mode
+bool TerminalIO::usb_input_mode = false;
+
+// USB integration methods
+void TerminalIO::enable_usb_input() {
+    extern bool usb_keyboard_active;
+    if (usb_keyboard_active) {
+        usb_input_mode = true;
+        //cout << "USB keyboard input enabled\n";
+    }
+}
+
+void TerminalIO::disable_usb_input() {
+    usb_input_mode = false;
+    ///cout << "USB keyboard input disabled\n";
+}
+
+bool TerminalIO::is_usb_input_enabled() {
+    return usb_input_mode;
+}
+
+// Modified keyboard input function
+TerminalIO& TerminalIO::operator>>(char* str) {
+    // Check if USB keyboard should be used
+    extern bool usb_keyboard_active;
+    
+    if (usb_input_mode && usb_keyboard_active) {
+        // Use USB keyboard input
+        extern bool input_ready;
+        char input_buffer[256];
+        
+        input_ready = false;
+        
+        // Poll USB keyboard until input is ready
+        while (!input_ready) {
+            poll_usb_keyboard();
+            // Small delay to prevent excessive CPU usage
+            for (volatile int i = 0; i < 1000; i++);
+        }
+        
+        strcpy(str, input_buffer);
+    } else {
+        // Use PS/2 keyboard input (existing implementation)
+        extern bool input_ready;
+        char input_buffer[256];
+        
+        input_ready = false;
+        
+        while (!input_ready) {
+            asm volatile ("hlt");
+        }
+        
+        strcpy(str, input_buffer);
+    }
+    
+    return *this;
+}
 
 // Integer input function
 TerminalIO& TerminalIO::operator>>(int& num) {
@@ -18,13 +77,11 @@ TerminalIO& TerminalIO::operator>>(int& num) {
     bool negative = false;
     int i = 0;
     
-    // Check for negative sign
     if (buffer[0] == '-') {
         negative = true;
         i = 1;
     }
     
-    // Process digits
     while (buffer[i] >= '0' && buffer[i] <= '9') {
         num = num * 10 + (buffer[i] - '0');
         i++;
@@ -42,11 +99,9 @@ TerminalIO& TerminalIO::operator>>(unsigned int& num) {
     char buffer[32];
     *this >> buffer;
     
-    // Simple string to unsigned integer conversion
     num = 0;
     int i = 0;
     
-    // Process digits
     while (buffer[i] >= '0' && buffer[i] <= '9') {
         num = num * 10 + (buffer[i] - '0');
         i++;
@@ -71,7 +126,7 @@ TerminalIO& dec(TerminalIO& stream) {
     return stream;
 }
 
-// Output operators
+// Output operators (keep existing implementations)
 TerminalIO& TerminalIO::operator<<(const char* str) {
     while (*str) {
         terminal_putchar(*str++);
@@ -86,122 +141,100 @@ TerminalIO& TerminalIO::operator<<(char c) {
 
 TerminalIO& TerminalIO::operator<<(int num) {
     if (use_hex) {
-        // Print in hexadecimal
-        char buffer[12];  // Enough for 32-bit hex
+        char buffer[12];
         int i = 0;
         
-        // Handle 0 specially
         if (num == 0) {
             terminal_putchar('0');
             return *this;
         }
         
-        // Handle negative numbers
         if (num < 0) {
             terminal_putchar('-');
             num = -num;
         }
         
-        // Convert digits
         while (num > 0) {
             int digit = num % 16;
             buffer[i++] = digit < 10 ? '0' + digit : 'a' + (digit - 10);
             num /= 16;
         }
         
-        // Print in reverse order
         while (--i >= 0) {
             terminal_putchar(buffer[i]);
         }
     } else {
-        // Print in decimal
-        char buffer[12];  // Enough for 32-bit int
+        char buffer[12];
         int i = 0;
         
-        // Handle 0 specially
         if (num == 0) {
             terminal_putchar('0');
             return *this;
         }
         
-        // Handle negative numbers
         if (num < 0) {
             terminal_putchar('-');
             num = -num;
         }
         
-        // Convert digits
         while (num > 0) {
             buffer[i++] = '0' + (num % 10);
             num /= 10;
         }
         
-        // Print in reverse order
         while (--i >= 0) {
             terminal_putchar(buffer[i]);
         }
     }
-    
     return *this;
 }
 
 TerminalIO& TerminalIO::operator<<(unsigned int num) {
     if (use_hex) {
-        // Print in hexadecimal
-        char buffer[12];  // Enough for 32-bit hex
+        char buffer[12];
         int i = 0;
         
-        // Handle 0 specially
         if (num == 0) {
             terminal_putchar('0');
             return *this;
         }
         
-        // Convert digits
         while (num > 0) {
             int digit = num % 16;
             buffer[i++] = digit < 10 ? '0' + digit : 'a' + (digit - 10);
             num /= 16;
         }
         
-        // Print in reverse order
         while (--i >= 0) {
             terminal_putchar(buffer[i]);
         }
     } else {
-        // Print in decimal
-        char buffer[12];  // Enough for 32-bit unsigned
+        char buffer[12];
         int i = 0;
         
-        // Handle 0 specially
         if (num == 0) {
             terminal_putchar('0');
             return *this;
         }
         
-        // Convert digits
         while (num > 0) {
             buffer[i++] = '0' + (num % 10);
             num /= 10;
         }
         
-        // Print in reverse order
         while (--i >= 0) {
             terminal_putchar(buffer[i]);
         }
     }
-    
     return *this;
 }
 
 TerminalIO& TerminalIO::operator<<(long num) {
-    // Implementation similar to int version, but handles the larger size
-    return operator<<(static_cast<int>(num));  // Simplified for example
+    return operator<<(static_cast<int>(num));
 }
 
 TerminalIO& TerminalIO::operator<<(unsigned long num) {
-    // Implementation similar to unsigned int version, but handles the larger size
-    return operator<<(static_cast<unsigned int>(num));  // Simplified for example
+    return operator<<(static_cast<unsigned int>(num));
 }
 
 TerminalIO& TerminalIO::operator<<(void* ptr) {
@@ -211,43 +244,13 @@ TerminalIO& TerminalIO::operator<<(void* ptr) {
     }
     
     *this << "0x";
-    
-    // Store current format and switch to hex
     bool old_hex = use_hex;
     use_hex = true;
-    
-    // Print the pointer value
-    *this << reinterpret_cast<unsigned int>(ptr);
-    
-    // Restore format
+    *this << reinterpret_cast<uintptr_t>(ptr);
     use_hex = old_hex;
-    
     return *this;
 }
 
-// Handle manipulators (like endl, hex, dec)
 TerminalIO& TerminalIO::operator<<(ManipulatorFunc func) {
     return func(*this);
-}
-
-// Keyboard input function
-TerminalIO& TerminalIO::operator>>(char* str) {
-    // Reset the input ready flag
-    input_ready = false;
-    
-    // Display prompt to indicate input is expected
-    *this << "> ";
-    
-    // Wait for the keyboard handler to set input_ready flag
-    // This will be set when the user presses Enter
-    while (!input_ready) {
-        // Use hlt instruction to wait efficiently for interrupts
-        asm volatile ("hlt");
-    }
-    
-    // Copy the input buffer to the provided string
-    strcpy(str, input_buffer);
-    
-    // Return this object for chaining
-    return *this;
 }

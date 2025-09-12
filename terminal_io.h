@@ -10,6 +10,9 @@ typedef TerminalIO& (*ManipulatorFunc)(TerminalIO&);
 
 // Terminal IO class for stream-like IO
 class TerminalIO {
+private:
+    static bool usb_input_mode;
+
 public:
     // Output operators
     TerminalIO& operator<<(const char* str);
@@ -20,11 +23,16 @@ public:
     TerminalIO& operator<<(unsigned long num);
     TerminalIO& operator<<(void* ptr);
     TerminalIO& operator<<(ManipulatorFunc func);
-    
-    // Input operators
+
+    // Input operators (USB-aware)
     TerminalIO& operator>>(char* str);
     TerminalIO& operator>>(int& num);
     TerminalIO& operator>>(unsigned int& num);
+    
+    // USB integration
+    static void enable_usb_input();
+    static void disable_usb_input();
+    static bool is_usb_input_enabled();
 };
 
 // Terminal I/O manipulators

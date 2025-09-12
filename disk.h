@@ -274,9 +274,6 @@ uint64_t disk_init() {
                         print_hex(" Vendor ID: ", vendor_id); // Assuming print_hex handles width ok
                         print_hex(" Device ID: ", device_id);
 
-                        cout << "\nPress enter to continue...\n\n";
-                        char input[2]; // Allow for potential newline char
-                        cin >> input; // Read a line to consume potential newline
                     }
                 }
             }
