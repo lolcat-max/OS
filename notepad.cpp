@@ -315,9 +315,7 @@ void notepad_move_cursor(int delta_row, int delta_col) {
     if (cursor_col > line_len) cursor_col = line_len;
     if (cursor_col < 0) cursor_col = 0;
     if (cursor_col > MAX_LINE_LENGTH) cursor_col = MAX_LINE_LENGTH;
-}
-
-void notepad_save_and_exit(const char* filename_arg) {
+}void notepad_save_and_exit(const char* filename_arg) {
     char final_filename[256];
     if (filename_arg && filename_arg[0] != '\0') {
         simple_strcpy(final_filename, filename_arg);
@@ -343,6 +341,7 @@ void notepad_save_and_exit(const char* filename_arg) {
     } else {
         notepad_write_string_at(24, 0, "Error saving! Press any key.", 0x0C);
     }
+    // REMOVED the early return statements!
 
     // Wait for a key press before exiting
     while(inb(0x64) & 0x01) inb(0x60); // Clear keyboard buffer
@@ -352,8 +351,9 @@ void notepad_save_and_exit(const char* filename_arg) {
     notepad_running = false;
     terminal_clear_screen();
     terminal_draw_header();
-    // This is where you would restore the terminal's state if needed
 }
+
+
 
 void notepad_load_file(const char* filename) {
     notepad_clear_buffer();

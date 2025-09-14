@@ -89,7 +89,6 @@ extern "C" void keyboard_handler() {
     }
 
     if (scancode == SCANCODE_ESC) {
-		command_prompt();
         outb(0x20, 0x20);
         return;
     }
