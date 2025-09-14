@@ -11,6 +11,7 @@ struct idt_entry idt[256];
 struct idt_ptr idtp;
 struct gdt_entry gdt[3];
 struct gdt_ptr gdtp;
+extern bool usb_keyboard_active; // Add this near the top of interrupts.cpp
 
 // --- KEYBOARD STATE ---
 static bool shift_pressed = false;
@@ -61,6 +62,14 @@ const char extended_scancode_table[128] = {
 // COMPLETELY REPLACE keyboard_handler() function
 extern "C" void keyboard_handler() {
     uint8_t scancode = inb(0x60);
+
+	
+	if (usb_keyboard_active) {
+        inb(0x60); // Clear the scancode to prevent buffer overflow
+        outb(0x20, 0x20); // Send EOI
+        return;
+    }
+    
     
     // Check for extended key code (0xE0)
     if (scancode == 0xE0) {
