@@ -10,6 +10,7 @@
 
 // --- Low-level I/O Functions ---
 
+
 static void outl(uint16_t port, uint32_t value) {
     asm volatile ("outl %0, %1" : : "a"(value), "Nd"(port));
 }
@@ -21,6 +22,36 @@ static uint32_t inl(uint16_t port) {
 }
 
 // --- PCI Configuration Space Access ---
+
+
+
+// PCI Configuration Functions - Add these if they're missing from your pci.cpp
+uint32_t read_pci_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | ((uint32_t)device << 11) | 
+                      ((uint32_t)function << 8) | (offset & 0xFC);
+    outl(0xCF8, address);
+    return inl(0xCFC);
+}
+
+void write_pci_config_dword(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value) {
+    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | ((uint32_t)device << 11) | 
+                      ((uint32_t)function << 8) | (offset & 0xFC);
+    outl(0xCF8, address);
+    outl(0xCFC, value);
+}
+
+uint16_t read_pci_config_word(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    uint32_t dword = read_pci_config_dword(bus, device, function, offset);
+    return (uint16_t)((dword >> ((offset & 2) * 8)) & 0xFFFF);
+}
+
+void write_pci_config_word(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint16_t value) {
+    uint32_t dword = read_pci_config_dword(bus, device, function, offset);
+    uint32_t shift = (offset & 2) * 8;
+    dword = (dword & ~(0xFFFF << shift)) | ((uint32_t)value << shift);
+    write_pci_config_dword(bus, device, function, offset, dword);
+}
+
 
 uint32_t pci_read_config_dword(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset) {
     uint32_t address;

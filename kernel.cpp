@@ -851,6 +851,7 @@ void command_prompt() {
                     else cout << "Usage: rm <filename>\n"; 
                 }
 				else if (stricmp(cmd, "kbtest") == 0) {
+					xhci_init();
 					usb_keyboard_self_test();
 				}
                 else if (stricmp(cmd, "pong") == 0) {
