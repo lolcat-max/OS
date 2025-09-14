@@ -93,5 +93,11 @@ extern usb_keyboard_report_t* keyboard_buffer;
 extern usb_keyboard_report_t last_usb_report;
 extern bool usb_caps_lock_on;
 extern uint8_t usb_keyboard_slot_id;
+void usb_keyboard_self_test();
+
+
+
+// Keyboard Self-Test Implementation for xHCI USB Driver
+// Add this function to your xhci.cpp file
 
 #endif // XHCI_H

@@ -15,16 +15,6 @@
 #include "xhci.h"
 
 
-
-// Forward declaration for the new function
-void reinit_keyboard_after_usb();
-
-// ... [Keep all your existing code unchanged until kernel_main()] ...
-
-
-void cmd_notepad(unsigned long long, int, char const*);
-
-
 // --- MACROS AND CONSTANTS ---
 #undef MAX_COMMAND_LENGTH
 #define MAX_COMMAND_LENGTH 256
@@ -36,6 +26,10 @@ void cmd_notepad(unsigned long long, int, char const*);
 #define ATTR_ARCHIVE 0x20
 #define DELETED_ENTRY 0xE5
 
+
+void usb_keyboard_self_test();
+
+void cmd_notepad(unsigned long long, int, char const*);
 
 
 static const uint32_t FAT_FREE_CLUSTER = 0x00000000;
@@ -768,7 +762,8 @@ void cmd_help() {
          << "  help, clear, pong, ls, rm, chkdsk\n"
          << "  touch <file> [content], cat <file>\n"
          << "  cp <src> <dest>, mv <old> <new>\n"
-         << "  formatfs, mount, unmount, fsinfo\n";
+         << "  formatfs, mount, unmount, fsinfo\n"
+		 << "  kbtest\n";
 }
 
 void cmd_cat(uint64_t ahci_base, int port, const char* filename) {
@@ -855,6 +850,9 @@ void command_prompt() {
                     if(arg1) fat32_remove_file(ahci_base, port, arg1); 
                     else cout << "Usage: rm <filename>\n"; 
                 }
+				else if (stricmp(cmd, "kbtest") == 0) {
+					usb_keyboard_self_test();
+				}
                 else if (stricmp(cmd, "pong") == 0) {
                   start_pong_game();
                 }
@@ -888,7 +886,6 @@ void command_prompt() {
 }
 
 
-
 // --- KERNEL ENTRY POINT ---
 extern "C" void kernel_main() {
     terminal_initialize(); 
@@ -902,17 +899,6 @@ extern "C" void kernel_main() {
     }
     
     cout << "FAT32 Filesystem Support Ready.\n\n";
-    
-    // Initialize USB subsystem
-    if (xhci_init()) {
-        cout << "USB Subsystem is online.\n";
-        // CRITICAL: Re-initialize keyboard after USB setup to prevent conflicts
-        cout << "Re-initializing PS/2 keyboard after USB setup...\n";
-        reinit_keyboard_after_usb();
-        cout << "Keyboard re-initialization complete.\n";
-    } else {
-        cout << "USB Subsystem failed to start.\n";
-    }
     
     command_prompt();
 }

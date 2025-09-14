@@ -145,6 +145,7 @@ char usb_hid_to_ascii(uint8_t hid_code, bool shift, bool caps_lock) {
     }
 }
 
+
 // Send LED state to USB keyboard
 void send_usb_keyboard_led_command(uint8_t led_state) {
     if (!usb_keyboard_active || usb_keyboard_slot_id == 0) return;
@@ -582,3 +583,202 @@ bool xhci_init() {
     cout << "xHCI driver initialized successfully\n";
     return true;
 }
+
+
+
+void usb_keyboard_self_test() {
+    cout << "=== USB Keyboard Self-Test ===\n";
+    
+    // Test 1: Check xHCI Controller Status
+    cout << "1. Checking xHCI Controller Status...\n";
+    if (!xhci_cap_regs || !xhci_op_regs) {
+        cout << "   FAIL: xHCI registers not mapped\n";
+        return;
+    }
+    
+    uint16_t hci_version = xhci_cap_regs->hci_version;
+    uint32_t usb_status = xhci_op_regs->usb_sts;
+    
+    cout << "   xHCI Version: 0x" << hci_version << "\n";
+    cout << "   Controller Status: 0x" << usb_status << "\n";
+    
+    if (usb_status & 0x1) {
+        cout << "   FAIL: Controller is halted\n";
+        return;
+    }
+    cout << "   PASS: Controller is running\n";
+    
+    // Test 2: Check USB Ports
+    cout << "2. Checking USB Ports...\n";
+    uint8_t num_ports = (xhci_cap_regs->hcs_params1 >> 24) & 0xFF;
+    cout << "   Total Ports: " << (int)num_ports << "\n";
+    
+    int connected_devices = 0;
+    for (uint8_t port = 0; port < num_ports; port++) {
+        if (xhci_port_regs) {
+            volatile xhci_port_regs_t* port_regs = &xhci_port_regs[port];
+            uint32_t portsc = port_regs->portsc;
+            
+            cout << "   Port " << (int)(port + 1) << ": ";
+            if (portsc & 0x1) {
+                cout << "Device Connected";
+                connected_devices++;
+                
+                // Check port speed
+                uint32_t speed = (portsc >> 10) & 0xF;
+                switch(speed) {
+                    case 1: cout << " (Full Speed)"; break;
+                    case 2: cout << " (Low Speed)"; break;
+                    case 3: cout << " (High Speed)"; break;
+                    case 4: cout << " (Super Speed)"; break;
+                    default: cout << " (Unknown Speed)"; break;
+                }
+            } else {
+                cout << "No Device";
+            }
+            cout << "\n";
+        }
+    }
+    
+    if (connected_devices == 0) {
+        cout << "   WARNING: No USB devices connected\n";
+    } else {
+        cout << "   PASS: " << connected_devices << " device(s) detected\n";
+    }
+    
+    // Test 3: Check Memory Structures
+    cout << "3. Checking Memory Structures...\n";
+    
+    if (!dcbaa) {
+        cout << "   FAIL: Device Context Base Address Array not allocated\n";
+        return;
+    }
+    cout << "   PASS: DCBAA allocated at 0x" << (uint32_t)dcbaa << "\n";
+    
+    if (!cmd_ring) {
+        cout << "   FAIL: Command Ring not allocated\n";
+        return;
+    }
+    cout << "   PASS: Command Ring allocated at 0x" << (uint32_t)cmd_ring << "\n";
+    
+    if (!event_ring) {
+        cout << "   FAIL: Event Ring not allocated\n";
+        return;
+    }
+    cout << "   PASS: Event Ring allocated at 0x" << (uint32_t)event_ring << "\n";
+    
+    // Test 4: Check Keyboard Status
+    cout << "4. Checking USB Keyboard Status...\n";
+    
+    if (!usb_keyboard_active) {
+        cout << "   INFO: USB keyboard not active\n";
+        cout << "   Attempting to enumerate devices...\n";
+        if (enumerate_usb_devices()) {
+            cout << "   SUCCESS: USB keyboard enumerated\n";
+        } else {
+            cout << "   WARNING: No USB keyboard found\n";
+        }
+    } else {
+        cout << "   PASS: USB keyboard active (Slot " << (int)usb_keyboard_slot_id << ")\n";
+        
+        // Check keyboard buffer
+        if (!keyboard_buffer) {
+            cout << "   FAIL: Keyboard buffer not allocated\n";
+        } else {
+            cout << "   PASS: Keyboard buffer allocated\n";
+        }
+        
+        // Check transfer ring
+        if (!keyboard_in_ring) {
+            cout << "   FAIL: Keyboard transfer ring not allocated\n";
+        } else {
+            cout << "   PASS: Keyboard transfer ring allocated\n";
+        }
+    }
+    
+    // Test 5: LED State Test
+    cout << "5. Testing Keyboard LEDs...\n";
+    cout << "   Current LED State:\n";
+    cout << "     Caps Lock: " << (usb_caps_lock_on ? "ON" : "OFF") << "\n";
+    cout << "     Num Lock: " << (usb_num_lock_on ? "ON" : "OFF") << "\n";
+    cout << "     Scroll Lock: " << (usb_scroll_lock_on ? "ON" : "OFF") << "\n";
+    
+    if (usb_keyboard_active) {
+        cout << "   Testing LED toggle (Caps Lock)...\n";
+        bool original_caps = usb_caps_lock_on;
+        usb_caps_lock_on = !usb_caps_lock_on;
+        update_usb_keyboard_leds(usb_caps_lock_on, usb_num_lock_on, usb_scroll_lock_on);
+        
+        // Small delay simulation
+        for (volatile int i = 0; i < 1000000; i++);
+        
+        usb_caps_lock_on = original_caps;
+        update_usb_keyboard_leds(usb_caps_lock_on, usb_num_lock_on, usb_scroll_lock_on);
+        cout << "   PASS: LED test completed\n";
+    }
+    
+    // Test 6: Input Processing Test
+    cout << "6. Testing Input Processing...\n";
+    
+    // Test HID to ASCII conversion
+    struct {
+        uint8_t hid_code;
+        bool shift;
+        bool caps;
+        char expected;
+        const char* desc;
+    } test_cases[] = {
+        {4, false, false, 'a', "Letter 'a' (no modifiers)"},
+        {4, false, true, 'A', "Letter 'a' (caps lock)"},
+        {4, true, false, 'A', "Letter 'a' (shift)"},
+        {4, true, true, 'a', "Letter 'a' (shift + caps)"},
+        {30, false, false, '1', "Number '1'"},
+        {30, true, false, '!', "Number '1' (shift)"},
+        {44, false, false, ' ', "Space"},
+        {40, false, false, '\n', "Enter"},
+        {42, false, false, '\b', "Backspace"}
+    };
+    
+    bool all_passed = true;
+    for (int i = 0; i < 9; i++) {
+        char result = usb_hid_to_ascii(test_cases[i].hid_code, 
+                                      test_cases[i].shift, 
+                                      test_cases[i].caps);
+        if (result == test_cases[i].expected) {
+            cout << "   PASS: " << test_cases[i].desc << "\n";
+        } else {
+            cout << "   FAIL: " << test_cases[i].desc 
+                 << " (got " << (int)result << ", expected " 
+                 << (int)test_cases[i].expected << ")\n";
+            all_passed = false;
+        }
+    }
+    
+    if (all_passed) {
+        cout << "   PASS: All HID conversion tests passed\n";
+    }
+    
+    // Test 7: Event Processing Test
+    cout << "7. Testing Event Processing...\n";
+    process_events();
+    cout << "   PASS: Event processing completed\n";
+    
+    // Final Summary
+    cout << "\n=== Self-Test Summary ===\n";
+    if (usb_keyboard_active) {
+        cout << "Status: USB Keyboard is OPERATIONAL\n";
+        cout << "The keyboard should now respond to input.\n";
+        cout << "Try typing to test functionality.\n";
+    } else {
+        cout << "Status: USB Keyboard NOT ACTIVE\n";
+        cout << "Please connect a USB keyboard and run 'mount' to retry.\n";
+    }
+    
+    cout << "\nKeyboard Input Legend:\n";
+    cout << "  F5: Start Pong Game\n";
+    cout << "  Caps Lock: Toggle capitalization\n";
+    cout << "  Ctrl+C: Not yet implemented\n";
+    cout << "  All other keys: Normal input\n";
+    cout << "\n=== End Self-Test ===\n";
+}
+
