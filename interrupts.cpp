@@ -4,6 +4,8 @@
 #include "test.h"
 #include "notepad.h"
 
+#include "kernel.h"
+
 // IDT and GDT structures
 struct idt_entry idt[256];
 struct idt_ptr idtp;
@@ -82,6 +84,12 @@ extern "C" void keyboard_handler() {
         if (!is_notepad_running()) { // Don't start Pong if notepad is running
             start_pong_game();
         }
+        outb(0x20, 0x20);
+        return;
+    }
+
+    if (scancode == SCANCODE_ESC) {
+		command_prompt();
         outb(0x20, 0x20);
         return;
     }
