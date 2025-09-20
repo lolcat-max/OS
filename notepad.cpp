@@ -400,42 +400,42 @@ void notepad_handle_input(char key) {
 
 void notepad_handle_special_key(int scancode) {
     if (!notepad_running) return;
-    switch (scancode) {
-        case 0x48: // Up arrow
+
+        if (scancode == 0x48) {// Up arrow
             notepad_move_cursor(-1, 0);
-            break;
-        case 0x50: // Down arrow
+		}
+        if (scancode == 0x50) {// Down arrow
             notepad_move_cursor(1, 0);
-            break;
-        case 0x4B: // Left arrow
+		}
+        if (scancode == 0x4B) {// Left arrow
             notepad_move_cursor(0, -1);
-            break;
-        case 0x4D: // Right arrow
+		}
+        if (scancode == 0x4D) {// Right arrow
             notepad_move_cursor(0, 1);
-            break;
-        case 0x47: // Home
+		}
+        if (scancode == 0x47) {// Home
             cursor_col = 0;
-            break;
-        case 0x4F: // End
+		}
+        if (scancode == 0x4F) {// End
             cursor_col = simple_strlen(notepad_buffer[cursor_row]);
-            break;
+		}
         
         // --- CORRECTED SCROLL LOGIC ---
-        case 0x49: // Page Up
+        if (scancode == 0x49) {// Page Up
             cursor_row -= visible_lines;
             if (cursor_row < 0) cursor_row = 0;
             // No need to call redraw, notepad_update_cursor will handle it
-            break;
-        case 0x51: // Page Down
+		}
+        if (scancode == 0x51) {// Page Down
             cursor_row += visible_lines;
             if (cursor_row >= current_line_count) cursor_row = current_line_count - 1;
             // No need to call redraw, notepad_update_cursor will handle it
-            break;
+		}
 
-        case 0x01: // ESC
+        if (scancode == 0x01) {// ESC
             notepad_save_and_exit(notepad_filename);
             return; // Exit immediately, don't update cursor
-    }
+		}
     // Adjust column if new line is shorter
     int line_len = simple_strlen(notepad_buffer[cursor_row]);
     if (cursor_col > line_len) {
