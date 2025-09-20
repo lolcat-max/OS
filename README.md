@@ -4,7 +4,7 @@ limitations are: cin cannot directly accept int, use atoi afterward
 
 Features: keyboard interrupts, iostream, AHCI sata, XHCI USB(WIP), DMA, FAT32 filesystem, format, chkdsk(WIP), game engine, copy and paste file, delete, cp and mv commands. 
 
-TODO: implement notepad robustly, examine chkdsk upon mutiOS file writes and subsequent garbage, dump DMA and PCIE to file...
+TODO: implement notepad robustly(remove arrow key error), examine chkdsk upon mutiOS file writes and subsequent garbage, dump DMA and PCIE to file...
 
 Recommended: format desired drive as fat32 first then dd the drive.
 
