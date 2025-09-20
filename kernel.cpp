@@ -26,10 +26,37 @@
 #define ATTR_ARCHIVE 0x20
 #define DELETED_ENTRY 0xE5
 
-
+// ADD THESE THREE LINES RIGHT AFTER THE EXISTING FORWARD DECLARATIONS:
+void cmd_compile(uint64_t ahci_base, int port, const char* filename);
+void cmd_run(uint64_t ahci_base, int port, const char* filename);
+void cmd_exec(const char* code_text);
 void usb_keyboard_self_test();
 
 void cmd_notepad(unsigned long long, int, char const*);
+
+
+
+static inline int simple_atoi(const char* str) {
+    int result = 0;
+    bool negative = false;
+    if (*str == '-') {
+        negative = true;
+        str++;
+    }
+    while (*str >= '0' && *str <= '9') {
+        result = result * 10 + (*str - '0');
+        str++;
+    }
+    return negative ? -result : result;
+}
+
+static inline int simple_strcmp(const char* s1, const char* s2) {
+    while (*s1 && *s2 && *s1 == *s2) {
+        s1++;
+        s2++;
+    }
+    return *s1 - *s2;
+}
 
 
 static const uint32_t FAT_FREE_CLUSTER = 0x00000000;
@@ -762,10 +789,11 @@ void cmd_help() {
          << "  help, clear, pong, ls, rm, chkdsk\n"
          << "  touch <file> [content], cat <file>\n"
          << "  cp <src> <dest>, mv <old> <new>\n"
+         << "  compile <file.cpp>, run <file.obj>\n"
+         << "  exec <inline_code>\n"
          << "  formatfs, mount, unmount, fsinfo\n"
-		 << "  kbtest\n";
+         << "  kbtest\n";
 }
-
 void cmd_cat(uint64_t ahci_base, int port, const char* filename) {
     if (!filename) {
         cout << "Usage: cat <filename>\n";
@@ -827,6 +855,23 @@ void command_prompt() {
 
         // --- Command Handling ---
         if (stricmp(cmd, "help") == 0) cmd_help();
+		else if (stricmp(cmd, "compile") == 0) {
+			cmd_compile(ahci_base, port, arg1);
+		}
+		else if (stricmp(cmd, "run") == 0) {
+			cmd_run(ahci_base, port, arg1);
+		}
+		else if (stricmp(cmd, "exec") == 0) {
+			// For exec, we need to handle the rest of the line as code
+			char* code_start = line;
+			while (*code_start && *code_start != ' ') code_start++; // Skip "exec"
+			while (*code_start == ' ') code_start++; // Skip spaces
+			if (*code_start != '\0') {
+				cmd_exec(code_start);
+			} else {
+				cout << "Usage: exec <code>\n";
+			}
+		}
         else if (stricmp(cmd, "clear") == 0) terminal_clear_screen();
         else if (stricmp(cmd, "formatfs") == 0) cmd_formatfs(ahci_base, port);
         else if (stricmp(cmd, "mount") == 0) {
@@ -886,6 +931,436 @@ void command_prompt() {
     }
 }
 
+// REPLACE THE EXISTING COMPILER SYSTEM WITH THIS KERNEL-COMPATIBLE VERSION
+// This version avoids new/delete and uses static allocation instead
+
+// --- C++ COMPILER SYSTEM (KERNEL COMPATIBLE) ---
+enum TokenType {
+    TOKEN_KEYWORD, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_STRING, TOKEN_OPERATOR, TOKEN_DELIMITER, TOKEN_EOF
+};
+
+struct Token {
+    TokenType type;
+    char value[64];
+    int line;
+};
+
+class SimpleTokenizer {
+private:
+    const char* source;
+    int pos;
+    int line;
+    
+    void skip_whitespace() {
+        while (source[pos] == ' ' || source[pos] == '\t' || source[pos] == '\n' || source[pos] == '\r') {
+            if (source[pos] == '\n') line++;
+            pos++;
+        }
+    }
+    
+    bool is_digit(char c) { return c >= '0' && c <= '9'; }
+    bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+    
+    Token read_number() {
+        Token token;
+        token.type = TOKEN_NUMBER;
+        token.line = line;
+        int i = 0;
+        while (is_digit(source[pos]) && i < 63) {
+            token.value[i++] = source[pos++];
+        }
+        token.value[i] = '\0';
+        return token;
+    }
+    
+    Token read_identifier() {
+        Token token;
+        token.line = line;
+        int i = 0;
+        while ((is_alpha(source[pos]) || is_digit(source[pos]) || source[pos] == '_') && i < 63) {
+            token.value[i++] = source[pos++];
+        }
+        token.value[i] = '\0';
+        
+        // Check for keywords
+        if (simple_strcmp(token.value, "int") == 0 || 
+            simple_strcmp(token.value, "void") == 0 ||
+            simple_strcmp(token.value, "return") == 0 ||
+            simple_strcmp(token.value, "if") == 0 ||
+            simple_strcmp(token.value, "else") == 0 ||
+            simple_strcmp(token.value, "while") == 0) {
+            token.type = TOKEN_KEYWORD;
+        } else {
+            token.type = TOKEN_IDENTIFIER;
+        }
+        return token;
+    }
+    
+    Token read_string() {
+        Token token;
+        token.type = TOKEN_STRING;
+        token.line = line;
+        pos++; // Skip opening quote
+        int i = 0;
+        while (source[pos] != '"' && source[pos] != '\0' && i < 63) {
+            token.value[i++] = source[pos++];
+        }
+        token.value[i] = '\0';
+        if (source[pos] == '"') pos++; // Skip closing quote
+        return token;
+    }
+    
+public:
+    void init(const char* src) { 
+        source = src; 
+        pos = 0; 
+        line = 1; 
+    }
+    
+    Token next_token() {
+        Token token;
+        skip_whitespace();
+        
+        if (source[pos] == '\0') {
+            token.type = TOKEN_EOF;
+            token.value[0] = '\0';
+            return token;
+        }
+        
+        if (is_digit(source[pos])) return read_number();
+        if (is_alpha(source[pos]) || source[pos] == '_') return read_identifier();
+        if (source[pos] == '"') return read_string();
+        
+        token.type = TOKEN_OPERATOR;
+        token.value[0] = source[pos];
+        token.value[1] = '\0';
+        token.line = line;
+        pos++;
+        return token;
+    }
+};
+
+class X86Generator {
+private:
+    uint8_t* code_buffer;
+    int code_pos;
+    int buffer_size;
+    
+    void emit_byte(uint8_t byte) {
+        if (code_pos < buffer_size) {
+            code_buffer[code_pos++] = byte;
+        }
+    }
+    
+    void emit_dword(uint32_t dword) {
+        emit_byte(dword & 0xff);
+        emit_byte((dword >> 8) & 0xff);
+        emit_byte((dword >> 16) & 0xff);
+        emit_byte((dword >> 24) & 0xff);
+    }
+    
+public:
+    void init(uint8_t* buffer, int size) { 
+        code_buffer = buffer; 
+        code_pos = 0; 
+        buffer_size = size; 
+    }
+    
+    void emit_function_prologue() {
+        emit_byte(0x55); // push ebp
+        emit_byte(0x89); emit_byte(0xe5); // mov ebp, esp
+    }
+    
+    void emit_function_epilogue() {
+        emit_byte(0x89); emit_byte(0xec); // mov esp, ebp
+        emit_byte(0x5d); // pop ebp
+        emit_byte(0xc3); // ret
+    }
+    
+    void emit_mov_eax_immediate(int value) {
+        emit_byte(0xb8); // mov eax, immediate
+        emit_dword(value);
+    }
+    
+    int get_code_size() const { return code_pos; }
+};
+
+class SimpleCppCompiler {
+private:
+    SimpleTokenizer tokenizer;
+    Token current_token;
+    X86Generator generator;
+    
+    void advance() { current_token = tokenizer.next_token(); }
+    
+    int simple_atoi(const char* str) {
+        int result = 0;
+        for (int i = 0; str[i] != '\0'; i++) {
+            result = result * 10 + (str[i] - '0');
+        }
+        return result;
+    }
+    
+    bool parse_program() {
+        while (current_token.type != TOKEN_EOF) {
+            if (!parse_function()) return false;
+        }
+        return true;
+    }
+    
+    bool parse_function() {
+        if (current_token.type != TOKEN_KEYWORD) return false;
+        if (simple_strcmp(current_token.value, "int") != 0) return false;
+        
+        advance(); // consume 'int'
+        if (current_token.type != TOKEN_IDENTIFIER) return false;
+        advance(); // consume function name
+        if (current_token.value[0] != '(') return false;
+        advance(); // consume '('
+        if (current_token.value[0] != ')') return false;
+        advance(); // consume ')'
+        if (current_token.value[0] != '{') return false;
+        advance(); // consume '{'
+        
+        generator.emit_function_prologue();
+        
+        while (current_token.value[0] != '}' && current_token.type != TOKEN_EOF) {
+            if (!parse_statement()) return false;
+        }
+        
+        if (current_token.value[0] != '}') return false;
+        advance(); // consume '}'
+        
+        generator.emit_function_epilogue();
+        return true;
+    }
+    
+    bool parse_statement() {
+        if (current_token.type == TOKEN_KEYWORD && simple_strcmp(current_token.value, "return") == 0) {
+            advance(); // consume 'return'
+            if (current_token.type == TOKEN_NUMBER) {
+                int value = simple_atoi(current_token.value);
+                generator.emit_mov_eax_immediate(value);
+                advance();
+            }
+            if (current_token.value[0] != ';') return false;
+            advance(); // consume ';'
+            return true;
+        }
+        
+        // Skip unknown statements
+        while (current_token.value[0] != ';' && current_token.type != TOKEN_EOF) {
+            advance();
+        }
+        if (current_token.value[0] == ';') advance();
+        return true;
+    }
+    
+public:
+    bool compile(const char* source_code, uint8_t* output_buffer, int buffer_size) {
+        tokenizer.init(source_code);
+        generator.init(output_buffer, buffer_size);
+        
+        current_token = tokenizer.next_token();
+        
+        return parse_program();
+    }
+};
+
+// Executable memory management (same as before)
+static uint8_t executable_memory_pool[8192];
+static bool memory_used[128];
+static bool memory_pool_initialized = false;
+
+void init_executable_memory_pool() {
+    if (!memory_pool_initialized) {
+        simple_memset(memory_used, 0, sizeof(memory_used));
+        memory_pool_initialized = true;
+    }
+}
+
+void* allocate_executable_block(int size) {
+    init_executable_memory_pool();
+    int blocks_needed = (size + 63) / 64;
+    
+    for (int i = 0; i <= 128 - blocks_needed; i++) {
+        bool can_allocate = true;
+        for (int j = 0; j < blocks_needed; j++) {
+            if (memory_used[i + j]) {
+                can_allocate = false;
+                break;
+            }
+        }
+        
+        if (can_allocate) {
+            for (int j = 0; j < blocks_needed; j++) {
+                memory_used[i + j] = true;
+            }
+            return &executable_memory_pool[i * 64];
+        }
+    }
+    return nullptr;
+}
+
+void free_executable_block(void* ptr) {
+    if (!ptr || ptr < executable_memory_pool || 
+        ptr >= executable_memory_pool + 8192) return;
+    
+    int block_index = ((uint8_t*)ptr - executable_memory_pool) / 64;
+    if (block_index >= 0 && block_index < 128) {
+        memory_used[block_index] = false;
+    }
+}
+
+// Simple code executor without C++ constructors/destructors
+struct CodeExecutor {
+    uint8_t* executable_memory;
+    int memory_size;
+    bool initialized;
+    
+    void init() {
+        memory_size = 2048;
+        executable_memory = (uint8_t*)allocate_executable_block(memory_size);
+        initialized = (executable_memory != nullptr);
+    }
+    
+    void cleanup() {
+        if (executable_memory && initialized) {
+            free_executable_block(executable_memory);
+            executable_memory = nullptr;
+            initialized = false;
+        }
+    }
+    
+    int execute_code(uint8_t* code, int code_size) {
+        if (!initialized || !executable_memory) {
+            cout << "Error: Could not allocate executable memory\n";
+            return -1;
+        }
+        
+        simple_memcpy(executable_memory, code, code_size);
+        
+        typedef int (*compiled_function)();
+        compiled_function func = (compiled_function)executable_memory;
+        
+        cout << "Executing compiled code...\n";
+        int result = func();
+        cout << "Execution completed. Return value: " << result << "\n";
+        
+        return result;
+    }
+};
+
+// Global instances (plain objects, not using constructors)
+static SimpleCppCompiler cpp_compiler;
+static CodeExecutor code_executor;
+static bool compiler_system_initialized = false;
+
+void init_compiler_system() {
+    if (!compiler_system_initialized) {
+        code_executor.init();
+        compiler_system_initialized = true;
+    }
+}
+
+// --- END C++ COMPILER SYSTEM ---
+
+// UPDATED COMMAND IMPLEMENTATIONS (replace the previous ones):
+void cmd_compile(uint64_t ahci_base, int port, const char* filename) {
+    init_compiler_system(); // Initialize on first use
+    
+    if (!filename) {
+        cout << "Usage: compile <filename.cpp>\n";
+        return;
+    }
+    
+    // Read C++ source file
+    static char source_buffer[8192];
+    int bytes_read = fat32_read_file_to_buffer(ahci_base, port, filename, source_buffer, sizeof(source_buffer));
+    
+    if (bytes_read < 0) {
+        cout << "Error: Could not read source file '" << filename << "'\n";
+        return;
+    }
+    
+    cout << "Compiling " << filename << "...\n";
+    cout << "Source code:\n" << source_buffer << "\n---\n";
+    
+    // Compile to x86 machine code
+    static uint8_t compiled_code[2048];
+    bool success = cpp_compiler.compile(source_buffer, compiled_code, sizeof(compiled_code));
+    
+    if (!success) {
+        cout << "Compilation failed!\n";
+        return;
+    }
+    
+    // Generate output filename
+    char obj_filename[64];
+    simple_strcpy(obj_filename, filename);
+    // Replace .cpp with .obj
+    char* dot = simple_strchr(obj_filename, '.');
+    if (dot) {
+        simple_strcpy(dot, ".obj");
+    } else {
+        simple_strcat(obj_filename, ".obj");
+    }
+    
+    // Save compiled object file
+    int result = fat32_write_file(ahci_base, port, obj_filename, compiled_code, 2048);
+    
+    if (result == 0) {
+        cout << "Compilation successful! Object file: " << obj_filename << "\n";
+    } else {
+        cout << "Error saving object file\n";
+    }
+}
+
+void cmd_run(uint64_t ahci_base, int port, const char* filename) {
+    init_compiler_system(); // Initialize on first use
+    
+    if (!filename) {
+        cout << "Usage: run <filename.obj>\n";
+        return;
+    }
+    
+    // Read compiled object file
+    static uint8_t object_code[2048];
+    int bytes_read = fat32_read_file_to_buffer(ahci_base, port, filename, object_code, sizeof(object_code));
+    
+    if (bytes_read < 0) {
+        cout << "Error: Could not read object file '" << filename << "'\n";
+        return;
+    }
+    
+    cout << "Loading and executing " << filename << "...\n";
+    
+    // Execute the compiled code
+    code_executor.execute_code(object_code, bytes_read);
+}
+
+void cmd_exec(const char* code_text) {
+    init_compiler_system(); // Initialize on first use
+    
+    if (!code_text) {
+        cout << "Usage: exec <inline_code>\n";
+        cout << "Example: exec \"int main() { return 42; }\"\n";
+        return;
+    }
+    
+    cout << "Compiling and executing inline code...\n";
+    
+    static uint8_t compiled_code[1024];
+    bool success = cpp_compiler.compile(code_text, compiled_code, sizeof(compiled_code));
+    
+    if (!success) {
+        cout << "Compilation failed!\n";
+        return;
+    }
+    
+    code_executor.execute_code(compiled_code, 1024);
+}
+// --- END C++ COMPILER SYSTEM ---
 
 // --- KERNEL ENTRY POINT ---
 extern "C" void kernel_main() {
