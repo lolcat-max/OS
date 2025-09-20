@@ -315,7 +315,9 @@ void notepad_move_cursor(int delta_row, int delta_col) {
     if (cursor_col > line_len) cursor_col = line_len;
     if (cursor_col < 0) cursor_col = 0;
     if (cursor_col > MAX_LINE_LENGTH) cursor_col = MAX_LINE_LENGTH;
-}void notepad_save_and_exit(const char* filename_arg) {
+}
+
+void notepad_save_and_exit(const char* filename_arg) {
     char final_filename[256];
     if (filename_arg && filename_arg[0] != '\0') {
         simple_strcpy(final_filename, filename_arg);
@@ -335,24 +337,17 @@ void notepad_move_cursor(int delta_row, int delta_col) {
     }
 
     int result = fat32_write_file(ahci_base, 0, final_filename, save_buffer, simple_strlen(save_buffer));
-    notepad_write_string_at(24, 0, "                                                  ", 0x07);
+    notepad_write_string_at(24, 0, "                                                    ", 0x07);
     if (result == 0) {
         notepad_write_string_at(24, 0, "File saved. Press any key.", 0x0A);
     } else {
         notepad_write_string_at(24, 0, "Error saving! Press any key.", 0x0C);
     }
-    // REMOVED the early return statements!
-
-    // Wait for a key press before exiting
-    while(inb(0x64) & 0x01) inb(0x60); // Clear keyboard buffer
-    while(!(inb(0x64) & 0x01));      // Wait for new key press
-    inb(0x60); // Discard the key
 
     notepad_running = false;
     terminal_clear_screen();
     terminal_draw_header();
 }
-
 
 
 void notepad_load_file(const char* filename) {
@@ -402,61 +397,61 @@ void notepad_handle_input(char key) {
 static bool handle_extended_scancode = false;
 
 void notepad_handle_special_key(int scancode) {
-    if (!notepad_running) return;
-    
-    // Handle extended scan codes (0xE0 prefix)
-    if (scancode == 0xE0) {
-        handle_extended_scancode = true;
-        return; // Wait for the actual key code
+  if (!notepad_running) return;
+ 
+  // Handle extended scan codes (0xE0 prefix)
+  if (scancode == 0xE0) {
+    handle_extended_scancode = true;
+    return; // Wait for the actual key code
+  }
+ 
+  // Process the actual key code
+  if (handle_extended_scancode) {
+    handle_extended_scancode = false; // Reset the flag AFTER processing the key
+    // These are the extended key codes (without 0xE0 prefix)
+    switch (scancode) {
+      case 0x48: // Up arrow (extended)
+        notepad_move_cursor(-1, 0);
+        break;
+      case 0x50: // Down arrow (extended)
+        notepad_move_cursor(1, 0);
+        break;
+      case 0x4B: // Left arrow (extended)
+        notepad_move_cursor(0, -1);
+        break;
+      case 0x4D: // Right arrow (extended)
+        notepad_move_cursor(0, 1);
+        break;
+      case 0x47: // Home (extended)
+        cursor_col = 0;
+        break;
+      case 0x4F: // End (extended)
+        cursor_col = simple_strlen(notepad_buffer[cursor_row]);
+        break;
+      case 0x49: // Page Up (extended)
+        cursor_row -= visible_lines;
+        if (cursor_row < 0) cursor_row = 0;
+        break;
+      case 0x51: // Page Down (extended)
+        cursor_row += visible_lines;
+        if (cursor_row >= current_line_count) cursor_row = current_line_count - 1;
+        break;
     }
-    
-    // Process the actual key code
-    if (handle_extended_scancode) {
-        handle_extended_scancode = false;
-        // These are the extended key codes (without 0xE0 prefix)
-        switch (scancode) {
-            case 0x48: // Up arrow (extended)
-                notepad_move_cursor(-1, 0);
-                break;
-            case 0x50: // Down arrow (extended)
-                notepad_move_cursor(1, 0);
-                break;
-            case 0x4B: // Left arrow (extended)
-                notepad_move_cursor(0, -1);
-                break;
-            case 0x4D: // Right arrow (extended)
-                notepad_move_cursor(0, 1);
-                break;
-            case 0x47: // Home (extended)
-                cursor_col = 0;
-                break;
-            case 0x4F: // End (extended)
-                cursor_col = simple_strlen(notepad_buffer[cursor_row]);
-                break;
-            case 0x49: // Page Up (extended)
-                cursor_row -= visible_lines;
-                if (cursor_row < 0) cursor_row = 0;
-                break;
-            case 0x51: // Page Down (extended)
-                cursor_row += visible_lines;
-                if (cursor_row >= current_line_count) cursor_row = current_line_count - 1;
-                break;
-        }
-    } else {
-        // Handle non-extended keys
-        switch (scancode) {
-            case 0x01: // ESC
-                notepad_save_and_exit(notepad_filename);
-                return;
-        }
+  } else {
+    // Handle non-extended keys
+    switch (scancode) {
+      case 0x01: // ESC
+        notepad_save_and_exit(notepad_filename);
+        return;
     }
-    
-    // Adjust column if new line is shorter
-    int line_len = simple_strlen(notepad_buffer[cursor_row]);
-    if (cursor_col > line_len) {
-        cursor_col = line_len;
-    }
-    notepad_update_cursor();
+  }
+ 
+  // Adjust column if new line is shorter
+  int line_len = simple_strlen(notepad_buffer[cursor_row]);
+  if (cursor_col > line_len) {
+    cursor_col = line_len;
+  }
+  notepad_update_cursor();
 }
 
 
