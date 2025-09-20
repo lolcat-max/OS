@@ -1013,20 +1013,17 @@ void command_prompt() {
     }
 }
 
-// REPLACE THE EXISTING COMPILER SYSTEM WITH THIS KERNEL-COMPATIBLE VERSION
-// This version avoids new/delete and uses static allocation instead
-
-// --- C++ COMPILER SYSTEM (KERNEL COMPATIBLE) ---
-// COMPLETE ENHANCED C++ COMPILER SYSTEM FOR KERNEL
-// Add this after your existing includes and before your forward declarations
-
-// COMPLETE ENHANCED C++ COMPILER SYSTEM FOR KERNEL.CPP
-// Add this entire section after your existing includes and before your forward declarations
-
 // --- ENHANCED C++ COMPILER SYSTEM ---
+
+// --- ENHANCED C COMPILER SYSTEM ---
 enum TokenType {
-    TOKEN_KEYWORD, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_STRING, 
-    TOKEN_OPERATOR, TOKEN_DELIMITER, TOKEN_EOF
+    TOKEN_KEYWORD,
+    TOKEN_IDENTIFIER,
+    TOKEN_NUMBER,
+    TOKEN_STRING,
+    TOKEN_OPERATOR,
+    TOKEN_DELIMITER,
+    TOKEN_EOF
 };
 
 struct Token {
@@ -1046,7 +1043,7 @@ class VariableTable {
 private:
     Variable vars[16];
     int next_offset;
-    
+
 public:
     void init() {
         for (int i = 0; i < 16; i++) {
@@ -1054,7 +1051,7 @@ public:
         }
         next_offset = -4;
     }
-    
+
     int add_variable(const char* name) {
         for (int i = 0; i < 16; i++) {
             if (!vars[i].in_use) {
@@ -1067,7 +1064,7 @@ public:
         }
         return 0;
     }
-    
+
     int get_variable_offset(const char* name) {
         for (int i = 0; i < 16; i++) {
             if (vars[i].in_use && simple_strcmp(vars[i].name, name) == 0) {
@@ -1076,9 +1073,9 @@ public:
         }
         return 0;
     }
-    
+
     int get_stack_size() {
-        return -(next_offset + 4);
+        return -next_offset + 4;
     }
 };
 
@@ -1087,17 +1084,17 @@ private:
     const char* source;
     int pos;
     int line;
-    
+
     void skip_whitespace() {
         while (source[pos] == ' ' || source[pos] == '\t' || source[pos] == '\n' || source[pos] == '\r') {
             if (source[pos] == '\n') line++;
             pos++;
         }
     }
-    
+
     bool is_digit(char c) { return c >= '0' && c <= '9'; }
-    bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
-    
+    bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+
     Token read_number() {
         Token token;
         token.type = TOKEN_NUMBER;
@@ -1106,32 +1103,37 @@ private:
         while (is_digit(source[pos]) && i < 63) {
             token.value[i++] = source[pos++];
         }
-        token.value[i] = '\0';
+        token.value[i] = 0;
         return token;
     }
-    
+
     Token read_identifier() {
         Token token;
         token.line = line;
         int i = 0;
+        
         while ((is_alpha(source[pos]) || is_digit(source[pos]) || source[pos] == '_') && i < 63) {
             token.value[i++] = source[pos++];
         }
-        token.value[i] = '\0';
+        token.value[i] = 0;
         
+        // Check for keywords
         if (simple_strcmp(token.value, "int") == 0 || 
             simple_strcmp(token.value, "void") == 0 ||
             simple_strcmp(token.value, "return") == 0 ||
             simple_strcmp(token.value, "if") == 0 ||
             simple_strcmp(token.value, "else") == 0 ||
-            simple_strcmp(token.value, "while") == 0) {
+            simple_strcmp(token.value, "while") == 0 ||
+            simple_strcmp(token.value, "break") == 0 ||    // ADDED
+            simple_strcmp(token.value, "continue") == 0) { // ADDED
             token.type = TOKEN_KEYWORD;
         } else {
             token.type = TOKEN_IDENTIFIER;
         }
+        
         return token;
     }
-    
+
     Token read_operator() {
         Token token;
         token.type = TOKEN_OPERATOR;
@@ -1140,63 +1142,71 @@ private:
         if (source[pos] == '=' && source[pos + 1] == '=') {
             token.value[0] = '=';
             token.value[1] = '=';
-            token.value[2] = '\0';
+            token.value[2] = 0;
             pos += 2;
-        } else if (source[pos] == '!' && source[pos + 1] == '=') {
+        }
+        else if (source[pos] == '!' && source[pos + 1] == '=') {
             token.value[0] = '!';
             token.value[1] = '=';
-            token.value[2] = '\0';
+            token.value[2] = 0;
             pos += 2;
-        } else if (source[pos] == '<' && source[pos + 1] == '=') {
+        }
+        else if (source[pos] == '<' && source[pos + 1] == '=') {
             token.value[0] = '<';
             token.value[1] = '=';
-            token.value[2] = '\0';
+            token.value[2] = 0;
             pos += 2;
-        } else if (source[pos] == '>' && source[pos + 1] == '=') {
+        }
+        else if (source[pos] == '>' && source[pos + 1] == '=') {
             token.value[0] = '>';
             token.value[1] = '=';
-            token.value[2] = '\0';
+            token.value[2] = 0;
             pos += 2;
-        } else {
+        }
+        else {
             token.value[0] = source[pos];
-            token.value[1] = '\0';
+            token.value[1] = 0;
             pos++;
         }
         return token;
     }
-    
+
 public:
-    void init(const char* src) { 
-        source = src; 
-        pos = 0; 
-        line = 1; 
+    void init(const char* src) {
+        source = src;
+        pos = 0;
+        line = 1;
     }
-    
+
     Token next_token() {
         Token token;
         skip_whitespace();
         
-        if (source[pos] == '\0') {
+        if (source[pos] == 0) {
             token.type = TOKEN_EOF;
-            token.value[0] = '\0';
+            token.value[0] = 0;
             return token;
         }
         
-        if (is_digit(source[pos])) return read_number();
-        if (is_alpha(source[pos]) || source[pos] == '_') return read_identifier();
+        if (is_digit(source[pos])) {
+            return read_number();
+        }
+        
+        if (is_alpha(source[pos]) || source[pos] == '_') {
+            return read_identifier();
+        }
         
         char c = source[pos];
-        if (c == '+' || c == '-' || c == '*' || c == '/' || c == '=' || 
-            c == '<' || c == '>' || c == '!' || c == '&' || c == '|') {
+        if (c == '=' || c == '<' || c == '>' || c == '!' || 
+            c == '+' || c == '-' || c == '*' || c == '/') {
             return read_operator();
         }
         
         token.type = TOKEN_DELIMITER;
         token.value[0] = source[pos];
-        token.value[1] = '\0';
+        token.value[1] = 0;
         token.line = line;
         pos++;
-        
         return token;
     }
 };
@@ -1206,160 +1216,205 @@ private:
     uint8_t* code_buffer;
     int code_pos;
     int buffer_size;
-    
+
     void emit_byte(uint8_t byte) {
         if (code_pos < buffer_size) {
             code_buffer[code_pos++] = byte;
         }
     }
-    
+
     void emit_dword(uint32_t dword) {
         emit_byte(dword & 0xff);
         emit_byte((dword >> 8) & 0xff);
         emit_byte((dword >> 16) & 0xff);
         emit_byte((dword >> 24) & 0xff);
     }
-    
+
 public:
-    void init(uint8_t* buffer, int size) { 
-        code_buffer = buffer; 
-        code_pos = 0; 
-        buffer_size = size; 
+    void init(uint8_t* buffer, int size) {
+        code_buffer = buffer;
+        code_pos = 0;
+        buffer_size = size;
     }
-    
+
     void emit_function_prologue(int stack_space = 0) {
-        emit_byte(0x55);
-        emit_byte(0x89); emit_byte(0xe5);
+        emit_byte(0x55);    // push ebp
+        emit_byte(0x89);    // mov ebp, esp
+        emit_byte(0xe5);
         if (stack_space > 0) {
-            emit_byte(0x83); emit_byte(0xec); emit_byte(stack_space & 0xff);
+            emit_byte(0x83);    // sub esp, stack_space
+            emit_byte(0xec);
+            emit_byte(stack_space & 0xff);
         }
     }
-    
+
     void emit_function_epilogue() {
-        emit_byte(0x89); emit_byte(0xec);
-        emit_byte(0x5d);
-        emit_byte(0xc3);
+        emit_byte(0x89);    // mov esp, ebp
+        emit_byte(0xec);
+        emit_byte(0x5d);    // pop ebp
+        emit_byte(0xc3);    // ret
     }
-    
+
     void emit_mov_eax_immediate(int value) {
         emit_byte(0xb8);
         emit_dword(value);
     }
-    
+
     void emit_mov_eax_variable(int offset) {
-        emit_byte(0x8b); emit_byte(0x45); emit_byte(offset & 0xff);
+        emit_byte(0x8b);    // mov eax, [ebp+offset]
+        emit_byte(0x45);
+        emit_byte(offset & 0xff);
     }
-    
+
     void emit_mov_variable_eax(int offset) {
-        emit_byte(0x89); emit_byte(0x45); emit_byte(offset & 0xff);
+        emit_byte(0x89);    // mov [ebp+offset], eax
+        emit_byte(0x45);
+        emit_byte(offset & 0xff);
     }
-    
+
     void emit_push_eax() {
         emit_byte(0x50);
     }
-    
+
     void emit_pop_ebx() {
         emit_byte(0x5b);
     }
-    
+
     void emit_add_eax_ebx() {
-        emit_byte(0x01); emit_byte(0xd8);
+        emit_byte(0x01);
+        emit_byte(0xd8);
     }
-    
+
     void emit_sub_ebx_eax() {
-        emit_byte(0x29); emit_byte(0xc3);
+        emit_byte(0x29);
+        emit_byte(0xc3);
     }
-    
+
     void emit_mov_eax_ebx() {
-        emit_byte(0x89); emit_byte(0xd8);
+        emit_byte(0x89);
+        emit_byte(0xd8);
     }
-    
+
     void emit_imul_eax_ebx() {
-        emit_byte(0x0f); emit_byte(0xaf); emit_byte(0xc3);
+        emit_byte(0x0f);
+        emit_byte(0xaf);
+        emit_byte(0xc3);
     }
-    
+
     void emit_div_ebx() {
-        emit_byte(0x99);
-        emit_byte(0xf7); emit_byte(0xfb);
+        emit_byte(0x99);    // cdq
+        emit_byte(0xf7);    // idiv ebx
+        emit_byte(0xfb);
     }
-    
+
     void emit_cmp_ebx_eax() {
-        emit_byte(0x39); emit_byte(0xc3);
+        emit_byte(0x39);
+        emit_byte(0xc3);
     }
-    
+
     void emit_sete_al() {
-        emit_byte(0x0f); emit_byte(0x94); emit_byte(0xc0);
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0x94);
+        emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0xb6);
+        emit_byte(0xc0);
     }
-    
+
     void emit_setne_al() {
-        emit_byte(0x0f); emit_byte(0x95); emit_byte(0xc0);
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0x95);
+        emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0xb6);
+        emit_byte(0xc0);
     }
-    
+
     void emit_setl_al() {
-        emit_byte(0x0f); emit_byte(0x9c); emit_byte(0xc0);
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0x9c);
+        emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0xb6);
+        emit_byte(0xc0);
     }
-    
+
     void emit_setle_al() {
-        emit_byte(0x0f); emit_byte(0x9e); emit_byte(0xc0);
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0x9e);
+        emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0xb6);
+        emit_byte(0xc0);
     }
-    
+
     void emit_setg_al() {
-        emit_byte(0x0f); emit_byte(0x9f); emit_byte(0xc0);
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0x9f);
+        emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0xb6);
+        emit_byte(0xc0);
     }
-    
+
     void emit_setge_al() {
-        emit_byte(0x0f); emit_byte(0x9d); emit_byte(0xc0);
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0x9d);
+        emit_byte(0xc0);
+        emit_byte(0x0f);
+        emit_byte(0xb6);
+        emit_byte(0xc0);
     }
-    
+
     void emit_test_eax() {
-        emit_byte(0x85); emit_byte(0xc0);
+        emit_byte(0x85);
+        emit_byte(0xc0);
     }
-    
-    int emit_jz_forward() {
-        emit_byte(0x0f); emit_byte(0x84);
-        int patch_pos = code_pos;
-        emit_dword(0x00000000);
-        return patch_pos;
-    }
-    
+
     int emit_jmp_forward() {
-        emit_byte(0xe9);
-        int patch_pos = code_pos;
-        emit_dword(0x00000000);
-        return patch_pos;
-    }
-    
+		emit_byte(0xe9);        // JMP rel32 opcode (near jump)
+		int patch_pos = code_pos; // Position where we need to write displacement
+		emit_dword(0x00000000); // Placeholder - will be patched later
+		return patch_pos;       // Return position of the displacement field
+	}
+
+
+	int emit_jz_forward() {
+		emit_byte(0x0f);        // Two-byte opcode for JZ rel32
+		emit_byte(0x84);
+		int patch_pos = code_pos; // Position of the 4-byte displacement  
+		emit_dword(0x00000000); // Placeholder displacement
+		return patch_pos;       // Return position of displacement bytes
+	}
+
+
     void emit_jmp_backward(int target_pos) {
         emit_byte(0xe9);
         int displacement = target_pos - (code_pos + 4);
         emit_dword(displacement);
     }
-    
+
     void patch_jump(int jump_pos, int target_pos) {
-        int displacement = target_pos - (jump_pos + 4);
-        code_buffer[jump_pos] = displacement & 0xff;
-        code_buffer[jump_pos + 1] = (displacement >> 8) & 0xff;
-        code_buffer[jump_pos + 2] = (displacement >> 16) & 0xff;
-        code_buffer[jump_pos + 3] = (displacement >> 24) & 0xff;
-    }
-    
-    int get_code_pos() { 
-        return code_pos; 
-    }
-    
-    int get_current_pos() {
-        return code_pos;
-    }
-    
-    int get_code_size() { 
-        return code_pos; 
-    }
+		// jump_pos is the position of the 4-byte displacement field
+		// target_pos is where we want to jump to
+		// Displacement = target - (end of jump instruction)
+		int displacement = target_pos - (jump_pos + 4);
+		
+		cout << "DEBUG: Patching jump at " << jump_pos << " to target " << target_pos;
+		cout << " (displacement: " << displacement << ")\n";
+		
+		// Write displacement in little-endian format
+		code_buffer[jump_pos]     = displacement & 0xff;
+		code_buffer[jump_pos + 1] = (displacement >> 8) & 0xff;
+		code_buffer[jump_pos + 2] = (displacement >> 16) & 0xff;
+		code_buffer[jump_pos + 3] = (displacement >> 24) & 0xff;
+	}
+
+
+
+    int get_code_pos() { return code_pos; }
+    int get_current_pos() { return code_pos; }
+    int get_code_size() { return code_pos; }
 };
 
 class SimpleCppCompiler {
@@ -1368,23 +1423,78 @@ private:
     Token current_token;
     X86Generator generator;
     VariableTable variables;
+
+    // LOOP CONTEXT FOR BREAK/CONTINUE - THIS IS ESSENTIAL
+    struct LoopContext {
+        int break_jumps[16];        // Array of jump positions that need patching
+        int continue_jumps[16];     // Array of continue jump positions  
+        int break_count;            // Number of break statements collected
+        int continue_count;         // Number of continue statements collected
+        int loop_start_pos;         // Position where loop condition begins
+        bool active;                // Is this loop context currently active
+    };
     
-    void advance() { current_token = tokenizer.next_token(); }
-    
-    int simple_atoi(const char* str) {
-        int result = 0;
-        bool negative = false;
-        if (*str == '-') {
-            negative = true;
-            str++;
+    LoopContext loop_stack[8];      // Support up to 8 nested loops
+    int loop_level;                 // Current nesting depth
+
+    // ESSENTIAL LOOP CONTEXT MANAGEMENT
+    void push_loop_context(int loop_start) {
+        if (loop_level < 8) {
+            loop_stack[loop_level].break_count = 0;
+            loop_stack[loop_level].continue_count = 0;
+            loop_stack[loop_level].loop_start_pos = loop_start;
+            loop_stack[loop_level].active = true;
+            loop_level++;
         }
-        while (*str >= '0' && *str <= '9') {
-            result = result * 10 + (*str - '0');
-            str++;
-        }
-        return negative ? -result : result;
     }
     
+    void pop_loop_context(int loop_end) {
+        if (loop_level > 0) {
+            loop_level--;
+            LoopContext& ctx = loop_stack[loop_level];
+            
+            // BACKPATCH ALL BREAK JUMPS TO LOOP END
+            for (int i = 0; i < ctx.break_count; i++) {
+                generator.patch_jump(ctx.break_jumps[i], loop_end);
+            }
+            
+            // BACKPATCH ALL CONTINUE JUMPS TO LOOP START  
+            for (int i = 0; i < ctx.continue_count; i++) {
+                generator.patch_jump(ctx.continue_jumps[i], ctx.loop_start_pos);
+            }
+            
+            ctx.active = false;
+        }
+    }
+    
+    bool is_inside_loop() {
+        return loop_level > 0 && loop_stack[loop_level - 1].active;
+    }
+    
+    void add_break_jump(int jump_pos) {
+        if (is_inside_loop()) {
+            LoopContext& ctx = loop_stack[loop_level - 1];
+            if (ctx.break_count < 16) {
+                ctx.break_jumps[ctx.break_count++] = jump_pos;
+            }
+        }
+    }
+    
+    void add_continue_jump(int jump_pos) {
+        if (is_inside_loop()) {
+            LoopContext& ctx = loop_stack[loop_level - 1];
+            if (ctx.continue_count < 16) {
+                ctx.continue_jumps[ctx.continue_count++] = jump_pos;
+            }
+        }
+    }
+
+    
+    
+    void advance() {
+        current_token = tokenizer.next_token();
+    }
+
     bool expect(const char* expected) {
         if (simple_strcmp(current_token.value, expected) == 0) {
             advance();
@@ -1392,21 +1502,22 @@ private:
         }
         return false;
     }
-    
+
     bool parse_program() {
         while (current_token.type != TOKEN_EOF) {
             if (!parse_function()) return false;
         }
         return true;
     }
-    
+
     bool parse_function() {
         if (current_token.type != TOKEN_KEYWORD) return false;
         if (simple_strcmp(current_token.value, "int") != 0) return false;
-        
         advance();
+        
         if (current_token.type != TOKEN_IDENTIFIER) return false;
         advance();
+        
         if (!expect("(")) return false;
         if (!expect(")")) return false;
         if (!expect("{")) return false;
@@ -1419,35 +1530,57 @@ private:
         }
         
         if (!expect("}")) return false;
-        
         generator.emit_function_epilogue();
         return true;
     }
-    
-    bool parse_statement() {
-        if (current_token.type == TOKEN_KEYWORD) {
-            if (simple_strcmp(current_token.value, "int") == 0) {
-                return parse_variable_declaration();
-            } else if (simple_strcmp(current_token.value, "return") == 0) {
-                return parse_return_statement();
-            } else if (simple_strcmp(current_token.value, "if") == 0) {
-                return parse_if_statement();
-            } else if (simple_strcmp(current_token.value, "while") == 0) {
-                return parse_while_statement();
-            }
-        } else if (current_token.type == TOKEN_IDENTIFIER) {
-            return parse_assignment();
+
+    bool parsestatement() {
+    if (current_token.type == TOKEN_KEYWORD) {
+        if (simple_strcmp(current_token.value, "int") == 0) {
+            return parse_variable_declaration();
         }
-        
-        while (current_token.value[0] != ';' && current_token.type != TOKEN_EOF) {
-            advance();
+        else if (simple_strcmp(current_token.value, "return") == 0) {
+            return parse_return_statement();
         }
-        if (current_token.value[0] == ';') advance();
-        return true;
+        else if (simple_strcmp(current_token.value, "if") == 0) {
+            return parse_if_statement();
+        }
+        else if (simple_strcmp(current_token.value, "while") == 0) {
+            return parse_while_statement();
+        }
+        // ADD THESE MISSING CASES
+        else if (simple_strcmp(current_token.value, "break") == 0) {
+            advance(); // skip 'break'
+            
+            // For now, generate a simple unconditional jump to end of function
+            // This is a basic implementation - you'll need loop context for proper break
+            generator.emit_jmp_forward(); // This jump won't be patched properly yet
+            
+            return expect(";");
+        }
+        else if (simple_strcmp(current_token.value, "continue") == 0) {
+            advance(); // skip 'continue'
+            
+            // For now, just skip - proper implementation needs loop context
+            return expect(";");
+        }
+    }
+    else if (current_token.type == TOKEN_IDENTIFIER) {
+        return parse_assignment();
     }
     
-    bool parse_variable_declaration() {
+    // Skip unknown statements
+    while (current_token.value[0] != ';' && current_token.type != TOKEN_EOF) {
         advance();
+    }
+    if (current_token.value[0] == ';') advance();
+    return true;
+}
+
+
+
+    bool parse_variable_declaration() {
+        advance(); // skip 'int'
         if (current_token.type != TOKEN_IDENTIFIER) return false;
         
         char var_name[32];
@@ -1459,21 +1592,19 @@ private:
         if (current_token.value[0] == '=') {
             advance();
             if (!parse_expression()) return false;
-            
             int offset = variables.get_variable_offset(var_name);
             generator.emit_mov_variable_eax(offset);
         }
         
         return expect(";");
     }
-    
+
     bool parse_assignment() {
         char var_name[32];
         simple_strcpy(var_name, current_token.value);
         advance();
         
         if (!expect("=")) return false;
-        
         if (!parse_expression()) return false;
         
         int offset = variables.get_variable_offset(var_name);
@@ -1483,17 +1614,19 @@ private:
         
         return expect(";");
     }
-    
+
     bool parse_return_statement() {
-        advance();
+        advance(); // skip 'return'
+        
         if (!parse_expression()) return false;
+        
         return expect(";");
     }
-    
+
     bool parse_if_statement() {
-        advance();
-        if (!expect("(")) return false;
+        advance(); // skip 'if'
         
+        if (!expect("(")) return false;
         if (!parse_expression()) return false;
         if (!expect(")")) return false;
         
@@ -1509,41 +1642,137 @@ private:
         if (!expect("}")) return false;
         
         generator.patch_jump(jump_pos, generator.get_current_pos());
-        
         return true;
     }
-    
+
+        // CORRECTED WHILE LOOP WITH PROPER BREAK/CONTINUE SUPPORT
     bool parse_while_statement() {
-        advance();
-        if (!expect("(")) return false;
+		advance(); // skip 'while'
+		
+		if (!expect("(")) return false;
+		
+		int loop_start = generator.get_current_pos();
+		cout << "DEBUG: Loop starts at position: " << loop_start << "\n";
+		
+		push_loop_context(loop_start);  // CRITICAL: Set up break/continue context
+		
+		if (!parse_expression()) return false;
+		if (!expect(")")) return false;
+		
+		generator.emit_test_eax();
+		int condition_jump = generator.emit_jz_forward();
+		
+		if (!expect("{")) return false;
+		
+		// Parse loop body - break statements will be collected here
+		while (current_token.value[0] != '}' && current_token.type != TOKEN_EOF) {
+			if (!parse_statement()) return false;
+		}
+		
+		if (!expect("}")) return false;
+		
+		generator.emit_jmp_backward(loop_start);
+		int loop_end = generator.get_current_pos();
+		
+		cout << "DEBUG: Loop ends at position: " << loop_end << "\n";
+		
+		generator.patch_jump(condition_jump, loop_end);
+		pop_loop_context(loop_end);  // CRITICAL: Patch all break jumps
+		
+		return true;
+	}
+
+
+    bool parse_break_statement() {
+		advance(); // skip 'break'
+		
+		if (!is_inside_loop()) {
+			cout << "Error: break statement not inside loop\n";
+			return false;
+		}
+		
+		cout << "DEBUG: Generating break at code position: " << generator.get_current_pos() << "\n";
+		
+		// Generate forward jump - target unknown until loop ends
+		int jump_pos = generator.emit_jmp_forward();
+		add_break_jump(jump_pos);
+		
+		cout << "DEBUG: Break jump stored at position: " << jump_pos << "\n";
+		
+		return expect(";");
+	}
+
+
+    // CORRECTED CONTINUE STATEMENT PARSING  
+    bool parse_continue_statement() {
+        advance(); // skip 'continue'
         
-        int loop_start = generator.get_current_pos();
-        
-        if (!parse_expression()) return false;
-        if (!expect(")")) return false;
-        
-        generator.emit_test_eax();
-        int exit_jump = generator.emit_jz_forward();
-        
-        if (!expect("{")) return false;
-        
-        while (current_token.value[0] != '}' && current_token.type != TOKEN_EOF) {
-            if (!parse_statement()) return false;
+        if (!is_inside_loop()) {
+            cout << "Error: continue statement not inside loop\n";
+            return false;
         }
         
-        if (!expect("}")) return false;
+        // Generate forward jump - target unknown until we backpatch
+        int jump_pos = generator.emit_jmp_forward();
+        add_continue_jump(jump_pos);  // Add to list for later backpatching
         
-        generator.emit_jmp_backward(loop_start);
-        generator.patch_jump(exit_jump, generator.get_current_pos());
+        return expect(";");
+    }
+
+    // ENSURE parsestatement() INCLUDES BREAK/CONTINUE
+    bool parse_statement() {
+        if (current_token.type == TOKEN_KEYWORD) {
+            if (simple_strcmp(current_token.value, "int") == 0) {
+                return parse_variable_declaration();
+            }
+            else if (simple_strcmp(current_token.value, "return") == 0) {
+                return parse_return_statement();
+            }
+            else if (simple_strcmp(current_token.value, "if") == 0) {
+                return parse_if_statement();
+            }
+            else if (simple_strcmp(current_token.value, "while") == 0) {
+                return parse_while_statement();
+            }
+            // CRITICAL: ADD THESE CASES
+            else if (simple_strcmp(current_token.value, "break") == 0) {
+                return parse_break_statement();
+            }
+            else if (simple_strcmp(current_token.value, "continue") == 0) {
+                return parse_continue_statement();
+            }
+        }
+        else if (current_token.type == TOKEN_IDENTIFIER) {
+            return parse_assignment();
+        }
         
+        // Skip unknown statements
+        while (current_token.value[0] != ';' && current_token.type != TOKEN_EOF) {
+            advance();
+        }
+        if (current_token.value[0] == ';') advance();
         return true;
     }
-    
+
+
+public:
+    SimpleCppCompiler() : loop_level(0) {
+        for (int i = 0; i < 8; i++) {
+            loop_stack[i].active = false;
+        }
+    }
+
+    bool compile(const char* source_code, uint8_t* output_buffer, int buffer_size) {
+        tokenizer.init(source_code);
+        generator.init(output_buffer, buffer_size);
+        current_token = tokenizer.next_token();
+        return parse_program();
+    }
     bool parse_expression() {
         if (!parse_comparison()) return false;
         return true;
     }
-    
+
     bool parse_comparison() {
         if (!parse_term()) return false;
         
@@ -1554,29 +1783,33 @@ private:
                 simple_strcmp(current_token.value, "<=") == 0 ||
                 simple_strcmp(current_token.value, ">") == 0 ||
                 simple_strcmp(current_token.value, ">=") == 0)) {
-            
+                
             char op[3];
             simple_strcpy(op, current_token.value);
             advance();
             
             generator.emit_push_eax();
-            
             if (!parse_term()) return false;
-            
             generator.emit_pop_ebx();
             generator.emit_cmp_ebx_eax();
             
-            if (simple_strcmp(op, "==") == 0) generator.emit_sete_al();
-            else if (simple_strcmp(op, "!=") == 0) generator.emit_setne_al();
-            else if (simple_strcmp(op, "<") == 0) generator.emit_setl_al();
-            else if (simple_strcmp(op, "<=") == 0) generator.emit_setle_al();
-            else if (simple_strcmp(op, ">") == 0) generator.emit_setg_al();
-            else if (simple_strcmp(op, ">=") == 0) generator.emit_setge_al();
+            if (simple_strcmp(op, "==") == 0) {
+                generator.emit_sete_al();
+            } else if (simple_strcmp(op, "!=") == 0) {
+                generator.emit_setne_al();
+            } else if (simple_strcmp(op, "<") == 0) {
+                generator.emit_setl_al();
+            } else if (simple_strcmp(op, "<=") == 0) {
+                generator.emit_setle_al();
+            } else if (simple_strcmp(op, ">") == 0) {
+                generator.emit_setg_al();
+            } else if (simple_strcmp(op, ">=") == 0) {
+                generator.emit_setge_al();
+            }
         }
-        
         return true;
     }
-    
+
     bool parse_term() {
         if (!parse_factor()) return false;
         
@@ -1586,9 +1819,7 @@ private:
             advance();
             
             generator.emit_push_eax();
-            
             if (!parse_factor()) return false;
-            
             generator.emit_pop_ebx();
             
             if (op == '+') {
@@ -1598,10 +1829,9 @@ private:
                 generator.emit_mov_eax_ebx();
             }
         }
-        
         return true;
     }
-    
+
     bool parse_factor() {
         if (!parse_primary()) return false;
         
@@ -1611,9 +1841,7 @@ private:
             advance();
             
             generator.emit_push_eax();
-            
             if (!parse_primary()) return false;
-            
             generator.emit_pop_ebx();
             
             if (op == '*') {
@@ -1626,44 +1854,35 @@ private:
                 generator.emit_div_ebx();
             }
         }
-        
         return true;
     }
-    
+
     bool parse_primary() {
         if (current_token.type == TOKEN_NUMBER) {
             int value = simple_atoi(current_token.value);
             generator.emit_mov_eax_immediate(value);
             advance();
             return true;
-        } else if (current_token.type == TOKEN_IDENTIFIER) {
+        }
+        else if (current_token.type == TOKEN_IDENTIFIER) {
             int offset = variables.get_variable_offset(current_token.value);
             if (offset != 0) {
                 generator.emit_mov_eax_variable(offset);
             }
             advance();
             return true;
-        } else if (current_token.value[0] == '(') {
+        }
+        else if (current_token.value[0] == '(') {
             advance();
             if (!parse_expression()) return false;
             return expect(")");
         }
-        
         return false;
     }
-    
-public:
-    bool compile(const char* source_code, uint8_t* output_buffer, int buffer_size) {
-        tokenizer.init(source_code);
-        generator.init(output_buffer, buffer_size);
-        
-        current_token = tokenizer.next_token();
-        
-        return parse_program();
-    }
+
 };
 
-// Executable memory management
+// --- EXECUTABLE MEMORY MANAGEMENT ---
 static uint8_t executable_memory_pool[8192];
 static bool memory_used[128];
 static bool memory_pool_initialized = false;
@@ -1692,20 +1911,52 @@ void* allocate_executable_block(int size) {
             for (int j = 0; j < blocks_needed; j++) {
                 memory_used[i + j] = true;
             }
-            return &executable_memory_pool[i * 64];
+            
+            void* block = &executable_memory_pool[i * 64];
+            simple_memset(block, 0, blocks_needed * 64);
+            
+            return block;
         }
     }
+    
     return nullptr;
 }
 
 void free_executable_block(void* ptr) {
-    if (!ptr || ptr < executable_memory_pool || 
-        ptr >= executable_memory_pool + 8192) return;
+    if (!ptr || ptr < executable_memory_pool || ptr >= executable_memory_pool + 8192) return;
     
     int block_index = ((uint8_t*)ptr - executable_memory_pool) / 64;
     if (block_index >= 0 && block_index < 128) {
         memory_used[block_index] = false;
     }
+}
+
+static void int_to_string(int value, char* buffer) {
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+    
+    bool negative = value < 0;
+    if (negative) value = -value;
+    
+    char temp[16];
+    int i = 0;
+    
+    while (value > 0) {
+        temp[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+    
+    int j = 0;
+    if (negative) buffer[j++] = '-';
+    
+    while (i > 0) {
+        buffer[j++] = temp[--i];
+    }
+    
+    buffer[j] = '\0';
 }
 
 struct CodeExecutor {
@@ -1735,17 +1986,22 @@ struct CodeExecutor {
         
         simple_memcpy(executable_memory, code, code_size);
         
-        typedef int (*compiled_function)();
-        compiled_function func = (compiled_function)executable_memory;
+        typedef int (*CompiledFunction)();
+        CompiledFunction func = (CompiledFunction)executable_memory;
         
         cout << "Executing compiled code...\n";
         int result = func();
-        cout << "Execution completed. Return value: " << result << "\n";
+        
+        // MANUALLY CONVERT INTEGER TO STRING TO AVOID IOSTREAM BUGS
+        char result_str[16];
+        int_to_string(result, result_str);
+        cout << result_str;
         
         return result;
     }
 };
 
+// Global compiler instances
 static SimpleCppCompiler cpp_compiler;
 static CodeExecutor code_executor;
 static bool compiler_system_initialized = false;
