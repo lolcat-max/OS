@@ -938,6 +938,9 @@ void command_prompt() {
 // COMPLETE ENHANCED C++ COMPILER SYSTEM FOR KERNEL
 // Add this after your existing includes and before your forward declarations
 
+// COMPLETE ENHANCED C++ COMPILER SYSTEM FOR KERNEL.CPP
+// Add this entire section after your existing includes and before your forward declarations
+
 // --- ENHANCED C++ COMPILER SYSTEM ---
 enum TokenType {
     TOKEN_KEYWORD, TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_STRING, 
@@ -953,13 +956,13 @@ struct Token {
 // Variable table for local variables
 struct Variable {
     char name[32];
-    int stack_offset;  // Offset from EBP
+    int stack_offset;
     bool in_use;
 };
 
 class VariableTable {
 private:
-    Variable vars[16];  // Support up to 16 local variables
+    Variable vars[16];
     int next_offset;
     
 public:
@@ -967,7 +970,7 @@ public:
         for (int i = 0; i < 16; i++) {
             vars[i].in_use = false;
         }
-        next_offset = -4;  // Start at EBP-4
+        next_offset = -4;
     }
     
     int add_variable(const char* name) {
@@ -976,11 +979,11 @@ public:
                 simple_strcpy(vars[i].name, name);
                 vars[i].stack_offset = next_offset;
                 vars[i].in_use = true;
-                next_offset -= 4;  // Each int is 4 bytes
+                next_offset -= 4;
                 return vars[i].stack_offset;
             }
         }
-        return 0;  // No space
+        return 0;
     }
     
     int get_variable_offset(const char* name) {
@@ -989,11 +992,11 @@ public:
                 return vars[i].stack_offset;
             }
         }
-        return 0;  // Not found
+        return 0;
     }
     
     int get_stack_size() {
-        return -(next_offset + 4);  // Total stack space needed
+        return -(next_offset + 4);
     }
 };
 
@@ -1034,7 +1037,6 @@ private:
         }
         token.value[i] = '\0';
         
-        // Check for keywords
         if (simple_strcmp(token.value, "int") == 0 || 
             simple_strcmp(token.value, "void") == 0 ||
             simple_strcmp(token.value, "return") == 0 ||
@@ -1053,7 +1055,6 @@ private:
         token.type = TOKEN_OPERATOR;
         token.line = line;
         
-        // Handle two-character operators
         if (source[pos] == '=' && source[pos + 1] == '=') {
             token.value[0] = '=';
             token.value[1] = '=';
@@ -1075,12 +1076,10 @@ private:
             token.value[2] = '\0';
             pos += 2;
         } else {
-            // Single character operator
             token.value[0] = source[pos];
             token.value[1] = '\0';
             pos++;
         }
-        
         return token;
     }
     
@@ -1104,14 +1103,12 @@ public:
         if (is_digit(source[pos])) return read_number();
         if (is_alpha(source[pos]) || source[pos] == '_') return read_identifier();
         
-        // Handle operators and delimiters
         char c = source[pos];
         if (c == '+' || c == '-' || c == '*' || c == '/' || c == '=' || 
             c == '<' || c == '>' || c == '!' || c == '&' || c == '|') {
             return read_operator();
         }
         
-        // Single character tokens
         token.type = TOKEN_DELIMITER;
         token.value[0] = source[pos];
         token.value[1] = '\0';
@@ -1149,106 +1146,117 @@ public:
     }
     
     void emit_function_prologue(int stack_space = 0) {
-        emit_byte(0x55); // push ebp
-        emit_byte(0x89); emit_byte(0xe5); // mov ebp, esp
+        emit_byte(0x55);
+        emit_byte(0x89); emit_byte(0xe5);
         if (stack_space > 0) {
-            emit_byte(0x83); emit_byte(0xec); emit_byte(stack_space & 0xff); // sub esp, stack_space
+            emit_byte(0x83); emit_byte(0xec); emit_byte(stack_space & 0xff);
         }
     }
     
     void emit_function_epilogue() {
-        emit_byte(0x89); emit_byte(0xec); // mov esp, ebp
-        emit_byte(0x5d); // pop ebp
-        emit_byte(0xc3); // ret
+        emit_byte(0x89); emit_byte(0xec);
+        emit_byte(0x5d);
+        emit_byte(0xc3);
     }
     
     void emit_mov_eax_immediate(int value) {
-        emit_byte(0xb8); // mov eax, immediate
+        emit_byte(0xb8);
         emit_dword(value);
     }
     
     void emit_mov_eax_variable(int offset) {
-        emit_byte(0x8b); emit_byte(0x45); emit_byte(offset & 0xff); // mov eax, [ebp+offset]
+        emit_byte(0x8b); emit_byte(0x45); emit_byte(offset & 0xff);
     }
     
     void emit_mov_variable_eax(int offset) {
-        emit_byte(0x89); emit_byte(0x45); emit_byte(offset & 0xff); // mov [ebp+offset], eax
+        emit_byte(0x89); emit_byte(0x45); emit_byte(offset & 0xff);
     }
     
     void emit_push_eax() {
-        emit_byte(0x50); // push eax
+        emit_byte(0x50);
     }
     
     void emit_pop_ebx() {
-        emit_byte(0x5b); // pop ebx
+        emit_byte(0x5b);
     }
     
-    // Arithmetic operations
     void emit_add_eax_ebx() {
-        emit_byte(0x01); emit_byte(0xd8); // add eax, ebx
+        emit_byte(0x01); emit_byte(0xd8);
     }
     
     void emit_sub_ebx_eax() {
-        emit_byte(0x29); emit_byte(0xc3); // sub ebx, eax (ebx = ebx - eax)
+        emit_byte(0x29); emit_byte(0xc3);
     }
     
     void emit_mov_eax_ebx() {
-        emit_byte(0x89); emit_byte(0xd8); // mov eax, ebx
+        emit_byte(0x89); emit_byte(0xd8);
     }
     
     void emit_imul_eax_ebx() {
-        emit_byte(0x0f); emit_byte(0xaf); emit_byte(0xc3); // imul eax, ebx
+        emit_byte(0x0f); emit_byte(0xaf); emit_byte(0xc3);
     }
     
     void emit_div_ebx() {
-        emit_byte(0x99); // cdq (sign extend eax to edx:eax)
-        emit_byte(0xf7); emit_byte(0xfb); // idiv ebx
+        emit_byte(0x99);
+        emit_byte(0xf7); emit_byte(0xfb);
     }
     
-    // Comparison operations
     void emit_cmp_ebx_eax() {
-        emit_byte(0x39); emit_byte(0xc3); // cmp ebx, eax
+        emit_byte(0x39); emit_byte(0xc3);
     }
     
     void emit_sete_al() {
-        emit_byte(0x0f); emit_byte(0x94); emit_byte(0xc0); // sete al
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0); // movzx eax, al
+        emit_byte(0x0f); emit_byte(0x94); emit_byte(0xc0);
+        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
     }
     
     void emit_setne_al() {
-        emit_byte(0x0f); emit_byte(0x95); emit_byte(0xc0); // setne al
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0); // movzx eax, al
+        emit_byte(0x0f); emit_byte(0x95); emit_byte(0xc0);
+        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
     }
     
     void emit_setl_al() {
-        emit_byte(0x0f); emit_byte(0x9c); emit_byte(0xc0); // setl al
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0); // movzx eax, al
+        emit_byte(0x0f); emit_byte(0x9c); emit_byte(0xc0);
+        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
     }
     
     void emit_setle_al() {
-        emit_byte(0x0f); emit_byte(0x9e); emit_byte(0xc0); // setle al
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0); // movzx eax, al
+        emit_byte(0x0f); emit_byte(0x9e); emit_byte(0xc0);
+        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
     }
     
     void emit_setg_al() {
-        emit_byte(0x0f); emit_byte(0x9f); emit_byte(0xc0); // setg al
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0); // movzx eax, al
+        emit_byte(0x0f); emit_byte(0x9f); emit_byte(0xc0);
+        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
     }
     
     void emit_setge_al() {
-        emit_byte(0x0f); emit_byte(0x9d); emit_byte(0xc0); // setge al
-        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0); // movzx eax, al
+        emit_byte(0x0f); emit_byte(0x9d); emit_byte(0xc0);
+        emit_byte(0x0f); emit_byte(0xb6); emit_byte(0xc0);
     }
     
-    // Conditional jumps - FIXED return type
     void emit_test_eax() {
-        emit_byte(0x85); emit_byte(0xc0); // test eax, eax
+        emit_byte(0x85); emit_byte(0xc0);
     }
     
     int emit_jz_forward() {
-        emit_byte(0x0f); emit_byte(0x84); // jz (32-bit displacement)
-        emit_dword(0); // Placeholder displacement
-        return code_pos - 4; // Return position for later patching
+        emit_byte(0x0f); emit_byte(0x84);
+        int patch_pos = code_pos;
+        emit_dword(0x00000000);
+        return patch_pos;
+    }
+    
+    int emit_jmp_forward() {
+        emit_byte(0xe9);
+        int patch_pos = code_pos;
+        emit_dword(0x00000000);
+        return patch_pos;
+    }
+    
+    void emit_jmp_backward(int target_pos) {
+        emit_byte(0xe9);
+        int displacement = target_pos - (code_pos + 4);
+        emit_dword(displacement);
     }
     
     void patch_jump(int jump_pos, int target_pos) {
@@ -1259,8 +1267,17 @@ public:
         code_buffer[jump_pos + 3] = (displacement >> 24) & 0xff;
     }
     
-    int get_code_pos() const { return code_pos; }
-    int get_code_size() const { return code_pos; }
+    int get_code_pos() { 
+        return code_pos; 
+    }
+    
+    int get_current_pos() {
+        return code_pos;
+    }
+    
+    int get_code_size() { 
+        return code_pos; 
+    }
 };
 
 class SimpleCppCompiler {
@@ -1305,17 +1322,15 @@ private:
         if (current_token.type != TOKEN_KEYWORD) return false;
         if (simple_strcmp(current_token.value, "int") != 0) return false;
         
-        advance(); // consume 'int'
+        advance();
         if (current_token.type != TOKEN_IDENTIFIER) return false;
-        advance(); // consume function name
+        advance();
         if (!expect("(")) return false;
         if (!expect(")")) return false;
         if (!expect("{")) return false;
         
         variables.init();
-        
-        // Emit prologue with placeholder stack space
-        generator.emit_function_prologue(64); // Reserve 64 bytes for local vars
+        generator.emit_function_prologue(64);
         
         while (current_token.value[0] != '}' && current_token.type != TOKEN_EOF) {
             if (!parse_statement()) return false;
@@ -1335,12 +1350,13 @@ private:
                 return parse_return_statement();
             } else if (simple_strcmp(current_token.value, "if") == 0) {
                 return parse_if_statement();
+            } else if (simple_strcmp(current_token.value, "while") == 0) {
+                return parse_while_statement();
             }
         } else if (current_token.type == TOKEN_IDENTIFIER) {
             return parse_assignment();
         }
         
-        // Skip unknown statements
         while (current_token.value[0] != ';' && current_token.type != TOKEN_EOF) {
             advance();
         }
@@ -1349,7 +1365,7 @@ private:
     }
     
     bool parse_variable_declaration() {
-        advance(); // consume 'int'
+        advance();
         if (current_token.type != TOKEN_IDENTIFIER) return false;
         
         char var_name[32];
@@ -1359,7 +1375,7 @@ private:
         variables.add_variable(var_name);
         
         if (current_token.value[0] == '=') {
-            advance(); // consume '='
+            advance();
             if (!parse_expression()) return false;
             
             int offset = variables.get_variable_offset(var_name);
@@ -1387,23 +1403,20 @@ private:
     }
     
     bool parse_return_statement() {
-        advance(); // consume 'return'
-        
+        advance();
         if (!parse_expression()) return false;
-        
         return expect(";");
     }
     
     bool parse_if_statement() {
-        advance(); // consume 'if'
+        advance();
         if (!expect("(")) return false;
         
         if (!parse_expression()) return false;
-        
         if (!expect(")")) return false;
         
         generator.emit_test_eax();
-        int jump_pos = generator.emit_jz_forward(); // FIXED: now returns int
+        int jump_pos = generator.emit_jz_forward();
         
         if (!expect("{")) return false;
         
@@ -1413,7 +1426,33 @@ private:
         
         if (!expect("}")) return false;
         
-        generator.patch_jump(jump_pos, generator.get_code_pos());
+        generator.patch_jump(jump_pos, generator.get_current_pos());
+        
+        return true;
+    }
+    
+    bool parse_while_statement() {
+        advance();
+        if (!expect("(")) return false;
+        
+        int loop_start = generator.get_current_pos();
+        
+        if (!parse_expression()) return false;
+        if (!expect(")")) return false;
+        
+        generator.emit_test_eax();
+        int exit_jump = generator.emit_jz_forward();
+        
+        if (!expect("{")) return false;
+        
+        while (current_token.value[0] != '}' && current_token.type != TOKEN_EOF) {
+            if (!parse_statement()) return false;
+        }
+        
+        if (!expect("}")) return false;
+        
+        generator.emit_jmp_backward(loop_start);
+        generator.patch_jump(exit_jump, generator.get_current_pos());
         
         return true;
     }
@@ -1443,7 +1482,7 @@ private:
             if (!parse_term()) return false;
             
             generator.emit_pop_ebx();
-            generator.emit_cmp_ebx_eax(); // Compare ebx (first) with eax (second)
+            generator.emit_cmp_ebx_eax();
             
             if (simple_strcmp(op, "==") == 0) generator.emit_sete_al();
             else if (simple_strcmp(op, "!=") == 0) generator.emit_setne_al();
@@ -1473,7 +1512,6 @@ private:
             if (op == '+') {
                 generator.emit_add_eax_ebx();
             } else {
-                // For subtraction: ebx - eax (first - second)
                 generator.emit_sub_ebx_eax();
                 generator.emit_mov_eax_ebx();
             }
@@ -1499,13 +1537,11 @@ private:
             if (op == '*') {
                 generator.emit_imul_eax_ebx();
             } else {
-                // For division: ebx / eax -> result in eax
-                // We need eax = ebx / eax, so we swap first
-                generator.emit_mov_eax_ebx(); // Move dividend to eax
-                generator.emit_pop_ebx();     // Get divisor back
-                generator.emit_push_eax();    // Save dividend
-                generator.emit_pop_ebx();     // Get divisor in ebx
-                generator.emit_div_ebx();     // eax = eax / ebx
+                generator.emit_mov_eax_ebx();
+                generator.emit_pop_ebx();
+                generator.emit_push_eax();
+                generator.emit_pop_ebx();
+                generator.emit_div_ebx();
             }
         }
         
@@ -1526,7 +1562,7 @@ private:
             advance();
             return true;
         } else if (current_token.value[0] == '(') {
-            advance(); // consume '('
+            advance();
             if (!parse_expression()) return false;
             return expect(")");
         }
@@ -1545,7 +1581,7 @@ public:
     }
 };
 
-// Executable memory management (same as before)
+// Executable memory management
 static uint8_t executable_memory_pool[8192];
 static bool memory_used[128];
 static bool memory_pool_initialized = false;
@@ -1638,7 +1674,6 @@ void init_compiler_system() {
         compiler_system_initialized = true;
     }
 }
-
 // --- END C++ COMPILER SYSTEM ---
 
 // UPDATED COMMAND IMPLEMENTATIONS (replace the previous ones):
