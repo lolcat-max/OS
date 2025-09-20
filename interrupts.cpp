@@ -1,11 +1,12 @@
+
+
 #include "interrupts.h"
+#include "notepad.h"
+#include "kernel.h"
 #include "terminal_hooks.h"
 #include "iostream_wrapper.h"
-#include "test.h"
-#include "notepad.h"
-
 #include "kernel.h"
-
+#include "test.h"
 // IDT and GDT structures
 struct idt_entry idt[256];
 struct idt_ptr idtp;
@@ -13,25 +14,22 @@ struct gdt_entry gdt[3];
 struct gdt_ptr gdtp;
 extern bool usb_keyboard_active; // Add this near the top of interrupts.cpp
 
-// --- KEYBOARD STATE ---
+
+
 static bool shift_pressed = false;
 
-// --- SCANCODE CONSTANTS ---
+
 #define SCANCODE_L_SHIFT_PRESS 0x2A
 #define SCANCODE_R_SHIFT_PRESS 0x36
 #define SCANCODE_L_SHIFT_RELEASE 0xAA
 #define SCANCODE_R_SHIFT_RELEASE 0xB6
 #define SCANCODE_UP 0x48
 #define SCANCODE_DOWN 0x50
-#define SCANCODE_LEFT 0x4B      
-#define SCANCODE_RIGHT 0x4D     
-#define SCANCODE_HOME 0x47      
-#define SCANCODE_END 0x4F       
+#define SCANCODE_LEFT 0x4B
+#define SCANCODE_RIGHT 0x4D
+#define SCANCODE_ESC 0x01
 #define SCANCODE_F5_PRESS 0x3F
-#define SCANCODE_ESC 0x01       
-#define KEY_F5 -5
 
-// Keyboard scancode tables
 const char scancode_to_ascii[128] = {
     0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
     '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
@@ -44,140 +42,101 @@ const char scancode_to_ascii[128] = {
 const char scancode_to_ascii_shifted[128] = {
     0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
     '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
-    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
+    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '\"', '~',
     0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
     '*', 0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '-',
     0, 0, 0, '+', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
-const char extended_scancode_table[128] = {
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '\n', 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-};
-
-// COMPLETELY REPLACE keyboard_handler() function
 extern "C" void keyboard_handler() {
     uint8_t scancode = inb(0x60);
 
-	
-	if (usb_keyboard_active) {
-        inb(0x60); // Clear the scancode to prevent buffer overflow
-        outb(0x20, 0x20); // Send EOI
-        return;
-    }
-    
-    
-    // Check for extended key code (0xE0)
+    // Check for extended key prefix
     if (scancode == 0xE0) {
         extended_key = true;
         outb(0x20, 0x20);
         return;
     }
-    
-    // Handle ESC key specially for notepad
-    if (scancode == SCANCODE_ESC) {
-        if (is_notepad_running()) {
-            notepad_handle_special_key(scancode);
-        }
-        extended_key = false;
-        outb(0x20, 0x20);
-        return;
-    }
-    
-    // Handle F5 key press to start Pong
-    if (scancode == SCANCODE_F5_PRESS) {
-        if (!is_notepad_running()) { // Don't start Pong if notepad is running
-            start_pong_game();
-        }
-        outb(0x20, 0x20);
-        return;
-    }
 
-    if (scancode == SCANCODE_ESC) {
-        outb(0x20, 0x20);
-        return;
-    }
-    
-    // Handle Shift key press and release
+    // Handle shift press/release
     if (scancode == SCANCODE_L_SHIFT_PRESS || scancode == SCANCODE_R_SHIFT_PRESS) {
         shift_pressed = true;
         outb(0x20, 0x20);
         return;
     }
-    
     if (scancode == SCANCODE_L_SHIFT_RELEASE || scancode == SCANCODE_R_SHIFT_RELEASE) {
         shift_pressed = false;
         outb(0x20, 0x20);
         return;
     }
-    
-    // Handle key release (bit 7 set) for non-shift keys
+
+    // Handle key release (ignore)
     if (scancode & 0x80) {
         extended_key = false;
         outb(0x20, 0x20);
         return;
     }
-    
-    // Handle extended keys (arrow keys, etc.)
+
+    // Escape key special handling for notepad
+    if (scancode == SCANCODE_ESC) {
+        if (is_notepad_running()) {
+            notepad_handle_special_key(scancode);
+            extended_key = false;
+            outb(0x20, 0x20);
+            return;
+        }
+    }
+
+    // F5 to start Pong if notepad inactive
+    if (scancode == SCANCODE_F5_PRESS && !is_notepad_running()) {
+        start_pong_game();
+        outb(0x20, 0x20);
+        return;
+    }
+
+    // Handle extended keys (arrow keys) if notepad or pong running
     if (extended_key) {
         if (is_notepad_running()) {
             notepad_handle_special_key(scancode);
         } else if (is_pong_running()) {
             switch (scancode) {
-                case SCANCODE_UP:
-                    pong_handle_input('w'); // Map up arrow to W
-                    break;
-                case SCANCODE_DOWN:
-                    pong_handle_input('s'); // Map down arrow to S
-                    break;
-            }
-        } else {
-            switch (scancode) {
-                case SCANCODE_UP:
-                    // cin.navigateHistory(true);
-                    break;
-                case SCANCODE_DOWN:
-                    // cin.navigateHistory(false);
-                    break;
+                case SCANCODE_UP: pong_handle_input('w'); break;
+                case SCANCODE_DOWN: pong_handle_input('s'); break;
             }
         }
         extended_key = false;
         outb(0x20, 0x20);
         return;
     }
-    
-    // Normal input handling
-    const char* current_scancode_table = shift_pressed ? scancode_to_ascii_shifted : scancode_to_ascii;
-    char key = current_scancode_table[scancode];
-    
-    if (key != 0) {
+
+    // Normal input processing (ASCII characters)
+    const char* lookup_table = shift_pressed ? scancode_to_ascii_shifted : scancode_to_ascii;
+    char ch = lookup_table[scancode];
+
+    if (ch != 0) {
         if (is_notepad_running()) {
-            notepad_handle_input(key);
+            notepad_handle_input(ch);
         } else if (is_pong_running()) {
-            pong_handle_input(key);
+            pong_handle_input(ch);
         } else {
-            // Normal terminal input handling
-            if (key == '\n') {
-                terminal_putchar(key);
+            // Terminal input buffer handling here
+            if (ch == '\n') {
+                terminal_putchar(ch);
                 input_buffer[input_length] = '\0';
                 cin.setInputReady(input_buffer);
                 input_length = 0;
-            } else if (key == '\b') {
+            } else if (ch == '\b') {
                 if (input_length > 0) {
-                    terminal_putchar(key);
+                    terminal_putchar(ch);
                     input_length--;
                 }
             } else if (input_length < MAX_COMMAND_LENGTH - 1) {
-                input_buffer[input_length++] = key;
-                terminal_putchar(key);
+                input_buffer[input_length++] = ch;
+                terminal_putchar(ch);
             }
         }
     }
-    
+
     outb(0x20, 0x20);
 }
 
