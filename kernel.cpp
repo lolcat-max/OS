@@ -180,13 +180,13 @@ static inline int stricmp(const char* s1, const char* s2) { while (*s1 && *s2) {
 // --- FAT32 HELPER IMPLEMENTATIONS ---
 static void to_83_format(const char* filename, char* out) { simple_memset(out, ' ', 11); uint8_t i = 0, j = 0; while (filename[i] && filename[i] != '.' && j < 8) { char c = filename[i++]; out[j++] = (c >= 'a' && c <= 'z') ? c - 32 : c; } if (filename[i] == '.') i++; j = 8; while (filename[i] && j < 11) { char c = filename[i++]; out[j++] = (c >= 'a' && c <= 'z') ? c - 32 : c; } }
 void from_83_format(const char* fat_name, char* out) { int i, j = 0; for (i = 0; i < 8 && fat_name[i] != ' '; i++) out[j++] = fat_name[i]; if (fat_name[8] != ' ') { out[j++] = '.'; for (i = 8; i < 11 && fat_name[i] != ' '; i++) out[j++] = fat_name[i]; } out[j] = '\0'; }
-static inline uint64_t cluster_to_lba(uint32_t cluster) { if (cluster < 2) return 0; return data_start_sector + ((uint64_t)(cluster - 2) * fat32_bpb.sec_per_clus); }
-uint32_t clusters_needed(uint32_t size) { uint32_t cluster_size = fat32_bpb.sec_per_clus * fat32_bpb.bytes_per_sec; return (size + cluster_size - 1) / cluster_size; }
+uint64_t cluster_to_lba(uint32_t cluster) {
+    return data_start_sector + (cluster - 2) * fat32_bpb.sec_per_clus;
+}uint32_t clusters_needed(uint32_t size) { uint32_t cluster_size = fat32_bpb.sec_per_clus * fat32_bpb.bytes_per_sec; return (size + cluster_size - 1) / cluster_size; }
 
 
 // --- Add to FILE OPERATION IMPLEMENTATIONS ---
 // --- Add near the top of your file, after the includes ---
-
 // A memory-efficient bitmap class to track cluster usage.
 // Uses 1 bit per cluster instead of 1 byte, reducing memory usage by 8x.
 class Bitmap {
@@ -227,84 +227,81 @@ public:
     }
 };
 
-
-// --- Helper function for chkdsk (now uses the Bitmap) ---
 void scan_directory_for_chkdsk(uint64_t ahci_base, int port, uint32_t dir_cluster, Bitmap& cluster_map, uint32_t max_clusters) {
     if (dir_cluster < 2 || dir_cluster >= max_clusters) return;
     
     uint8_t buffer[SECTOR_SIZE];
     uint32_t current_dir_cluster = dir_cluster;
-
+    
     while (current_dir_cluster >= 2 && current_dir_cluster < FAT_BAD_CLUSTER) {
         // Mark the directory cluster itself as used
         cluster_map.set(current_dir_cluster);
-
+        
         uint64_t lba = cluster_to_lba(current_dir_cluster);
-        for (uint8_t s = 0; s < fat32_bpb.sec_per_clus; s++) {
+        bool end_of_directory = false;
+        
+        // Process all sectors in this cluster
+        for (uint8_t s = 0; s < fat32_bpb.sec_per_clus && !end_of_directory; s++) {
             if (read_sectors(ahci_base, port, lba + s, 1, buffer) != 0) return;
+            
+            // Process all entries in this sector
             for (uint16_t e = 0; e < SECTOR_SIZE / ENTRY_SIZE; e++) {
                 fat_dir_entry_t *entry = (fat_dir_entry_t *)(buffer + e * ENTRY_SIZE);
-
+                
+                // End of directory marker - stop processing entirely
                 if (entry->name[0] == 0x00) {
-                    current_dir_cluster = FAT_END_OF_CHAIN;
+                    end_of_directory = true;
                     break;
                 }
+                
+                // Skip deleted entries
                 if (entry->name[0] == DELETED_ENTRY) continue;
-
+                
+                // Skip long filename entries (LFN)
+                if (entry->attr == 0x0F) continue;
+                
+                // Skip volume label entries  
+                if (entry->attr & 0x08) continue;
+                
                 uint32_t file_cluster = (entry->fst_clus_hi << 16) | entry->fst_clus_lo;
                 
-                if ((entry->attr & ATTR_DIRECTORY) && entry->name[0] != '.') {
+                // Handle zero cluster (empty files)
+                if (file_cluster == 0) continue;
+                
+                // Validate cluster range
+                if (file_cluster < 2 || file_cluster >= max_clusters) continue;
+                
+                if (entry->attr & ATTR_DIRECTORY) {
+                    // Skip . and .. entries
+                    if (entry->name[0] == '.') continue;
+                    
+                    // Recursively scan subdirectory
                     scan_directory_for_chkdsk(ahci_base, port, file_cluster, cluster_map, max_clusters);
                 } else {
+                    // Mark all clusters in file's chain as used
                     uint32_t current_file_cluster = file_cluster;
-                    while (current_file_cluster >= 2 && current_file_cluster < FAT_BAD_CLUSTER) {
+                    int chain_length = 0; // Prevent infinite loops
+                    
+                    while (current_file_cluster >= 2 && current_file_cluster < FAT_BAD_CLUSTER && chain_length < 65536) {
                         cluster_map.set(current_file_cluster);
-                        current_file_cluster = read_fat_entry(ahci_base, port, current_file_cluster);
+                        uint32_t next_cluster = read_fat_entry(ahci_base, port, current_file_cluster);
+                        
+                        // Detect circular references
+                        if (next_cluster == current_file_cluster) break;
+                        
+                        current_file_cluster = next_cluster;
+                        chain_length++;
                     }
                 }
             }
         }
-        if (current_dir_cluster < FAT_BAD_CLUSTER) {
-             current_dir_cluster = read_fat_entry(ahci_base, port, current_dir_cluster);
+        
+        // Move to next cluster in directory chain
+        if (current_dir_cluster < FAT_BAD_CLUSTER && !end_of_directory) {
+            current_dir_cluster = read_fat_entry(ahci_base, port, current_dir_cluster);
+        } else {
+            break;
         }
-    }
-}
-
-
-// --- The main chkdsk command (now uses the Bitmap) ---
-void cmd_chkdsk(uint64_t ahci_base, int port) {
-    cout << "Checking filesystem for errors...\n";
-
-    uint32_t total_data_sectors = fat32_bpb.tot_sec32 - data_start_sector;
-    uint32_t max_clusters = total_data_sectors / fat32_bpb.sec_per_clus + 2;
-    
-    // Use the memory-efficient Bitmap class for the cluster map.
-    Bitmap cluster_map(max_clusters);
-    if (!cluster_map.is_valid()) {
-        cout << "Error: Not enough memory to run chkdsk.\n";
-        return;
-    }
-
-    cout << "Phase 1: Verifying files and directories...\n";
-    scan_directory_for_chkdsk(ahci_base, port, fat32_bpb.root_clus, cluster_map, max_clusters);
-    
-    cout << "Phase 2: Verifying file allocation table...\n";
-    uint32_t orphaned_clusters_found = 0;
-    for (uint32_t cluster = 2; cluster < max_clusters; cluster++) {
-        uint32_t fat_entry = read_fat_entry(ahci_base, port, cluster);
-
-        // If the FAT says this cluster is in use, but our map says it's not...
-        if (fat_entry != FAT_FREE_CLUSTER && !cluster_map.test(cluster)) {
-            cout << "Found orphaned cluster: " << cluster << ". Reclaiming...\n";
-            write_fat_entry(ahci_base, port, cluster, FAT_FREE_CLUSTER);
-            orphaned_clusters_found++;
-        }
-    }
-
-    if (orphaned_clusters_found > 0) {
-        cout << "\nCHKDSK finished. Reclaimed " << orphaned_clusters_found << " orphaned clusters.\n";
-    } else {
-        cout << "\nCHKDSK finished. No errors found.\n";
     }
 }
 
@@ -385,6 +382,73 @@ int fat32_copy_file(uint64_t ahci_base, int port, const char* src_name, const ch
     return result;
 }
 
+
+
+// --- The main chkdsk command (now uses the Bitmap) ---
+void cmd_chkdsk(uint64_t ahci_base, int port) {
+    cout << "Checking filesystem for errors...\n";
+    
+    // DEBUG: Verify boot sector and root cluster
+    cout << "DEBUG: Root cluster from BPB: " << fat32_bpb.root_clus << "\n";
+    cout << "DEBUG: Sectors per cluster: " << fat32_bpb.sec_per_clus << "\n";
+    cout << "DEBUG: Data start sector: " << data_start_sector << "\n";
+    
+    uint32_t total_data_sectors = fat32_bpb.tot_sec32 - data_start_sector;
+    uint32_t max_clusters = total_data_sectors / fat32_bpb.sec_per_clus + 2;
+    
+    cout << "DEBUG: Max clusters: " << max_clusters << "\n";
+    
+    // Validate root cluster number
+    if (fat32_bpb.root_clus < 2 || fat32_bpb.root_clus >= max_clusters) {
+        cout << "ERROR: Invalid root cluster " << fat32_bpb.root_clus << ". Boot sector may be corrupted.\n";
+        return;
+    }
+    
+    // Test if we can actually read the root directory
+    uint64_t root_lba = cluster_to_lba(fat32_bpb.root_clus);
+    uint8_t test_buffer[SECTOR_SIZE];
+    if (read_sectors(ahci_base, port, root_lba, 1, test_buffer) != 0) {
+        cout << "ERROR: Cannot read root directory at LBA " << (int)root_lba << "\n";
+        return;
+    }
+    
+    // Check if root directory looks valid
+    fat_dir_entry_t *first_entry = (fat_dir_entry_t *)test_buffer;
+    cout << "DEBUG: First root entry name: ";
+    for (int i = 0; i < 11; i++) {
+        cout << (char)(first_entry->name[i] == 0 ? '.' : first_entry->name[i]);
+    }
+    cout << " (attr: 0x" << std::hex << (int)first_entry->attr << std::dec << ")\n";
+    
+    // Continue with normal chkdsk...
+    Bitmap cluster_map(max_clusters);
+    if (!cluster_map.is_valid()) {
+        cout << "Error: Not enough memory to run chkdsk.\n";
+        return;
+    }
+    
+    cout << "Phase 1: Verifying files and directories...\n";
+    scan_directory_for_chkdsk(ahci_base, port, fat32_bpb.root_clus, cluster_map, max_clusters);
+
+    cout << "Phase 2: Verifying file allocation table...\n";
+    uint32_t orphaned_clusters_found = 0;
+    for (uint32_t cluster = 2; cluster < max_clusters; cluster++) {
+        uint32_t fat_entry = read_fat_entry(ahci_base, port, cluster);
+
+        // If the FAT says this cluster is in use, but our map says it's not...
+        if (fat_entry != FAT_FREE_CLUSTER && !cluster_map.test(cluster)) {
+            cout << "Found orphaned cluster: " << cluster << ". Reclaiming...\n";
+            write_fat_entry(ahci_base, port, cluster, FAT_FREE_CLUSTER);
+            orphaned_clusters_found++;
+        }
+    }
+
+    if (orphaned_clusters_found > 0) {
+        cout << "\nCHKDSK finished. Reclaimed " << orphaned_clusters_found << " orphaned clusters.\n";
+    } else {
+        cout << "\nCHKDSK finished. No errors found.\n";
+    }
+}
 
 
 bool fat32_init(uint64_t ahci_base, int port) {
@@ -584,29 +648,47 @@ int fat32_add_file(uint64_t ahci_base, int port, const char* filename, const voi
     if (first_cluster) free_cluster_chain(ahci_base, port, first_cluster);
     return -4; // No space in directory
 }
-
 int fat32_remove_file(uint64_t ahci_base, int port, const char* filename) {
     uint8_t buffer[SECTOR_SIZE];
     uint64_t lba = cluster_to_lba(current_directory_cluster);
     char target[11];
     to_83_format(filename, target);
+    
     for (uint8_t s = 0; s < fat32_bpb.sec_per_clus; s++) {
         if (read_sectors(ahci_base, port, lba + s, (uint32_t)1, buffer) != 0) return -1;
+        
         for (uint16_t e = 0; e < SECTOR_SIZE / ENTRY_SIZE; e++) {
             fat_dir_entry_t *entry = (fat_dir_entry_t *)(buffer + e * ENTRY_SIZE);
-            if (entry->name[0] == 0) return -4;
+            if (entry->name[0] == 0) return -4; // End of directory
             if (entry->name[0] == DELETED_ENTRY || (entry->attr & (ATTR_LONG_NAME | ATTR_VOLUME_ID))) continue;
+            
             if (simple_memcmp(entry->name, target, 11) == 0) {
                 uint32_t cluster = (entry->fst_clus_hi << 16) | entry->fst_clus_lo;
+                
+                // COMPLETE DIRECTORY ENTRY CLEANUP
                 entry->name[0] = DELETED_ENTRY;
+                // Clear the remaining filename bytes to prevent garbage characters
+                simple_memset(&entry->name[1], 0x00, 10);
+                // Clear all other fields to prevent data leakage
+                entry->attr = 0;
+                entry->file_size = 0;
+                entry->fst_clus_hi = 0;
+                entry->fst_clus_lo = 0;
+                entry->crt_time = 0;
+                entry->crt_date = 0;
+                entry->wrt_time = 0;
+                entry->wrt_date = 0;
+                entry->lst_acc_date = 0;
+                
                 if (write_sectors(ahci_base, port, lba + s, (uint32_t)1, buffer) != 0) return -2;
                 if (cluster >= 2) free_cluster_chain(ahci_base, port, cluster);
                 return 0;
             }
         }
     }
-    return -4;
+    return -4; // File not found
 }
+
 
 int fat32_read_file_to_buffer(uint64_t ahci_base, int port, const char* filename, void* data_buffer, uint32_t buffer_size) {
     uint8_t dir_sector_buffer[SECTOR_SIZE];
