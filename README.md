@@ -11,6 +11,7 @@ Recommended: format desired drive as fat32 first then dd the drive.
 sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with your sata drive, the OS is programmed to select port 0 for all operations recommended not to boot on drive 0, or it's use once OS)
 
 TODO: setup USB keyboard HID in kernel init.
+TODO, notepad doesn't work quite well on real hardware...
 
 
 
