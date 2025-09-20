@@ -12,7 +12,7 @@ sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with 
 
 TODO: setup USB keyboard HID in kernel init.
 
-TODO, notepad doesn't work quite well on real hardware...
+TODO, notepad doesn't work quite well on real hardware, i use VMware...
 
 
 
