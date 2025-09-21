@@ -47,7 +47,6 @@ const char scancode_to_ascii_shifted[128] = {
     '*', 0, ' ', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '-',
     0, 0, 0, '+', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
-
 extern "C" void keyboard_handler() {
     uint8_t scancode = inb(0x60);
 
@@ -58,7 +57,7 @@ extern "C" void keyboard_handler() {
         return;
     }
 
-    // Handle shift press/release
+    // Handle shift press/release - but don't interfere with extended_key flag
     if (scancode == SCANCODE_L_SHIFT_PRESS || scancode == SCANCODE_R_SHIFT_PRESS) {
         shift_pressed = true;
         outb(0x20, 0x20);
@@ -70,9 +69,12 @@ extern "C" void keyboard_handler() {
         return;
     }
 
-    // Handle key release (ignore)
+    // Handle key release (ignore) - but preserve extended_key handling
     if (scancode & 0x80) {
-        extended_key = false;
+        // Only clear extended_key if this was actually an extended key release
+        if (extended_key) {
+            extended_key = false;
+        }
         outb(0x20, 0x20);
         return;
     }
@@ -81,7 +83,7 @@ extern "C" void keyboard_handler() {
     if (scancode == SCANCODE_ESC) {
         if (is_notepad_running()) {
             notepad_handle_special_key(scancode);
-            extended_key = false;
+            extended_key = false; // Clear after processing
             outb(0x20, 0x20);
             return;
         }
@@ -104,7 +106,7 @@ extern "C" void keyboard_handler() {
                 case SCANCODE_DOWN: pong_handle_input('s'); break;
             }
         }
-        extended_key = false;
+        extended_key = false; // Clear after processing extended key
         outb(0x20, 0x20);
         return;
     }
