@@ -10,7 +10,7 @@ static const size_t VGA_HEIGHT = 25;
 #define SCREEN_BACKUP_SIZE (VGA_WIDTH * VGA_HEIGHT)
 
 // Terminal buffer constants
-#define MAX_COMMAND_LENGTH 80
+#define MAX_COMMAND_LENGTH 256
 
 /* Hardware text mode color constants. */
 enum vga_color {
