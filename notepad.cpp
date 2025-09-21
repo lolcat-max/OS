@@ -119,7 +119,6 @@ static void int_to_string(int num, char* str) {
         str[i - 1 - j] = temp;
     }
 }
-
 void notepad_save_and_exit(const char* filename_arg) {
     char final_filename[256];
     if (filename_arg && filename_arg[0] != '\0') {
@@ -142,62 +141,26 @@ void notepad_save_and_exit(const char* filename_arg) {
     int result = fat32_write_file(ahci_base, 0, final_filename, save_buffer, simple_strlen(save_buffer));
     notepad_write_string_at(24, 0, "                                                                                ", 0x07);
     if (result == 0) {
-        notepad_write_string_at(24, 0, "File saved. Press any key.", 0x0A);
+        notepad_write_string_at(24, 0, "File saved successfully!", 0x0A);
     } else {
-        notepad_write_string_at(24, 0, "Error saving! Press any key.", 0x0C);
+        notepad_write_string_at(24, 0, "Error saving file!", 0x0C);
     }
 
-    // Wait for key press to continue
-    // Clear any pending keyboard data (including the ESC that triggered this)
-    volatile int clear_count = 0;
-    while ((inb(0x64) & 0x01) && clear_count < 10) {
-        inb(0x60);
-        clear_count++;
-        // Small delay between reads
-        for (volatile int i = 0; i < 5000; i++);
-    }
-    
-    // Now wait for a NEW key press (not the ESC that triggered save)
-    bool key_received = false;
-    while (!key_received) {
-        // Wait for keyboard data to be available
-        while (!(inb(0x64) & 0x01)) {
-            // Small delay to prevent busy waiting
-            for (volatile int i = 0; i < 1000; i++);
-        }
-        
-        // Read the key
-        uint8_t scancode = inb(0x60);
-        
-        // Only exit on key press (not release) and ignore extended key prefix
-        if (scancode != 0xE0 && !(scancode & 0x80)) {
-            key_received = true;
-        }
-        
-        // Small delay after reading
-        for (volatile int i = 0; i < 1000; i++);
-    }
-    
-    // Clear any remaining keyboard data
-    for (volatile int i = 0; i < 10000; i++);
-    while (inb(0x64) & 0x01) {
-        inb(0x60);
-    }
+    // Simple delay
+    for (volatile int delay = 0; delay < 2000000; delay++);
 
-    // IMPORTANT: Set notepad_running to false BEFORE clearing screen
+    // ONLY set the flag - don't call any terminal functions
     notepad_running = false;
     
-    // Hide the notepad cursor
-    notepad_hide_cursor();
+    // Clear screen manually using VGA buffer
+    for (int i = 0; i < 25 * 80; i++) {
+        vga_buffer[i] = 0x0720; // Space with gray on black
+    }
     
-    // Clear screen and restore terminal using only functions that definitely exist
-    terminal_clear_screen();
-    terminal_draw_header();
-    
-    // Position cursor at a reasonable location (adjust row/col as needed for your terminal)
-    // Typically after header, so maybe row 3 or 4, column 0
-    notepad_set_cursor_position(4, 0);
+    // Position cursor at start of line after prompt
+    notepad_set_cursor_position(0, 5);
     notepad_show_cursor();
+	
 }
 void notepad_load_file(const char* filename) {
     notepad_clear_buffer();
@@ -445,7 +408,6 @@ void notepad_handle_special_key(int scancode) {
             break;
         case 0x01:  // ESC key
             notepad_save_and_exit(notepad_filename);
-			command_prompt();
             return;
         default:
             break;
