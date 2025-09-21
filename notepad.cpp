@@ -3,6 +3,7 @@
 #include "terminal_io.h"
 #include "iostream_wrapper.h"
 #include "interrupts.h"
+#include "kernel.h"
 
 
 // --- NOTEPAD CONSTANTS ---
@@ -404,6 +405,7 @@ void notepad_handle_special_key(int scancode) {
             break;
         case 0x01:  // ESC key
             notepad_save_and_exit(notepad_filename);
+			command_prompt();
             return;
         default:
             break;
