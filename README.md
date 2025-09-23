@@ -14,7 +14,6 @@ TODO:
 
 Perhaps a modified open source kernel to only allow authenticated applications from accessing mutually exclusive drives and WiFi (not with the same virtual machine) with a root access prompts to transfer data to & from secure locations...
 
-Tamper resistant encryption of all the data on the drive with a proof of work storage system.
-
+Tamper resistant encryption of all the files on the drive with a proof of work storage system.
 
 
