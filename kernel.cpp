@@ -24,10 +24,98 @@
 #define ATTR_ARCHIVE 0x20
 #define DELETED_ENTRY 0xE5
 
-// ADD THESE THREE LINES RIGHT AFTER THE EXISTING FORWARD DECLARATIONS:
-void cmd_compile(uint64_t ahci_base, int port, const char* filename);
-void cmd_run(uint64_t ahci_base, int port, const char* filename);
-void cmd_exec(const char* code_text);
+
+
+
+// Function to print hex value with label (Keep this function)
+void print_hex(const char* label, uint32_t value) {
+    cout << label;
+
+    // Convert to hex
+    char hex_chars[16] = { '0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F' };
+    char buffer[11]; // Increased size for 0x + 8 digits + null
+
+    buffer[0] = '0';
+    buffer[1] = 'x';
+
+    // Fill from right to left for potentially shorter numbers if desired, but fixed 8 is fine too.
+    for (int i = 0; i < 8; i++) {
+        uint8_t nibble = (value >> (28 - i * 4)) & 0xF;
+        buffer[2 + i] = hex_chars[nibble];
+    }
+    buffer[10] = '\0';
+
+    cout << buffer << "\n";
+}
+
+
+
+
+// Debug function to fully examine SATA controller state
+uint64_t disk_init() {
+    cout << "Disk initilisation\n";
+    cout << "--------------------\n";
+
+    // Find AHCI controller via PCI
+    uint64_t ahci_base = 0;
+    uint16_t bus, dev, func;
+    uint16_t ahci_bus = 0, ahci_dev = 0, ahci_func = 0; // Store location
+
+    for (bus = 0; bus < 256 && !ahci_base; bus++) {
+        for (dev = 0; dev < 32 && !ahci_base; dev++) {
+            for (func = 0; func < 8 && !ahci_base; func++) {
+                // Check if device exists first (Vendor ID != 0xFFFF)
+                uint32_t vendor_device_check = pci_read_config_dword(bus, dev, func, 0x00);
+                if ((vendor_device_check & 0xFFFF) == 0xFFFF) {
+                    continue; // No device here
+                }
+
+                uint32_t class_reg = pci_read_config_dword(bus, dev, func, 0x08);
+                uint8_t class_code = (class_reg >> 24) & 0xFF;
+                uint8_t subclass = (class_reg >> 16) & 0xFF;
+                uint8_t prog_if = (class_reg >> 8) & 0xFF;
+
+                if (class_code == 0x01 && subclass == 0x06 && prog_if == 0x01) {
+                    uint32_t bar5 = pci_read_config_dword(bus, dev, func, 0x24);
+                    // Check if BAR5 is memory mapped and non-zero
+                    if ((bar5 & 0x1) == 0 && (bar5 & ~0xF) != 0) {
+                        ahci_base = bar5 & ~0xF;
+                        ahci_bus = bus;
+                        ahci_dev = dev;
+                        ahci_func = func;
+
+                        cout << "Found AHCI controller at PCI ";
+                        cout << (int)bus << ":" << (int)dev << "." << (int)func << "\n"; // Use dot separator common practice
+
+                        // Get vendor and device ID
+                        uint32_t vendor_device = pci_read_config_dword(bus, dev, func, 0x00);
+                        uint16_t vendor_id = vendor_device & 0xFFFF;
+                        uint16_t device_id = (vendor_device >> 16) & 0xFFFF;
+
+                        // Use print_hex for consistency (need to adapt for 16-bit)
+                        print_hex(" Vendor ID: ", vendor_id); // Assuming print_hex handles width ok
+                        print_hex(" Device ID: ", device_id);
+
+                    }
+                }
+            }
+        }
+    }
+
+    if (!ahci_base) {
+        cout << "No AHCI controller found or BAR5 not valid.\n";
+        return -1;
+    }
+    return ahci_base;
+}
+
+
+
+// Forward declarations for tinycc VM glue
+extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename);
+extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename);
+extern "C" void cmd_exec(const char* code_text);
+
 void usb_keyboard_self_test();
 
 void cmd_notepad(unsigned long long, int, char const*);
@@ -894,6 +982,36 @@ void cmd_cat(uint64_t ahci_base, int port, const char* filename) {
     }
 }
 
+
+static void int_to_string(int value, char* buffer) {
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = '\0';
+        return;
+    }
+    
+    bool negative = value < 0;
+    if (negative) value = -value;
+    
+    char temp[16];
+    int i = 0;
+    
+    while (value > 0) {
+        temp[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+    
+    int j = 0;
+    if (negative) buffer[j++] = '-';
+    
+    while (i > 0) {
+        buffer[j++] = temp[--i];
+    }
+    
+    buffer[j] = '\0';
+}
+
+
 // --- COMMAND PROMPT (Rewritten for better argument parsing) ---
 void command_prompt() {
     char line[MAX_COMMAND_LENGTH + 1];
@@ -1011,1103 +1129,555 @@ void command_prompt() {
     }
 }
 
-// --- ENHANCED C++ COMPILER SYSTEM ---
 
-// --- ENHANCED C COMPILER SYSTEM ---
-enum TokenType {
-    TOKEN_KEYWORD,
-    TOKEN_IDENTIFIER,
-    TOKEN_NUMBER,
-    TOKEN_STRING,
-    TOKEN_OPERATOR,
-    TOKEN_DELIMITER,
-    TOKEN_EOF
+// tinycc_vm_kernel.cpp
+// Self-hosted tinycc-style compiler to bytecode + VM runner inside kernel.
+// Features:
+// - Types: int, char, string (string is pointer to char, token-based I/O)
+// - Decls: int/char/string name [= expr] ;
+// - Expr: + - * /, unary -, comparisons (== != < <= > >=), parentheses
+// - Control: if/else, while, break, continue
+// - I/O: cin >> chains (int/char/string), cout << chains (int/char/string/argv(i)/endl)
+// - Built-ins: argc (int), argv(i) (string pointer)
+// - Program form: int main() { ... } with implicit return 0 if missing
+// - Object I/O: saves/loads TVM1 object via FAT32 helpers
+//
+// Requires existing kernel wrappers and helpers already present in your tree:
+// - cout, cin (iostream_wrapper.h) for console printing/input
+// - simple_strcmp, simple_strcpy, simple_memcpy, simple_atoi, int_to_string
+// - FAT32 I/O: fat32_read_file_to_buffer, fat32_write_file
+// - Command shell provides: parts[], part_count (tokenized command line)
+// - Keep cmd_compile/cmd_run signatures; command_prompt dispatch remains unchanged.
+
+// kernel.cpp — tinycc VM edition
+// Self-hosted tiny compiler -> bytecode VM with console I/O and filesystem I/O.
+// Features:
+// - Types: int, char, string (string is pointer to char for printing/assignment)
+// - Decls: int/char/string name [= expr] ;
+// - Expr: + - * /, unary -, comparisons (== != < <= > >=), parentheses
+// - Control: if/else, while, break, continue
+// - I/O: cin >> chains (int/char/string), cout << chains (int/char/string/argv(i)/endl)
+// - Built-ins: argc (int), argv(i) (string pointer)
+// - Program: int main() { ... } with implicit return 0 if missing
+// - Object I/O: TVM1 object saved/loaded via existing FAT32 helpers
+//
+// Kernel dependencies expected (already present in your tree):
+// - cout, cin from iostream_wrapper.h
+// - simple_strcmp, simple_strcpy, simple_memcpy, simple_atoi, int_to_string
+// - fat32_read_file_to_buffer, fat32_write_file
+// - parts[], part_count (command shell tokenization)
+
+#include "terminal_hooks.h"
+#include "terminal_io.h"
+#include "iostream_wrapper.h"
+#include "interrupts.h"
+#include "hardware_specs.h"
+#include "stdlib_hooks.h"
+#include "pci.h"
+#include "sata.h"
+#include "test.h"
+#include "test2.h"
+#include "disk.h"
+#include "dma_memory.h"
+#include "identify.h"
+#include "notepad.h"
+#include "xhci.h"
+
+// Forward declarations consumed by the command shell
+extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename);
+extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename);
+extern "C" void cmd_exec(const char* code_text);
+
+// Provided by the command shell tokenizer
+char* parts[32];
+int   part_count;
+
+// ---- tiny helpers ----
+static inline int tcc_is_digit(char c){ return c>='0' && c<='9'; }
+static inline int tcc_is_alpha(char c){ return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_'; }
+static inline int tcc_is_alnum(char c){ return tcc_is_alpha(c)||tcc_is_digit(c); }
+static inline int tcc_strlen(const char* s){ int n=0; while(s && s[n]) ++n; return n; }
+
+// ============================================================
+// Bytecode ISA
+// ============================================================
+enum TOp : unsigned char {
+    // stack/data
+    T_NOP=0, T_PUSH_IMM, T_PUSH_STR, T_LOAD_LOCAL, T_STORE_LOCAL, T_POP,
+
+    // arithmetic / unary
+    T_ADD, T_SUB, T_MUL, T_DIV, T_NEG,
+
+    // comparisons
+    T_EQ, T_NE, T_LT, T_LE, T_GT, T_GE,
+
+    // control flow
+    T_JMP, T_JZ, T_JNZ, T_RET,
+
+    // I/O and args
+    T_PRINT_INT, T_PRINT_CHAR, T_PRINT_STR, T_PRINT_ENDL,
+    T_READ_INT, T_READ_CHAR, T_READ_STR,
+    T_PUSH_ARGC, T_PUSH_ARGV_PTR
 };
 
-struct Token {
-    TokenType type;
-    char value[64];
-    int line;
+// ============================================================
+// Program buffers
+// ============================================================
+struct TProgram {
+    static const int CODE_MAX = 8192;
+    unsigned char code[CODE_MAX];
+    int pc = 0;
+
+    static const int LIT_MAX = 4096;
+    char lit[LIT_MAX];
+    int lit_top = 0;
+
+    static const int LOC_MAX = 32;
+    char  loc_name[LOC_MAX][32];
+    unsigned char loc_type[LOC_MAX]; // 0=int,1=char,2=string
+    int   loc_count = 0;
+
+    int add_local(const char* name, unsigned char t){
+        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], name)==0) return i; }
+        if(loc_count>=LOC_MAX) return -1;
+        simple_strcpy(loc_name[loc_count], name);
+        loc_type[loc_count]=t;
+        return loc_count++;
+    }
+    int get_local(const char* name){
+        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], name)==0) return i; }
+        return -1;
+    }
+    int get_local_type(int idx){ return (idx>=0 && idx<loc_count)? loc_type[idx] : 0; }
+
+    void emit1(unsigned char op){ if(pc<CODE_MAX) code[pc++]=op; }
+    void emit4(int v){ if(pc+4<=CODE_MAX){ code[pc++]=v&0xff; code[pc++]=(v>>8)&0xff; code[pc++]=(v>>16)&0xff; code[pc++]=(v>>24)&0xff; } }
+    int  mark(){ return pc; }
+    void patch4(int at, int v){ if(at+4<=CODE_MAX){ code[at+0]=v&0xff; code[at+1]=(v>>8)&0xff; code[at+2]=(v>>16)&0xff; code[at+3]=(v>>24)&0xff; } }
+
+    const char* add_lit(const char* s){
+        int n = tcc_strlen(s)+1;
+        if(lit_top+n > LIT_MAX) return "";
+        char* p = &lit[lit_top];
+        simple_memcpy(p, s, n);
+        lit_top += n;
+        return p;
+    }
 };
 
-// Variable table for local variables
-struct Variable {
-    char name[32];
-    int stack_offset;
-    bool in_use;
-};
+// ============================================================
+// Tokenizer
+// ============================================================
+enum TTokType { TT_EOF, TT_ID, TT_NUM, TT_STR, TT_CH, TT_KW, TT_OP, TT_PUNC };
+struct TTok { TTokType t; char v[64]; int ival; };
 
-class VariableTable {
-private:
-    Variable vars[16];
-    int next_offset;
+struct TLex {
+    const char* src; int pos; int line;
+    void init(const char* s){ src=s; pos=0; line=1; }
 
-public:
-    void init() {
-        for (int i = 0; i < 16; i++) {
-            vars[i].in_use = false;
+    void skipws(){
+        for(;;){
+            char c=src[pos];
+            if(c==' '||c=='\t'||c=='\r'||c=='\n'){ if(c=='\n') line++; pos++; continue; }
+            if(c=='/' && src[pos+1]=='/'){ pos+=2; while(src[pos] && src[pos]!='\n') pos++; continue; }
+            if(c=='/' && src[pos+1]=='*'){ pos+=2; while(src[pos] && !(src[pos]=='*'&&src[pos+1]=='/')) pos++; if(src[pos]) pos+=2; continue; }
+            break;
         }
-        next_offset = -4;
     }
 
-    int add_variable(const char* name) {
-        for (int i = 0; i < 16; i++) {
-            if (!vars[i].in_use) {
-                simple_strcpy(vars[i].name, name);
-                vars[i].stack_offset = next_offset;
-                vars[i].in_use = true;
-                next_offset -= 4;
-                return vars[i].stack_offset;
+    TTok number(){
+        TTok t; t.t=TT_NUM; t.ival=0; int i=0;
+        while(tcc_is_digit(src[pos])){ t.v[i++]=src[pos]; t.ival = t.ival*10 + (src[pos]-'0'); pos++; if(i>=63) break; }
+        t.v[i]=0; return t;
+    }
+
+    TTok ident(){
+        TTok t; t.t=TT_ID; int i=0;
+        while(tcc_is_alnum(src[pos])){ t.v[i++]=src[pos++]; if(i>=63) break; } t.v[i]=0;
+        const char* kw[]={"int","char","string","return","if","else","while","break","continue","cin","cout","endl","argc","argv",0};
+        for(int k=0; kw[k]; ++k){ if(simple_strcmp(t.v,kw[k])==0){ t.t=TT_KW; break; } }
+        return t;
+    }
+
+    TTok string(){
+        TTok t; t.t=TT_STR; int i=0; pos++;
+        while(src[pos] && src[pos]!='"'){ if(i<63) t.v[i++]=src[pos]; pos++; }
+        t.v[i]=0; if(src[pos]=='"') pos++; return t;
+    }
+
+    TTok chlit(){
+        TTok t; t.t=TT_CH; t.v[0]=0; int v=0; pos++; // skip '
+        if(src[pos] && src[pos+1]=='\''){ v = (unsigned char)src[pos]; pos+=2; }
+        t.ival = v; return t;
+    }
+
+    TTok op_or_punc(){
+        TTok t; t.t=TT_OP; t.v[0]=src[pos]; t.v[1]=0; char c=src[pos];
+        if(c=='<' && src[pos+1]=='<'){ t.v[0]='<'; t.v[1]='<'; t.v[2]=0; pos+=2; return t; }
+        if(c=='>' && src[pos+1]=='>'){ t.v[0]='>'; t.v[1]='>'; t.v[2]=0; pos+=2; return t; }
+        if((c=='='||c=='!'||c=='<'||c=='>') && src[pos+1]=='='){ t.v[0]=c; t.v[1]='='; t.v[2]=0; pos+=2; return t; }
+        pos++; if(c=='('||c==')'||c=='{'||c=='}'||c==';'||c==',' ) t.t=TT_PUNC; return t;
+    }
+
+    TTok next(){
+        skipws();
+        if(src[pos]==0){ TTok t; t.t=TT_EOF; t.v[0]=0; return t; }
+        if(src[pos]=='"') return string();
+        if(src[pos]=='\'') return chlit();
+        if(tcc_is_digit(src[pos])) return number();
+        if(tcc_is_alpha(src[pos])) return ident();
+        return op_or_punc();
+    }
+};
+
+// ============================================================
+// Parser / Compiler
+// ============================================================
+struct TCompiler {
+    TLex lx; TTok tk; TProgram pr;
+
+    int brk_pos[32]; int brk_cnt=0;
+    int cont_pos[32]; int cont_cnt=0;
+
+    void adv(){ tk = lx.next(); }
+    int  accept(const char* s){ if(simple_strcmp(tk.v,s)==0){ adv(); return 1; } return 0; }
+    void expect(const char* s){ if(!accept(s)) { cout << "Parse error near: "; cout << tk.v; cout << "\n"; } }
+
+    void parse_primary(){
+        if(tk.t==TT_NUM){ pr.emit1(T_PUSH_IMM); pr.emit4(tk.ival); adv(); return; }
+        if(tk.t==TT_CH){ pr.emit1(T_PUSH_IMM); pr.emit4(tk.ival); adv(); return; }
+        if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"argc")==0){ pr.emit1(T_PUSH_ARGC); adv(); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); return; }
+        if(tk.t==TT_PUNC && tk.v[0]=='('){ adv(); parse_expression(); expect(")"); return; }
+        if(tk.t==TT_ID){
+            int idx = pr.get_local(tk.v);
+            if(idx<0){ cout << "Unknown var "; cout << tk.v; cout << "\n"; }
+            pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); adv(); return;
+        }
+    }
+
+    void parse_unary(){
+        if(accept("-")){ parse_unary(); pr.emit1(T_NEG); return; }
+        parse_primary();
+    }
+
+    void parse_term(){
+        parse_unary();
+        while(tk.v[0]=='*' || tk.v[0]=='/'){
+            char op=tk.v[0]; adv(); parse_unary();
+            pr.emit1(op=='*'?T_MUL:T_DIV);
+        }
+    }
+
+    void parse_arith(){
+        parse_term();
+        while(tk.v[0]=='+' || tk.v[0]=='-'){
+            char op=tk.v[0]; adv(); parse_term();
+            pr.emit1(op=='+'?T_ADD:T_SUB);
+        }
+    }
+
+    void parse_cmp(){
+        parse_arith();
+        while(tk.t==TT_OP && (simple_strcmp(tk.v,"==")==0 || simple_strcmp(tk.v,"!=")==0 ||
+               simple_strcmp(tk.v,"<")==0 || simple_strcmp(tk.v,"<=")==0 ||
+               simple_strcmp(tk.v,">")==0 || simple_strcmp(tk.v,">=")==0)){
+            char opv[3]; simple_strcpy(opv, tk.v); adv(); parse_arith();
+            if(simple_strcmp(opv,"==")==0) pr.emit1(T_EQ);
+            else if(simple_strcmp(opv,"!=")==0) pr.emit1(T_NE);
+            else if(simple_strcmp(opv,"<")==0)  pr.emit1(T_LT);
+            else if(simple_strcmp(opv,"<=")==0) pr.emit1(T_LE);
+            else if(simple_strcmp(opv,">")==0)  pr.emit1(T_GT);
+            else pr.emit1(T_GE);
+        }
+    }
+
+    void parse_expression(){ parse_cmp(); }
+
+    void parse_decl(unsigned char tkind){
+        adv(); // past type keyword
+        if(tk.t!=TT_ID){ cout << "Expected identifier\n"; return; }
+        char nm[32]; simple_strcpy(nm, tk.v); adv();
+        int idx = pr.add_local(nm, tkind);
+        if(accept("=")){ 
+            if(tkind==2){ // string
+                if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); }
+                else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); }
+                else if(tk.t==TT_ID){ int j=pr.get_local(tk.v); adv(); pr.emit1(T_LOAD_LOCAL); pr.emit4(j); }
+                else { parse_expression(); }
+            } else {
+                parse_expression();
             }
+            pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
         }
-        return 0;
+        expect(";");
     }
 
-    int get_variable_offset(const char* name) {
-        for (int i = 0; i < 16; i++) {
-            if (vars[i].in_use && simple_strcmp(vars[i].name, name) == 0) {
-                return vars[i].stack_offset;
+    void parse_assign_or_coutcin(){
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"cout")==0){ adv();
+            for(;;){
+                expect("<<");
+                if(tk.t==TT_KW && simple_strcmp(tk.v,"endl")==0){ adv(); pr.emit1(T_PRINT_ENDL); }
+                else if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); pr.emit1(T_PRINT_STR); }
+                else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); pr.emit1(T_PRINT_STR); }
+                else if(tk.t==TT_ID){
+                    int idx = pr.get_local(tk.v); int ty = pr.get_local_type(idx); adv();
+                    pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);
+                    if(ty==2) pr.emit1(T_PRINT_STR);
+                    else if(ty==1) pr.emit1(T_PRINT_CHAR);
+                    else pr.emit1(T_PRINT_INT);
+                } else { parse_expression(); pr.emit1(T_PRINT_INT); }
+                if(tk.t==TT_PUNC && tk.v[0]==';'){ adv(); break; }
             }
+            return;
         }
-        return 0;
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"cin")==0){ adv();
+            for(;;){
+                expect(">>"); if(tk.t!=TT_ID){ cout << "cin expects identifier\n"; return; }
+                int idx = pr.get_local(tk.v); int ty = pr.get_local_type(idx); adv();
+                if(ty==2) pr.emit1(T_READ_STR);
+                else if(ty==1) pr.emit1(T_READ_CHAR);
+                else pr.emit1(T_READ_INT);
+                pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
+                if(tk.t==TT_PUNC && tk.v[0]==';'){ adv(); break; }
+            }
+            return;
+        }
+
+        if(tk.t==TT_ID){
+            int idx = pr.get_local(tk.v);
+            if(idx<0){ cout << "Unknown var "; cout << tk.v; cout << "\n"; }
+            int ty = pr.get_local_type(idx);
+            adv(); expect("=");
+            if(ty==2){
+                if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); }
+                else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); }
+                else if(tk.t==TT_ID){ int j=pr.get_local(tk.v); adv(); pr.emit1(T_LOAD_LOCAL); pr.emit4(j); }
+                else { parse_expression(); }
+            } else {
+                parse_expression();
+            }
+            pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
+            expect(";");
+            return;
+        }
+
+        while(!(tk.t==TT_PUNC && tk.v[0]==';') && tk.t!=TT_EOF) adv();
+        if(tk.t==TT_PUNC && tk.v[0]==';') adv();
     }
 
-    int get_stack_size() {
-        return -next_offset + 4;
-    }
-};
-
-class SimpleTokenizer {
-private:
-    const char* source;
-    int pos;
-    int line;
-
-    void skip_whitespace() {
-        while (source[pos] == ' ' || source[pos] == '\t' || source[pos] == '\n' || source[pos] == '\r') {
-            if (source[pos] == '\n') line++;
-            pos++;
-        }
-    }
-
-    bool is_digit(char c) { return c >= '0' && c <= '9'; }
-    bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
-
-    Token read_number() {
-        Token token;
-        token.type = TOKEN_NUMBER;
-        token.line = line;
-        int i = 0;
-        while (is_digit(source[pos]) && i < 63) {
-            token.value[i++] = source[pos++];
-        }
-        token.value[i] = 0;
-        return token;
-    }
-
-    Token read_identifier() {
-        Token token;
-        token.line = line;
-        int i = 0;
-        
-        while ((is_alpha(source[pos]) || is_digit(source[pos]) || source[pos] == '_') && i < 63) {
-            token.value[i++] = source[pos++];
-        }
-        token.value[i] = 0;
-        
-        // Check for keywords
-        if (simple_strcmp(token.value, "int") == 0 || 
-            simple_strcmp(token.value, "void") == 0 ||
-            simple_strcmp(token.value, "return") == 0 ||
-            simple_strcmp(token.value, "if") == 0 ||
-            simple_strcmp(token.value, "else") == 0 ||
-            simple_strcmp(token.value, "while") == 0 ||
-            simple_strcmp(token.value, "break") == 0 ||    // ADDED
-            simple_strcmp(token.value, "continue") == 0) { // ADDED
-            token.type = TOKEN_KEYWORD;
+    void parse_if(){
+        adv(); expect("("); parse_expression(); expect(")");
+        pr.emit1(T_JZ); int jz_at = pr.mark(); pr.emit4(0);
+        parse_block();
+        int has_else = (tk.t==TT_KW && simple_strcmp(tk.v,"else")==0);
+        if(has_else){
+            pr.emit1(T_JMP); int j_at = pr.mark(); pr.emit4(0);
+            int here = pr.pc; pr.patch4(jz_at, here);
+            adv(); // else
+            parse_block();
+            int end = pr.pc; pr.patch4(j_at, end);
         } else {
-            token.type = TOKEN_IDENTIFIER;
+            int here = pr.pc; pr.patch4(jz_at, here);
         }
-        
-        return token;
     }
 
-    Token read_operator() {
-        Token token;
-        token.type = TOKEN_OPERATOR;
-        token.line = line;
-        
-        if (source[pos] == '=' && source[pos + 1] == '=') {
-            token.value[0] = '=';
-            token.value[1] = '=';
-            token.value[2] = 0;
-            pos += 2;
-        }
-        else if (source[pos] == '!' && source[pos + 1] == '=') {
-            token.value[0] = '!';
-            token.value[1] = '=';
-            token.value[2] = 0;
-            pos += 2;
-        }
-        else if (source[pos] == '<' && source[pos + 1] == '=') {
-            token.value[0] = '<';
-            token.value[1] = '=';
-            token.value[2] = 0;
-            pos += 2;
-        }
-        else if (source[pos] == '>' && source[pos + 1] == '=') {
-            token.value[0] = '>';
-            token.value[1] = '=';
-            token.value[2] = 0;
-            pos += 2;
-        }
-        else {
-            token.value[0] = source[pos];
-            token.value[1] = 0;
-            pos++;
-        }
-        return token;
+    void parse_while(){
+        adv(); expect("("); int cond_ip = pr.pc; parse_expression(); expect(")");
+        pr.emit1(T_JZ); int jz_at = pr.mark(); pr.emit4(0);
+        int brk_base=brk_cnt, cont_base=cont_cnt;
+        parse_block();
+        for(int i=cont_base;i<cont_cnt;i++){ pr.patch4(cont_pos[i], cond_ip); }
+        cont_cnt = cont_base;
+        pr.emit1(T_JMP); pr.emit4(cond_ip);
+        int end_ip = pr.pc; pr.patch4(jz_at, end_ip);
+        for(int i=brk_base;i<brk_cnt;i++){ pr.patch4(brk_pos[i], end_ip); }
+        brk_cnt = brk_base;
     }
 
-public:
-    void init(const char* src) {
-        source = src;
-        pos = 0;
-        line = 1;
+    void parse_block(){
+        if(accept("{")){
+            while(!(tk.t==TT_PUNC && tk.v[0]=='}') && tk.t!=TT_EOF) parse_stmt();
+            expect("}");
+        } else {
+            parse_stmt();
+        }
     }
 
-    Token next_token() {
-        Token token;
-        skip_whitespace();
-        
-        if (source[pos] == 0) {
-            token.type = TOKEN_EOF;
-            token.value[0] = 0;
-            return token;
-        }
-        
-        if (is_digit(source[pos])) {
-            return read_number();
-        }
-        
-        if (is_alpha(source[pos]) || source[pos] == '_') {
-            return read_identifier();
-        }
-        
-        char c = source[pos];
-        if (c == '=' || c == '<' || c == '>' || c == '!' || 
-            c == '+' || c == '-' || c == '*' || c == '/') {
-            return read_operator();
-        }
-        
-        token.type = TOKEN_DELIMITER;
-        token.value[0] = source[pos];
-        token.value[1] = 0;
-        token.line = line;
-        pos++;
-        return token;
+    void parse_stmt(){
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"int")==0){ parse_decl(0); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"char")==0){ parse_decl(1); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"string")==0){ parse_decl(2); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"return")==0){ adv(); parse_expression(); pr.emit1(T_RET); expect(";"); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"if")==0){ parse_if(); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"while")==0){ parse_while(); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"break")==0){ adv(); expect(";"); pr.emit1(T_JMP); int at=pr.mark(); pr.emit4(0); brk_pos[brk_cnt++]=at; return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"continue")==0){ adv(); expect(";"); pr.emit1(T_JMP); int at=pr.mark(); pr.emit4(0); cont_pos[cont_cnt++]=at; return; }
+        parse_assign_or_coutcin();
+    }
+
+    int compile(const char* source){
+        lx.init(source); adv();
+        if(!(tk.t==TT_KW && simple_strcmp(tk.v,"int")==0)) { cout<<"Expected 'int' at start\n"; return -1; }
+        adv();
+        if(!(tk.t==TT_ID && simple_strcmp(tk.v,"main")==0)){ cout<<"Expected main\n"; return -1; }
+        adv(); expect("("); expect(")"); parse_block();
+        pr.emit1(T_PUSH_IMM); pr.emit4(0); pr.emit1(T_RET);
+        return pr.pc;
     }
 };
 
-class X86Generator {
-private:
-    uint8_t* code_buffer;
-    int code_pos;
-    int buffer_size;
+// ============================================================
+// VM
+// ============================================================
+struct TinyVM {
+    static const int STK_MAX = 1024;
+    int   stk[STK_MAX]; int sp=0;
+    int   locals[TProgram::LOC_MAX];   // NEW: dedicated locals storage
+    int   argc; const char** argv;
+    TProgram* P;
+    char str_in[256];
 
-    void emit_byte(uint8_t byte) {
-        if (code_pos < buffer_size) {
-            code_buffer[code_pos++] = byte;
-        }
-    }
+    inline void push(int v){ if(sp<STK_MAX) stk[sp++]=v; }
+    inline int  pop(){ return sp?stk[--sp]:0; }
 
-    void emit_dword(uint32_t dword) {
-        emit_byte(dword & 0xff);
-        emit_byte((dword >> 8) & 0xff);
-        emit_byte((dword >> 16) & 0xff);
-        emit_byte((dword >> 24) & 0xff);
-    }
+    int run(TProgram& prog, int ac, const char** av){
+        P=&prog; argc=ac; argv=av; sp=0;
+        for (int i=0;i<TProgram::LOC_MAX;i++) locals[i]=0;  // NEW: init locals
+        int ip=0;
+        while(ip < P->pc){
+            TOp op = (TOp)P->code[ip++];
+            switch(op){
+                case T_NOP: break;
+                case T_PUSH_IMM: { int v= *(int*)&P->code[ip]; ip+=4; push(v); } break;
+                case T_PUSH_STR: { int p= *(int*)&P->code[ip]; ip+=4; push(p); } break;
+                case T_LOAD_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; push(locals[i]); } break;   // CHANGED
+                case T_STORE_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; locals[i]=pop(); } break;   // CHANGED
+                case T_POP: { if(sp) --sp; } break;
 
-public:
-    void init(uint8_t* buffer, int size) {
-        code_buffer = buffer;
-        code_pos = 0;
-        buffer_size = size;
-    }
+                case T_ADD: { int b=pop(), a=pop(); push(a+b);} break;
+                case T_SUB: { int b=pop(), a=pop(); push(a-b);} break;
+                case T_MUL: { int b=pop(), a=pop(); push(a*b);} break;
+                case T_DIV: { int b=pop(), a=pop(); push(b? a/b:0);} break;
+                case T_NEG: { int a=pop(); push(-a);} break;
 
-    void emit_function_prologue(int stack_space = 0) {
-        emit_byte(0x55);    // push ebp
-        emit_byte(0x89);    // mov ebp, esp
-        emit_byte(0xe5);
-        if (stack_space > 0) {
-            emit_byte(0x83);    // sub esp, stack_space
-            emit_byte(0xec);
-            emit_byte(stack_space & 0xff);
-        }
-    }
+                case T_EQ: { int b=pop(), a=pop(); push(a==b);} break;
+                case T_NE: { int b=pop(), a=pop(); push(a!=b);} break;
+                case T_LT: { int b=pop(), a=pop(); push(a<b);} break;
+                case T_LE: { int b=pop(), a=pop(); push(a<=b);} break;
+                case T_GT: { int b=pop(), a=pop(); push(a>b);} break;
+                case T_GE: { int b=pop(), a=pop(); push(a>=b);} break;
 
-    void emit_function_epilogue() {
-        emit_byte(0x89);    // mov esp, ebp
-        emit_byte(0xec);
-        emit_byte(0x5d);    // pop ebp
-        emit_byte(0xc3);    // ret
-    }
+                case T_JMP: { int t=*(int*)&P->code[ip]; ip=t; } break;
+                case T_JZ:  { int t=*(int*)&P->code[ip]; ip+=4; int v=pop(); if(v==0) ip=t; } break;
+                case T_JNZ: { int t=*(int*)&P->code[ip]; ip+=4; int v=pop(); if(v!=0) ip=t; } break;
 
-    void emit_mov_eax_immediate(int value) {
-        emit_byte(0xb8);
-        emit_dword(value);
-    }
+                case T_PRINT_INT: { int v=pop(); char b[16]; int_to_string(v,b); cout << b; } break;
+                case T_PRINT_CHAR:{ int v=pop(); char b[2]; b[0]=(char)(v&0xff); b[1]=0; cout << b; } break;
+                case T_PRINT_STR: { const char* p=(const char*)pop(); if(p) cout << p; } break;
+                case T_PRINT_ENDL:{ cout << "\n"; } break;
 
-    void emit_mov_eax_variable(int offset) {
-        emit_byte(0x8b);    // mov eax, [ebp+offset]
-        emit_byte(0x45);
-        emit_byte(offset & 0xff);
-    }
+                case T_READ_INT: { char t[32]; cin >> t; push(simple_atoi(t)); } break;
+                case T_READ_CHAR:{ char t[4]; cin >> t; push((unsigned char)t[0]); } break;
+                case T_READ_STR: { cin >> str_in; push((int)str_in); } break;
 
-    void emit_mov_variable_eax(int offset) {
-        emit_byte(0x89);    // mov [ebp+offset], eax
-        emit_byte(0x45);
-        emit_byte(offset & 0xff);
-    }
+                case T_PUSH_ARGC: { push(argc); } break;
+                case T_PUSH_ARGV_PTR: { int idx=pop(); const char* p=(idx>=0 && idx<argc && argv)? argv[idx]:""; push((int)p); } break;
 
-    void emit_push_eax() {
-        emit_byte(0x50);
-    }
-
-    void emit_pop_ebx() {
-        emit_byte(0x5b);
-    }
-
-    void emit_add_eax_ebx() {
-        emit_byte(0x01);
-        emit_byte(0xd8);
-    }
-
-    void emit_sub_ebx_eax() {
-        emit_byte(0x29);
-        emit_byte(0xc3);
-    }
-
-    void emit_mov_eax_ebx() {
-        emit_byte(0x89);
-        emit_byte(0xd8);
-    }
-
-    void emit_imul_eax_ebx() {
-        emit_byte(0x0f);
-        emit_byte(0xaf);
-        emit_byte(0xc3);
-    }
-
-    void emit_div_ebx() {
-        emit_byte(0x99);    // cdq
-        emit_byte(0xf7);    // idiv ebx
-        emit_byte(0xfb);
-    }
-
-    void emit_cmp_ebx_eax() {
-        emit_byte(0x39);
-        emit_byte(0xc3);
-    }
-
-    void emit_sete_al() {
-        emit_byte(0x0f);
-        emit_byte(0x94);
-        emit_byte(0xc0);
-        emit_byte(0x0f);
-        emit_byte(0xb6);
-        emit_byte(0xc0);
-    }
-
-    void emit_setne_al() {
-        emit_byte(0x0f);
-        emit_byte(0x95);
-        emit_byte(0xc0);
-        emit_byte(0x0f);
-        emit_byte(0xb6);
-        emit_byte(0xc0);
-    }
-
-    void emit_setl_al() {
-        emit_byte(0x0f);
-        emit_byte(0x9c);
-        emit_byte(0xc0);
-        emit_byte(0x0f);
-        emit_byte(0xb6);
-        emit_byte(0xc0);
-    }
-
-    void emit_setle_al() {
-        emit_byte(0x0f);
-        emit_byte(0x9e);
-        emit_byte(0xc0);
-        emit_byte(0x0f);
-        emit_byte(0xb6);
-        emit_byte(0xc0);
-    }
-
-    void emit_setg_al() {
-        emit_byte(0x0f);
-        emit_byte(0x9f);
-        emit_byte(0xc0);
-        emit_byte(0x0f);
-        emit_byte(0xb6);
-        emit_byte(0xc0);
-    }
-
-    void emit_setge_al() {
-        emit_byte(0x0f);
-        emit_byte(0x9d);
-        emit_byte(0xc0);
-        emit_byte(0x0f);
-        emit_byte(0xb6);
-        emit_byte(0xc0);
-    }
-
-    void emit_test_eax() {
-        emit_byte(0x85);
-        emit_byte(0xc0);
-    }
-
-    int emit_jmp_forward() {
-		emit_byte(0xe9);        // JMP rel32 opcode (near jump)
-		int patch_pos = code_pos; // Position where we need to write displacement
-		emit_dword(0x00000000); // Placeholder - will be patched later
-		return patch_pos;       // Return position of the displacement field
-	}
-
-
-	int emit_jz_forward() {
-		emit_byte(0x0f);        // Two-byte opcode for JZ rel32
-		emit_byte(0x84);
-		int patch_pos = code_pos; // Position of the 4-byte displacement  
-		emit_dword(0x00000000); // Placeholder displacement
-		return patch_pos;       // Return position of displacement bytes
-	}
-
-
-    void emit_jmp_backward(int target_pos) {
-        emit_byte(0xe9);
-        int displacement = target_pos - (code_pos + 4);
-        emit_dword(displacement);
-    }
-
-    void patch_jump(int jump_pos, int target_pos) {
-		// jump_pos is the position of the 4-byte displacement field
-		// target_pos is where we want to jump to
-		// Displacement = target - (end of jump instruction)
-		int displacement = target_pos - (jump_pos + 4);
-		
-		cout << "DEBUG: Patching jump at " << jump_pos << " to target " << target_pos;
-		cout << " (displacement: " << displacement << ")\n";
-		
-		// Write displacement in little-endian format
-		code_buffer[jump_pos]     = displacement & 0xff;
-		code_buffer[jump_pos + 1] = (displacement >> 8) & 0xff;
-		code_buffer[jump_pos + 2] = (displacement >> 16) & 0xff;
-		code_buffer[jump_pos + 3] = (displacement >> 24) & 0xff;
-	}
-
-
-
-    int get_code_pos() { return code_pos; }
-    int get_current_pos() { return code_pos; }
-    int get_code_size() { return code_pos; }
-};
-
-class SimpleCppCompiler {
-private:
-    SimpleTokenizer tokenizer;
-    Token current_token;
-    X86Generator generator;
-    VariableTable variables;
-
-    // LOOP CONTEXT FOR BREAK/CONTINUE - THIS IS ESSENTIAL
-    struct LoopContext {
-        int break_jumps[16];        // Array of jump positions that need patching
-        int continue_jumps[16];     // Array of continue jump positions  
-        int break_count;            // Number of break statements collected
-        int continue_count;         // Number of continue statements collected
-        int loop_start_pos;         // Position where loop condition begins
-        bool active;                // Is this loop context currently active
-    };
-    
-    LoopContext loop_stack[8];      // Support up to 8 nested loops
-    int loop_level;                 // Current nesting depth
-
-    // ESSENTIAL LOOP CONTEXT MANAGEMENT
-    void push_loop_context(int loop_start) {
-        if (loop_level < 8) {
-            loop_stack[loop_level].break_count = 0;
-            loop_stack[loop_level].continue_count = 0;
-            loop_stack[loop_level].loop_start_pos = loop_start;
-            loop_stack[loop_level].active = true;
-            loop_level++;
-        }
-    }
-    
-    void pop_loop_context(int loop_end) {
-        if (loop_level > 0) {
-            loop_level--;
-            LoopContext& ctx = loop_stack[loop_level];
-            
-            // BACKPATCH ALL BREAK JUMPS TO LOOP END
-            for (int i = 0; i < ctx.break_count; i++) {
-                generator.patch_jump(ctx.break_jumps[i], loop_end);
-            }
-            
-            // BACKPATCH ALL CONTINUE JUMPS TO LOOP START  
-            for (int i = 0; i < ctx.continue_count; i++) {
-                generator.patch_jump(ctx.continue_jumps[i], ctx.loop_start_pos);
-            }
-            
-            ctx.active = false;
-        }
-    }
-    
-    bool is_inside_loop() {
-        return loop_level > 0 && loop_stack[loop_level - 1].active;
-    }
-    
-    void add_break_jump(int jump_pos) {
-        if (is_inside_loop()) {
-            LoopContext& ctx = loop_stack[loop_level - 1];
-            if (ctx.break_count < 16) {
-                ctx.break_jumps[ctx.break_count++] = jump_pos;
+                case T_RET: { int rv=pop(); return rv; }
+                default: return -1;
             }
         }
-    }
-    
-    void add_continue_jump(int jump_pos) {
-        if (is_inside_loop()) {
-            LoopContext& ctx = loop_stack[loop_level - 1];
-            if (ctx.continue_count < 16) {
-                ctx.continue_jumps[ctx.continue_count++] = jump_pos;
-            }
-        }
-    }
-
-    
-    
-    void advance() {
-        current_token = tokenizer.next_token();
-    }
-
-    bool expect(const char* expected) {
-        if (simple_strcmp(current_token.value, expected) == 0) {
-            advance();
-            return true;
-        }
-        return false;
-    }
-
-    bool parse_program() {
-        while (current_token.type != TOKEN_EOF) {
-            if (!parse_function()) return false;
-        }
-        return true;
-    }
-
-    bool parse_function() {
-        if (current_token.type != TOKEN_KEYWORD) return false;
-        if (simple_strcmp(current_token.value, "int") != 0) return false;
-        advance();
-        
-        if (current_token.type != TOKEN_IDENTIFIER) return false;
-        advance();
-        
-        if (!expect("(")) return false;
-        if (!expect(")")) return false;
-        if (!expect("{")) return false;
-        
-        variables.init();
-        generator.emit_function_prologue(64);
-        
-        while (current_token.value[0] != '}' && current_token.type != TOKEN_EOF) {
-            if (!parse_statement()) return false;
-        }
-        
-        if (!expect("}")) return false;
-        generator.emit_function_epilogue();
-        return true;
-    }
-
-    bool parsestatement() {
-    if (current_token.type == TOKEN_KEYWORD) {
-        if (simple_strcmp(current_token.value, "int") == 0) {
-            return parse_variable_declaration();
-        }
-        else if (simple_strcmp(current_token.value, "return") == 0) {
-            return parse_return_statement();
-        }
-        else if (simple_strcmp(current_token.value, "if") == 0) {
-            return parse_if_statement();
-        }
-        else if (simple_strcmp(current_token.value, "while") == 0) {
-            return parse_while_statement();
-        }
-        // ADD THESE MISSING CASES
-        else if (simple_strcmp(current_token.value, "break") == 0) {
-            advance(); // skip 'break'
-            
-            // For now, generate a simple unconditional jump to end of function
-            // This is a basic implementation - you'll need loop context for proper break
-            generator.emit_jmp_forward(); // This jump won't be patched properly yet
-            
-            return expect(";");
-        }
-        else if (simple_strcmp(current_token.value, "continue") == 0) {
-            advance(); // skip 'continue'
-            
-            // For now, just skip - proper implementation needs loop context
-            return expect(";");
-        }
-    }
-    else if (current_token.type == TOKEN_IDENTIFIER) {
-        return parse_assignment();
-    }
-    
-    // Skip unknown statements
-    while (current_token.value[0] != ';' && current_token.type != TOKEN_EOF) {
-        advance();
-    }
-    if (current_token.value[0] == ';') advance();
-    return true;
-}
-
-
-
-    bool parse_variable_declaration() {
-        advance(); // skip 'int'
-        if (current_token.type != TOKEN_IDENTIFIER) return false;
-        
-        char var_name[32];
-        simple_strcpy(var_name, current_token.value);
-        advance();
-        
-        variables.add_variable(var_name);
-        
-        if (current_token.value[0] == '=') {
-            advance();
-            if (!parse_expression()) return false;
-            int offset = variables.get_variable_offset(var_name);
-            generator.emit_mov_variable_eax(offset);
-        }
-        
-        return expect(";");
-    }
-
-    bool parse_assignment() {
-        char var_name[32];
-        simple_strcpy(var_name, current_token.value);
-        advance();
-        
-        if (!expect("=")) return false;
-        if (!parse_expression()) return false;
-        
-        int offset = variables.get_variable_offset(var_name);
-        if (offset != 0) {
-            generator.emit_mov_variable_eax(offset);
-        }
-        
-        return expect(";");
-    }
-
-    bool parse_return_statement() {
-        advance(); // skip 'return'
-        
-        if (!parse_expression()) return false;
-        
-        return expect(";");
-    }
-
-    bool parse_if_statement() {
-        advance(); // skip 'if'
-        
-        if (!expect("(")) return false;
-        if (!parse_expression()) return false;
-        if (!expect(")")) return false;
-        
-        generator.emit_test_eax();
-        int jump_pos = generator.emit_jz_forward();
-        
-        if (!expect("{")) return false;
-        
-        while (current_token.value[0] != '}' && current_token.type != TOKEN_EOF) {
-            if (!parse_statement()) return false;
-        }
-        
-        if (!expect("}")) return false;
-        
-        generator.patch_jump(jump_pos, generator.get_current_pos());
-        return true;
-    }
-
-        // CORRECTED WHILE LOOP WITH PROPER BREAK/CONTINUE SUPPORT
-    bool parse_while_statement() {
-		advance(); // skip 'while'
-		
-		if (!expect("(")) return false;
-		
-		int loop_start = generator.get_current_pos();
-		cout << "DEBUG: Loop starts at position: " << loop_start << "\n";
-		
-		push_loop_context(loop_start);  // CRITICAL: Set up break/continue context
-		
-		if (!parse_expression()) return false;
-		if (!expect(")")) return false;
-		
-		generator.emit_test_eax();
-		int condition_jump = generator.emit_jz_forward();
-		
-		if (!expect("{")) return false;
-		
-		// Parse loop body - break statements will be collected here
-		while (current_token.value[0] != '}' && current_token.type != TOKEN_EOF) {
-			if (!parse_statement()) return false;
-		}
-		
-		if (!expect("}")) return false;
-		
-		generator.emit_jmp_backward(loop_start);
-		int loop_end = generator.get_current_pos();
-		
-		cout << "DEBUG: Loop ends at position: " << loop_end << "\n";
-		
-		generator.patch_jump(condition_jump, loop_end);
-		pop_loop_context(loop_end);  // CRITICAL: Patch all break jumps
-		
-		return true;
-	}
-
-
-    bool parse_break_statement() {
-		advance(); // skip 'break'
-		
-		if (!is_inside_loop()) {
-			cout << "Error: break statement not inside loop\n";
-			return false;
-		}
-		
-		cout << "DEBUG: Generating break at code position: " << generator.get_current_pos() << "\n";
-		
-		// Generate forward jump - target unknown until loop ends
-		int jump_pos = generator.emit_jmp_forward();
-		add_break_jump(jump_pos);
-		
-		cout << "DEBUG: Break jump stored at position: " << jump_pos << "\n";
-		
-		return expect(";");
-	}
-
-
-    // CORRECTED CONTINUE STATEMENT PARSING  
-    bool parse_continue_statement() {
-        advance(); // skip 'continue'
-        
-        if (!is_inside_loop()) {
-            cout << "Error: continue statement not inside loop\n";
-            return false;
-        }
-        
-        // Generate forward jump - target unknown until we backpatch
-        int jump_pos = generator.emit_jmp_forward();
-        add_continue_jump(jump_pos);  // Add to list for later backpatching
-        
-        return expect(";");
-    }
-
-    // ENSURE parsestatement() INCLUDES BREAK/CONTINUE
-    bool parse_statement() {
-        if (current_token.type == TOKEN_KEYWORD) {
-            if (simple_strcmp(current_token.value, "int") == 0) {
-                return parse_variable_declaration();
-            }
-            else if (simple_strcmp(current_token.value, "return") == 0) {
-                return parse_return_statement();
-            }
-            else if (simple_strcmp(current_token.value, "if") == 0) {
-                return parse_if_statement();
-            }
-            else if (simple_strcmp(current_token.value, "while") == 0) {
-                return parse_while_statement();
-            }
-            // CRITICAL: ADD THESE CASES
-            else if (simple_strcmp(current_token.value, "break") == 0) {
-                return parse_break_statement();
-            }
-            else if (simple_strcmp(current_token.value, "continue") == 0) {
-                return parse_continue_statement();
-            }
-        }
-        else if (current_token.type == TOKEN_IDENTIFIER) {
-            return parse_assignment();
-        }
-        
-        // Skip unknown statements
-        while (current_token.value[0] != ';' && current_token.type != TOKEN_EOF) {
-            advance();
-        }
-        if (current_token.value[0] == ';') advance();
-        return true;
-    }
-
-
-public:
-    SimpleCppCompiler() : loop_level(0) {
-        for (int i = 0; i < 8; i++) {
-            loop_stack[i].active = false;
-        }
-    }
-
-    bool compile(const char* source_code, uint8_t* output_buffer, int buffer_size) {
-        tokenizer.init(source_code);
-        generator.init(output_buffer, buffer_size);
-        current_token = tokenizer.next_token();
-        return parse_program();
-    }
-    bool parse_expression() {
-        if (!parse_comparison()) return false;
-        return true;
-    }
-
-    bool parse_comparison() {
-        if (!parse_term()) return false;
-        
-        while (current_token.type == TOKEN_OPERATOR &&
-               (simple_strcmp(current_token.value, "==") == 0 ||
-                simple_strcmp(current_token.value, "!=") == 0 ||
-                simple_strcmp(current_token.value, "<") == 0 ||
-                simple_strcmp(current_token.value, "<=") == 0 ||
-                simple_strcmp(current_token.value, ">") == 0 ||
-                simple_strcmp(current_token.value, ">=") == 0)) {
-                
-            char op[3];
-            simple_strcpy(op, current_token.value);
-            advance();
-            
-            generator.emit_push_eax();
-            if (!parse_term()) return false;
-            generator.emit_pop_ebx();
-            generator.emit_cmp_ebx_eax();
-            
-            if (simple_strcmp(op, "==") == 0) {
-                generator.emit_sete_al();
-            } else if (simple_strcmp(op, "!=") == 0) {
-                generator.emit_setne_al();
-            } else if (simple_strcmp(op, "<") == 0) {
-                generator.emit_setl_al();
-            } else if (simple_strcmp(op, "<=") == 0) {
-                generator.emit_setle_al();
-            } else if (simple_strcmp(op, ">") == 0) {
-                generator.emit_setg_al();
-            } else if (simple_strcmp(op, ">=") == 0) {
-                generator.emit_setge_al();
-            }
-        }
-        return true;
-    }
-
-    bool parse_term() {
-        if (!parse_factor()) return false;
-        
-        while (current_token.type == TOKEN_OPERATOR &&
-               (current_token.value[0] == '+' || current_token.value[0] == '-')) {
-            char op = current_token.value[0];
-            advance();
-            
-            generator.emit_push_eax();
-            if (!parse_factor()) return false;
-            generator.emit_pop_ebx();
-            
-            if (op == '+') {
-                generator.emit_add_eax_ebx();
-            } else {
-                generator.emit_sub_ebx_eax();
-                generator.emit_mov_eax_ebx();
-            }
-        }
-        return true;
-    }
-
-    bool parse_factor() {
-        if (!parse_primary()) return false;
-        
-        while (current_token.type == TOKEN_OPERATOR &&
-               (current_token.value[0] == '*' || current_token.value[0] == '/')) {
-            char op = current_token.value[0];
-            advance();
-            
-            generator.emit_push_eax();
-            if (!parse_primary()) return false;
-            generator.emit_pop_ebx();
-            
-            if (op == '*') {
-                generator.emit_imul_eax_ebx();
-            } else {
-                generator.emit_mov_eax_ebx();
-                generator.emit_pop_ebx();
-                generator.emit_push_eax();
-                generator.emit_pop_ebx();
-                generator.emit_div_ebx();
-            }
-        }
-        return true;
-    }
-
-    bool parse_primary() {
-        if (current_token.type == TOKEN_NUMBER) {
-            int value = simple_atoi(current_token.value);
-            generator.emit_mov_eax_immediate(value);
-            advance();
-            return true;
-        }
-        else if (current_token.type == TOKEN_IDENTIFIER) {
-            int offset = variables.get_variable_offset(current_token.value);
-            if (offset != 0) {
-                generator.emit_mov_eax_variable(offset);
-            }
-            advance();
-            return true;
-        }
-        else if (current_token.value[0] == '(') {
-            advance();
-            if (!parse_expression()) return false;
-            return expect(")");
-        }
-        return false;
-    }
-
-};
-
-// --- EXECUTABLE MEMORY MANAGEMENT ---
-static uint8_t executable_memory_pool[8192];
-static bool memory_used[128];
-static bool memory_pool_initialized = false;
-
-void init_executable_memory_pool() {
-    if (!memory_pool_initialized) {
-        simple_memset(memory_used, 0, sizeof(memory_used));
-        memory_pool_initialized = true;
-    }
-}
-
-void* allocate_executable_block(int size) {
-    init_executable_memory_pool();
-    int blocks_needed = (size + 63) / 64;
-    
-    for (int i = 0; i <= 128 - blocks_needed; i++) {
-        bool can_allocate = true;
-        for (int j = 0; j < blocks_needed; j++) {
-            if (memory_used[i + j]) {
-                can_allocate = false;
-                break;
-            }
-        }
-        
-        if (can_allocate) {
-            for (int j = 0; j < blocks_needed; j++) {
-                memory_used[i + j] = true;
-            }
-            
-            void* block = &executable_memory_pool[i * 64];
-            simple_memset(block, 0, blocks_needed * 64);
-            
-            return block;
-        }
-    }
-    
-    return nullptr;
-}
-
-void free_executable_block(void* ptr) {
-    if (!ptr || ptr < executable_memory_pool || ptr >= executable_memory_pool + 8192) return;
-    
-    int block_index = ((uint8_t*)ptr - executable_memory_pool) / 64;
-    if (block_index >= 0 && block_index < 128) {
-        memory_used[block_index] = false;
-    }
-}
-
-static void int_to_string(int value, char* buffer) {
-    if (value == 0) {
-        buffer[0] = '0';
-        buffer[1] = '\0';
-        return;
-    }
-    
-    bool negative = value < 0;
-    if (negative) value = -value;
-    
-    char temp[16];
-    int i = 0;
-    
-    while (value > 0) {
-        temp[i++] = '0' + (value % 10);
-        value /= 10;
-    }
-    
-    int j = 0;
-    if (negative) buffer[j++] = '-';
-    
-    while (i > 0) {
-        buffer[j++] = temp[--i];
-    }
-    
-    buffer[j] = '\0';
-}
-
-struct CodeExecutor {
-    uint8_t* executable_memory;
-    int memory_size;
-    bool initialized;
-    
-    void init() {
-        memory_size = 2048;
-        executable_memory = (uint8_t*)allocate_executable_block(memory_size);
-        initialized = (executable_memory != nullptr);
-    }
-    
-    void cleanup() {
-        if (executable_memory && initialized) {
-            free_executable_block(executable_memory);
-            executable_memory = nullptr;
-            initialized = false;
-        }
-    }
-    
-    int execute_code(uint8_t* code, int code_size) {
-        if (!initialized || !executable_memory) {
-            cout << "Error: Could not allocate executable memory\n";
-            return -1;
-        }
-        
-        simple_memcpy(executable_memory, code, code_size);
-        
-        typedef int (*CompiledFunction)();
-        CompiledFunction func = (CompiledFunction)executable_memory;
-        
-        cout << "Executing compiled code...\n";
-        int result = func();
-        
-        // MANUALLY CONVERT INTEGER TO STRING TO AVOID IOSTREAM BUGS
-        char result_str[16];
-        int_to_string(result, result_str);
-        cout << result_str;
-        
-        return result;
+        return 0;
     }
 };
 
-// Global compiler instances
-static SimpleCppCompiler cpp_compiler;
-static CodeExecutor code_executor;
-static bool compiler_system_initialized = false;
+// ============================================================
+// Object I/O (TVM1)
+// ============================================================
+struct TVMObject {
+    static int save(uint64_t base, int port, const char* path, const TProgram& P){
+        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 32 ];
+        int off=0;
+        buf[off++]='T'; buf[off++]='V'; buf[off++]='M'; buf[off++]='1';
+        *(int*)&buf[off]=P.pc; off+=4;
+        *(int*)&buf[off]=P.lit_top; off+=4;
+        *(int*)&buf[off]=P.loc_count; off+=4;
+        simple_memcpy(&buf[off], P.code, P.pc); off+=P.pc;
+        simple_memcpy(&buf[off], P.lit, P.lit_top); off+=P.lit_top;
+        return fat32_write_file(base, port, path, buf, off);
+    }
+    static int load(uint64_t base, int port, const char* path, TProgram& P){
+        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 32 ];
+        int n = fat32_read_file_to_buffer(base, port, path, buf, sizeof(buf));
+        if(n<16) return -1;
+        if(!(buf[0]=='T'&&buf[1]=='V'&&buf[2]=='M'&&buf[3]=='1')) return -2;
+        int cp=*(int*)&buf[4], lp=*(int*)&buf[8], lc=*(int*)&buf[12];
+        if(cp<0||cp>TProgram::CODE_MAX||lp<0||lp>TProgram::LIT_MAX||lc<0||lc>TProgram::LOC_MAX) return -3;
+        P.pc=cp; P.lit_top=lp; P.loc_count=lc;
+        int off=16;
+        simple_memcpy(P.code, &buf[off], cp); off+=cp;
+        simple_memcpy(P.lit, &buf[off], lp); off+=lp;
+        return 0;
+    }
+};
 
-void init_compiler_system() {
-    if (!compiler_system_initialized) {
-        code_executor.init();
-        compiler_system_initialized = true;
-    }
-}
-// --- END C++ COMPILER SYSTEM ---
-
-// UPDATED COMMAND IMPLEMENTATIONS (replace the previous ones):
-void cmd_compile(uint64_t ahci_base, int port, const char* filename) {
-    init_compiler_system(); // Initialize on first use
-    
-    if (!filename) {
-        cout << "Usage: compile <filename.cpp>\n";
-        return;
-    }
-    
-    // Read C++ source file
-    static char source_buffer[8192];
-    int bytes_read = fat32_read_file_to_buffer(ahci_base, port, filename, source_buffer, sizeof(source_buffer));
-    
-    if (bytes_read < 0) {
-        cout << "Error: Could not read source file '" << filename << "'\n";
-        return;
-    }
-    
-    cout << "Compiling " << filename << "...\n";
-    cout << "Source code:\n" << source_buffer << "\n---\n";
-    
-    // Compile to x86 machine code
-    static uint8_t compiled_code[2048];
-    bool success = cpp_compiler.compile(source_buffer, compiled_code, sizeof(compiled_code));
-    
-    if (!success) {
-        cout << "Compilation failed!\n";
-        return;
-    }
-    
-    // Generate output filename
-    char obj_filename[64];
-    simple_strcpy(obj_filename, filename);
-    // Replace .cpp with .obj
-    char* dot = simple_strchr(obj_filename, '.');
-    if (dot) {
-        simple_strcpy(dot, ".obj");
-    } else {
-        simple_strcat(obj_filename, ".obj");
-    }
-    
-    // Save compiled object file
-    int result = fat32_write_file(ahci_base, port, obj_filename, compiled_code, 2048);
-    
-    if (result == 0) {
-        cout << "Compilation successful! Object file: " << obj_filename << "\n";
-    } else {
-        cout << "Error saving object file\n";
-    }
+// ============================================================
+// Public compile/run entry points for shell
+// ============================================================
+static int tinyvm_compile_to_obj(uint64_t ahci_base, int port, const char* src_path, const char* obj_path){
+    static char srcbuf[8192];
+    int n = fat32_read_file_to_buffer(ahci_base, port, src_path, (unsigned char*)srcbuf, sizeof(srcbuf)-1);
+    if(n<=0){ cout << "read fail\n"; return -1; }
+    srcbuf[n]=0;
+    TCompiler C; int ok = C.compile(srcbuf);
+    if(ok<0){ cout << "Compilation failed!\n"; return -2; }
+    int w = TVMObject::save(ahci_base, port, obj_path, C.pr);
+    if(w<0){ cout << "write fail\n"; return -3; }
+    return 0;
 }
 
-void cmd_run(uint64_t ahci_base, int port, const char* filename) {
-    init_compiler_system(); // Initialize on first use
-    
-    if (!filename) {
-        cout << "Usage: run <filename.obj>\n";
-        return;
-    }
-    
-    // Read compiled object file
-    static uint8_t object_code[2048];
-    int bytes_read = fat32_read_file_to_buffer(ahci_base, port, filename, object_code, sizeof(object_code));
-    
-    if (bytes_read < 0) {
-        cout << "Error: Could not read object file '" << filename << "'\n";
-        return;
-    }
-    
-    cout << "Loading and executing " << filename << "...\n";
-    
-    // Execute the compiled code
-    code_executor.execute_code(object_code, bytes_read);
+static int tinyvm_run_obj(uint64_t ahci_base, int port, const char* obj_path, int argc, const char** argv){
+    TProgram P; int r = TVMObject::load(ahci_base, port, obj_path, P);
+    if(r<0){ cout << "load fail\n"; return -1; }
+    TinyVM vm; int rv = vm.run(P, argc, argv);
+    char b[16]; int_to_string(rv,b); cout << b;
+    return rv;
 }
 
-void cmd_exec(const char* code_text) {
-    init_compiler_system(); // Initialize on first use
-    
-    if (!code_text) {
-        cout << "Usage: exec <inline_code>\n";
-        cout << "Example: exec \"int main() { return 42; }\"\n";
-        return;
-    }
-    
-    cout << "Compiling and executing inline code...\n";
-    
-    static uint8_t compiled_code[1024];
-    bool success = cpp_compiler.compile(code_text, compiled_code, sizeof(compiled_code));
-    
-    if (!success) {
-        cout << "Compilation failed!\n";
-        return;
-    }
-    
-    code_executor.execute_code(compiled_code, 1024);
+// ============================================================
+// Shell glue
+// ============================================================
+extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename){
+    if (!filename) { cout << "Usage: compile <file.cpp>\n"; return; }
+    static char obj[64]; int i=0; while(filename[i] && i<60){ obj[i]=filename[i]; i++; }
+    while(i>0 && obj[i-1] != '.') i--; obj[i]=0; simple_strcpy(&obj[i], "obj");
+    cout << "Compiling "; cout << filename; cout << "...\n";
+    int r = tinyvm_compile_to_obj(ahci_base, port, filename, obj);
+    if(r==0) { cout << "OK -> "; cout << obj; cout << "\n"; } else { cout << "Compilation failed!\n"; }
 }
-// --- END C++ COMPILER SYSTEM ---
+
+extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename){
+    if (!filename) { cout << "Usage: run <file.obj> [args...]\n"; return; }
+    static const char* argvv[16];
+    int argc=0;
+    for(int i=2;i<part_count && argc<16;i++){ argvv[argc++] = parts[i]; }
+    cout << "Executing "; cout << filename; cout << "...\n";
+    tinyvm_run_obj(ahci_base, port, filename, argc, argvv);
+}
+
+extern "C" void cmd_exec(const char* code_text){
+    if(!code_text){ cout<<"No code\n"; return; }
+    TCompiler C; int ok = C.compile(code_text);
+    if(ok<0){ cout << "Compilation failed!\n"; return; }
+    TinyVM vm; TProgram& P = C.pr;
+    static const char* argvv[1] = { };
+    int rv = vm.run(P, 0, argvv);
+    char b[16]; int_to_string(rv,b); cout << b;
+}
+
+
 
 // --- KERNEL ENTRY POINT ---
 extern "C" void kernel_main() {
