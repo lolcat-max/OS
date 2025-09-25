@@ -15,6 +15,13 @@
 #include "xhci.h"
 
 
+
+
+
+
+
+
+
 // --- MACROS AND CONSTANTS ---
 #define SECTOR_SIZE 512
 #define ENTRY_SIZE 32
@@ -955,12 +962,11 @@ void cmd_cat(uint64_t ahci_base, int port, const char* filename);
 void cmd_help() {
     cout << "--- KERNEL COMMANDS ---\n"
          << "  help, clear, pong, ls, rm, chkdsk\n"
-         << "  touch <file> [content], cat <file>\n"
+         << "  cat <file>, kbtest, gui\n"
          << "  cp <src> <dest>, mv <old> <new>\n"
          << "  compile <file.cpp>, run <file.obj>\n"
          << "  exec <inline_code>\n"
-         << "  formatfs, mount, unmount, fsinfo\n"
-         << "  kbtest\n";
+         << "  formatfs, mount, unmount\n";
 }
 void cmd_cat(uint64_t ahci_base, int port, const char* filename) {
     if (!filename) {
@@ -1011,123 +1017,6 @@ static void int_to_string(int value, char* buffer) {
     buffer[j] = '\0';
 }
 
-
-// --- COMMAND PROMPT (Rewritten for better argument parsing) ---
-void command_prompt() {
-    char line[MAX_COMMAND_LENGTH + 1];
-    ahci_base = disk_init(); 
-    int port = 0; 
-    bool fat32_initialized = false;
-
-    cout << "Kernel Command Prompt. Type 'help' for commands.\n\n";
-
-    while (true) {
-        cout << "> ";
-        cin >> line; // Use getline to read the whole line
-
-        // --- Argument Parser ---
-        char* parts[10] = {nullptr}; // Increased parts for more args
-        int part_count = 0;
-        char* next_part = line;
-        
-        while (part_count < 10 && next_part && *next_part != '\0') {
-            // Skip leading spaces
-            while (*next_part == ' ') next_part++;
-            if (*next_part == '\0') break;
-
-            parts[part_count++] = next_part;
-            char* space = simple_strchr(next_part, ' ');
-            if (space) {
-                *space = '\0';
-                next_part = space + 1;
-            } else {
-                next_part = nullptr;
-            }
-        }
-        
-        char* cmd = parts[0];
-        char* arg1 = parts[1];
-        char* arg2 = parts[2];
-
-        if (!cmd || *cmd == '\0') continue;
-
-        // --- Command Handling ---
-        if (stricmp(cmd, "help") == 0) cmd_help();
-		else if (stricmp(cmd, "compile") == 0) {
-			cmd_compile(ahci_base, port, arg1);
-		}
-		else if (stricmp(cmd, "run") == 0) {
-			cmd_run(ahci_base, port, arg1);
-		}
-		else if (stricmp(cmd, "exec") == 0) {
-			// For exec, we need to handle the rest of the line as code
-			char* code_start = line;
-			while (*code_start && *code_start != ' ') code_start++; // Skip "exec"
-			while (*code_start == ' ') code_start++; // Skip spaces
-			if (*code_start != '\0') {
-				cmd_exec(code_start);
-			} else {
-				cout << "Usage: exec <code>\n";
-			}
-		}
-        else if (stricmp(cmd, "clear") == 0) terminal_clear_screen();
-        else if (stricmp(cmd, "formatfs") == 0) cmd_formatfs(ahci_base, port);
-        else if (stricmp(cmd, "mount") == 0) {
-            if (fat32_init(ahci_base, port)) { 
-                fat32_initialized = true; 
-                cout << "FAT32 mounted.\n"; 
-            } else { 
-                cout << "Failed to mount. Is disk formatted?\n"; 
-            }
-        }
-        else if (stricmp(cmd, "unmount") == 0) { 
-            fat32_initialized = false; 
-            cout << "Filesystem unmounted.\n"; 
-        }
-        else {
-            if (!fat32_initialized) {
-                 cout << "Filesystem not mounted. Use 'mount' first.\n";
-            } else {
-                if (stricmp(cmd, "ls") == 0) fat32_list_files(ahci_base, port);
-                else if (stricmp(cmd, "rm") == 0) { 
-                    if(arg1) fat32_remove_file(ahci_base, port, arg1); 
-                    else cout << "Usage: rm <filename>\n"; 
-                }
-				else if (stricmp(cmd, "kbtest") == 0) {
-					xhci_init();
-					usb_keyboard_self_test();
-				}
-                else if (stricmp(cmd, "pong") == 0) {
-                  start_pong_game();
-                }
-                else if (stricmp(cmd, "chkdsk") == 0) {
-                  cmd_chkdsk(ahci_base, port);
-                }
-                else if (stricmp(cmd, "notepad") == 0) { // RENAME command
-                    if(arg1) {
-                      cmd_notepad(arg1);  // arg1 can be nullptr for new file
-                    } else cout << "Usage: notepad <file_name>\n";
-                }
-                else if (stricmp(cmd, "cat") == 0) {
-                    cmd_cat(ahci_base, port, arg1);
-                }
-                else if (stricmp(cmd, "mv") == 0) { // RENAME command
-                    if(arg1 && arg2) {
-                        if (fat32_rename_file(ahci_base, port, arg1, arg2) == 0) cout << "File renamed.\n";
-                        else cout << "Error renaming file.\n";
-                    } else cout << "Usage: mv <old_name> <new_name>\n";
-                }
-                else if (stricmp(cmd, "cp") == 0) { // COPY command
-                    if(arg1 && arg2) {
-                        if (fat32_copy_file(ahci_base, port, arg1, arg2) == 0) cout << "File copied.\n";
-                        else cout << "Error copying file.\n";
-                    } else cout << "Usage: cp <source> <destination>\n";
-                }
-                else { cout << "Unknown command: '" << cmd << "'\n"; }
-            }
-        }
-    }
-}
 
 
 // tinycc_vm_kernel.cpp
@@ -1677,6 +1566,435 @@ extern "C" void cmd_exec(const char* code_text){
     char b[16]; int_to_string(rv,b); cout << b;
 }
 
+
+
+
+
+
+
+
+
+// 1) Keep Framebuffer defined before any get_boot_framebuffer usage
+struct Framebuffer {
+    uint8_t* ptr;      // Linear framebuffer base (kernel virtual)
+    uint32_t width;    // pixels
+    uint32_t height;   // pixels
+    uint32_t pitch;    // bytes per scanline
+    uint32_t bpp;      // bits per pixel (expect 32)
+    uint32_t pixel_format; // 0 = XRGB8888, 1 = BGRA8888 (implementation choice)
+};
+
+// 2) C-linkage globals written by boot.S (define exactly once)
+extern "C" {
+    uint32_t multiboot_magic;
+    uint32_t multiboot_info_ptr;
+}
+
+// 3) Provide only a prototype before start_gui
+extern "C" bool get_boot_framebuffer(Framebuffer& out);
+
+
+
+// ---- Multiboot info layout (includes framebuffer fields when flags bit 12 set)
+#pragma pack(push,1)
+struct multiboot_info_t {
+    uint32_t flags;
+    uint32_t mem_lower, mem_upper;
+    uint32_t boot_device;
+    uint32_t cmdline;
+    uint32_t mods_count, mods_addr;
+    uint32_t syms[4];
+    uint32_t mmap_length, mmap_addr;
+    uint32_t drives_length, drives_addr;
+    uint32_t config_table;
+    uint32_t boot_loader_name;
+    uint32_t apm_table;
+    uint32_t vbe_control_info;
+    uint32_t vbe_mode_info;
+    uint16_t vbe_mode;
+    uint16_t vbe_interface_seg, vbe_interface_off, vbe_interface_len;
+    uint64_t framebuffer_addr;   // present if flags bit 12 set
+    uint32_t framebuffer_pitch;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    uint8_t  framebuffer_bpp;
+    uint8_t  framebuffer_type;   // 0=indexed, 1=RGB, 2=text
+    uint8_t  color_info[6];      // RGB: r_pos,r_size,g_pos,g_size,b_pos,b_size
+};
+#pragma pack(pop)
+
+// Detect 32bpp pixel ordering from Multiboot color_info
+static uint32_t detect_pixel_format(const multiboot_info_t* mb) {
+    if (mb->framebuffer_type != 1 || mb->framebuffer_bpp != 32) return 0; // default
+    uint8_t rpos = mb->color_info[0], rsz = mb->color_info[1];
+    uint8_t gpos = mb->color_info[2], gsz = mb->color_info[3];
+    uint8_t bpos = mb->color_info[4], bsz = mb->color_info[5];
+    if (rsz == 8 && gsz == 8 && bsz == 8 && rpos == 16 && gpos == 8 && bpos == 0) return 0;
+    if (rsz == 8 && gsz == 8 && bsz == 8 && rpos == 0 && gpos == 8 && bpos == 16) return 1;
+    return 0;
+}
+
+// 4) Full implementation placed AFTER Framebuffer and Multiboot structs
+extern "C" bool get_boot_framebuffer(Framebuffer& out) {
+    // EAX magic must be 0x2BADB002 (captured by boot.S)
+    if (multiboot_magic != 0x2BADB002u) return false;
+    const auto* mb = (const multiboot_info_t*)(uintptr_t)multiboot_info_ptr;
+    if (!mb) return false;
+    if (!(mb->flags & (1u << 12))) return false; // framebuffer fields not present
+
+    // GRUB provides a physical LFB; ensure it is mapped or identity-mapped
+    uint64_t phys = mb->framebuffer_addr;
+    out.ptr   = (uint8_t*)(uintptr_t)phys;
+    out.width = mb->framebuffer_width;
+    out.height= mb->framebuffer_height;
+    out.pitch = mb->framebuffer_pitch;
+    out.bpp   = mb->framebuffer_bpp;
+    out.pixel_format = detect_pixel_format(mb);
+
+    // Require 32bpp linear framebuffer
+    if (!out.ptr) return false;
+    if (out.bpp != 32) return false;
+    if (out.pitch < out.width * 4) return false;
+    return true;
+}
+
+
+
+// ---- Minimal GUI environment (framebuffer + PSF font + demo) ----
+
+
+
+static Framebuffer g_fb = {};
+static uint32_t*   g_back = nullptr;
+
+// Platform stub: provide a framebuffer from boot services/bootloader.
+// Implement this to populate out with a valid linear framebuffer mapping.
+extern "C" bool get_boot_framebuffer(Framebuffer& out);
+
+// Simple terminal fallback if no framebuffer is present.
+static void gui_fallback_text() {
+    cout << "[GUI] No framebuffer available. Implement get_boot_framebuffer() (e.g., VBE/Limine/UEFI GOP)\\n";
+}
+
+// Allocate/destroy backbuffer
+static bool fb_alloc_backbuffer() {
+    if (!g_fb.ptr || g_fb.bpp != 32 || g_fb.pitch < g_fb.width * 4) return false;
+    size_t bytes = size_t(g_fb.pitch) * g_fb.height;
+    g_back = (uint32_t*) new uint8_t[bytes];
+    if (!g_back) return false;
+    // Clear
+    for (uint32_t y = 0; y < g_fb.height; ++y) {
+        uint32_t* row = (uint32_t*)((uint8_t*)g_back + y * g_fb.pitch);
+        for (uint32_t x = 0; x < g_fb.width; ++x) row[x] = 0xFF101010; // dark gray
+    }
+    return true;
+}
+static void fb_free_backbuffer() { if (g_back) { delete[] (uint8_t*)g_back; g_back = nullptr; } }
+// Present: copy backbuffer -> front
+static void fb_present() {
+    if (!g_back || !g_fb.ptr) return;
+    for (uint32_t y = 0; y < g_fb.height; ++y) {
+        void* dst = g_fb.ptr + y * g_fb.pitch;
+        void* src = ((uint8_t*)g_back) + y * g_fb.pitch;
+        memcpy(dst, src, g_fb.pitch);
+    }
+}
+
+// Pixel write (XRGB8888 default)
+static inline void put_px(uint32_t x, uint32_t y, uint32_t color) {
+    if (!g_back) return;
+    if (x >= g_fb.width || y >= g_fb.height) return;
+    uint32_t* row = (uint32_t*)((uint8_t*)g_back + y * g_fb.pitch);
+    if (g_fb.pixel_format == 0) { // XRGB8888
+        row[x] = color;
+    } else { // BGRA8888-like, swap channels if needed
+        uint8_t r = (color >> 16) & 0xFF;
+        uint8_t g = (color >> 8) & 0xFF;
+        uint8_t b = color & 0xFF;
+        row[x] = (uint32_t(b) << 16) | (uint32_t(g) << 8) | uint32_t(r) | 0xFF000000u;
+    }
+}
+static void draw_rect(int x, int y, int w, int h, uint32_t color) {
+    if (w <= 0 || h <= 0) return;
+    for (int xx = x; xx < x + w; ++xx) {
+        put_px(xx, y, color);
+        put_px(xx, y + h - 1, color);
+    }
+    for (int yy = y; yy < y + h; ++yy) {
+        put_px(x, yy, color);
+        put_px(x + w - 1, yy, color);
+    }
+}
+
+
+static void fill_rect(int x, int y, int w, int h, uint32_t color) {
+    if (!g_back) return;
+    if (w <= 0 || h <= 0) return;
+    int x0 = x < 0 ? 0 : x;
+    int y0 = y < 0 ? 0 : y;
+    int x1 = x + w; if (x1 > int(g_fb.width)) x1 = int(g_fb.width);
+    int y1 = y + h; if (y1 > int(g_fb.height)) y1 = int(g_fb.height);
+    for (int yy = y0; yy < y1; ++yy) {
+        uint32_t* row = (uint32_t*)((uint8_t*)g_back + yy * g_fb.pitch);
+        for (int xx = x0; xx < x1; ++xx) row[xx] = color;
+    }
+}
+
+
+// ----- PSF1 loader (tiny) -----
+#pragma pack(push,1)
+struct PSF1Header {
+    uint8_t magic[2];   // 0x36,0x04
+    uint8_t mode;       // bit0=512glyphs
+    uint8_t charsize;   // bytes per glyph
+};
+#pragma pack(pop)
+
+struct PSFFont {
+    const uint8_t* glyphs = nullptr;
+    uint32_t glyph_count = 0;  // 256 or 512
+    uint32_t char_w = 8;       // PSF1 is 8 pixels wide
+    uint32_t char_h = 0;       // derived from charsize
+};
+
+static bool load_psf_from_memory(const uint8_t* buf, size_t size, PSFFont& out) {
+    if (size < sizeof(PSF1Header)) return false;
+    const PSF1Header* h = (const PSF1Header*)buf;
+    if (h->magic[0] != 0x36 || h->magic[1] != 0x04) return false;
+    out.glyph_count = (h->mode & 0x01) ? 512u : 256u;
+    out.char_h = h->charsize;
+    size_t need = sizeof(PSF1Header) + out.glyph_count * out.char_h;
+    if (size < need) return false;
+    out.glyphs = buf + sizeof(PSF1Header);
+    return true;
+}
+
+static void draw_glyph(const PSFFont& f, int x, int y, uint32_t fg, uint32_t bg, uint32_t ch) {
+    uint32_t idx = ch;
+    if (idx >= f.glyph_count) idx = '?';
+    const uint8_t* g = f.glyphs + idx * f.char_h;
+    for (uint32_t row = 0; row < f.char_h; ++row) {
+        uint8_t bits = g[row];
+        for (uint32_t col = 0; col < 8; ++col) {
+            bool on = (bits >> (7 - col)) & 1;
+            put_px(x + col, y + row, on ? fg : bg);
+        }
+    }
+}
+
+static void draw_text(const PSFFont& f, int x, int y, uint32_t fg, uint32_t bg, const char* s) {
+    int cx = x;
+    for (; *s; ++s) {
+        if (*s == '\n') { y += int(f.char_h); cx = x; continue; }
+        draw_glyph(f, cx, y, fg, bg, (uint8_t)*s);
+        cx += 8;
+    }
+}
+
+// Demo desktop
+static void draw_desktop(const PSFFont& font) {
+    // Background gradient
+    for (uint32_t y = 0; y < g_fb.height; ++y) {
+        uint8_t c = uint8_t((y * 255u) / (g_fb.height ? g_fb.height : 1));
+        uint32_t color = 0xFF000030u | (uint32_t(c) << 8);
+        for (uint32_t x = 0; x < g_fb.width; ++x) put_px(x, y, color);
+    }
+    // Taskbar
+    fill_rect(0, int(g_fb.height) - 28, g_fb.width, 28, 0xFF202020);
+    draw_rect(0, int(g_fb.height) - 28, g_fb.width, 28, 0xFF404040);
+    draw_text(font, 8, int(g_fb.height) - 22, 0xFFFFFFFF, 0xFF202020, "gui demo  (ESC to exit)");
+}
+
+static void draw_window(const PSFFont& font, int x, int y, int w, int h, const char* title) {
+    fill_rect(x, y, w, h, 0xFF2A2A2A);
+    draw_rect(x, y, w, h, 0xFF707070);
+    // Title bar
+    fill_rect(x+1, y+1, w-2, 18, 0xFF3A70B0);
+    draw_text(font, x+8, y+4, 0xFFFFFFFF, 0xFF3A70B0, title);
+    // Content area
+    fill_rect(x+1, y+20, w-2, h-21, 0xFF1C1C1C);
+}
+
+static bool load_font_file(uint64_t ahci_base, int port, PSFFont& outfont) {
+    static uint8_t buf[64*1024]; // big enough for PSF1/512*charsize
+    fat32_read_file_to_buffer(ahci_base, port, "/font.psf", buf, sizeof(buf));
+    return load_psf_from_memory(buf, (size_t)buf, outfont);
+}
+
+// Expose a start_gui(...) entry
+extern "C" void start_gui(uint64_t ahci_base, int port) {
+    if (!get_boot_framebuffer(g_fb)) {
+        gui_fallback_text();
+        return;
+    }
+    if (!fb_alloc_backbuffer()) {
+        cout << "[GUI] Failed to allocate backbuffer.\\n";
+        return;
+    }
+
+    PSFFont font = {};
+    if (!load_font_file(ahci_base, port, font)) {
+        // Provide a minimal 8x8 fallback if font.psf missing
+        cout << "[GUI] Could not load /font.psf. Using blank background without text.\\n";
+    }
+
+    int wx = 60, wy = 60, ww = 360, wh = 220;
+    bool running = true;
+    while (running) {
+        // Draw frame
+        if (font.glyphs) draw_desktop(font);
+        else fill_rect(0,0,g_fb.width,g_fb.height,0xFF202028);
+        draw_window(font, wx, wy, ww, wh, "Demo Window");
+        fb_present();
+
+        // Simple input: arrow keys move window, ESC exits (using existing cin)
+        // Non-blocking read is ideal; if not available, do a lightweight poll loop.
+        // For demonstration, use a tiny blocking read of one character.
+        char cbuf[4] = {0};
+        cin >> cbuf; // adapt to your non-blocking input if available
+        char c = cbuf[0];
+        if (c == 27 /*ESC*/) { running = false; }
+        else if (c == 'h') { wx -= 10; }
+        else if (c == 'l') { wx += 10; }
+        else if (c == 'k') { wy -= 10; }
+        else if (c == 'j') { wy += 10; }
+
+        // Clamp
+        if (wx < 0) wx = 0; if (wy < 0) wy = 0;
+        if (wx + ww > int(g_fb.width))  wx = int(g_fb.width)  - ww;
+        if (wy + wh > int(g_fb.height)) wy = int(g_fb.height) - wh;
+    }
+
+    fb_free_backbuffer();
+    cout << "[GUI] Exited.\\n";
+}
+
+// ---- End minimal GUI ----
+
+
+
+
+// --- COMMAND PROMPT (Rewritten for better argument parsing) ---
+void command_prompt() {
+    char line[MAX_COMMAND_LENGTH + 1];
+    ahci_base = disk_init(); 
+    int port = 0; 
+    bool fat32_initialized = false;
+
+    cout << "Kernel Command Prompt. Type 'help' for commands.\n\n";
+
+    while (true) {
+        cout << "> ";
+        cin >> line; // Use getline to read the whole line
+
+        // --- Argument Parser ---
+        char* parts[10] = {nullptr}; // Increased parts for more args
+        int part_count = 0;
+        char* next_part = line;
+        
+        while (part_count < 10 && next_part && *next_part != '\0') {
+            // Skip leading spaces
+            while (*next_part == ' ') next_part++;
+            if (*next_part == '\0') break;
+
+            parts[part_count++] = next_part;
+            char* space = simple_strchr(next_part, ' ');
+            if (space) {
+                *space = '\0';
+                next_part = space + 1;
+            } else {
+                next_part = nullptr;
+            }
+        }
+        
+        char* cmd = parts[0];
+        char* arg1 = parts[1];
+        char* arg2 = parts[2];
+
+        if (!cmd || *cmd == '\0') continue;
+
+        // --- Command Handling ---
+        if (stricmp(cmd, "help") == 0) cmd_help();
+		// inside commandprompt() command handling:
+		else if (stricmp(cmd, "gui") == 0) {
+			start_gui(ahci_base, port);
+		}
+		else if (stricmp(cmd, "compile") == 0) {
+			cmd_compile(ahci_base, port, arg1);
+		}
+		
+		else if (stricmp(cmd, "run") == 0) {
+			cmd_run(ahci_base, port, arg1);
+		}
+		else if (stricmp(cmd, "exec") == 0) {
+			// For exec, we need to handle the rest of the line as code
+			char* code_start = line;
+			while (*code_start && *code_start != ' ') code_start++; // Skip "exec"
+			while (*code_start == ' ') code_start++; // Skip spaces
+			if (*code_start != '\0') {
+				cmd_exec(code_start);
+			} else {
+				cout << "Usage: exec <code>\n";
+			}
+		}
+        else if (stricmp(cmd, "clear") == 0) terminal_clear_screen();
+        else if (stricmp(cmd, "formatfs") == 0) cmd_formatfs(ahci_base, port);
+        else if (stricmp(cmd, "mount") == 0) {
+            if (fat32_init(ahci_base, port)) { 
+                fat32_initialized = true; 
+                cout << "FAT32 mounted.\n"; 
+            } else { 
+                cout << "Failed to mount. Is disk formatted?\n"; 
+            }
+        }
+        else if (stricmp(cmd, "unmount") == 0) { 
+            fat32_initialized = false; 
+            cout << "Filesystem unmounted.\n"; 
+        }
+        else {
+            if (!fat32_initialized) {
+                 cout << "Filesystem not mounted. Use 'mount' first.\n";
+            } else {
+                if (stricmp(cmd, "ls") == 0) fat32_list_files(ahci_base, port);
+                else if (stricmp(cmd, "rm") == 0) { 
+                    if(arg1) fat32_remove_file(ahci_base, port, arg1); 
+                    else cout << "Usage: rm <filename>\n"; 
+                }
+				else if (stricmp(cmd, "kbtest") == 0) {
+					xhci_init();
+					usb_keyboard_self_test();
+				}
+                else if (stricmp(cmd, "pong") == 0) {
+                  start_pong_game();
+                }
+                else if (stricmp(cmd, "chkdsk") == 0) {
+                  cmd_chkdsk(ahci_base, port);
+                }
+                else if (stricmp(cmd, "notepad") == 0) { // RENAME command
+                    if(arg1) {
+                      cmd_notepad(arg1);  // arg1 can be nullptr for new file
+                    } else cout << "Usage: notepad <file_name>\n";
+                }
+                else if (stricmp(cmd, "cat") == 0) {
+                    cmd_cat(ahci_base, port, arg1);
+                }
+                else if (stricmp(cmd, "mv") == 0) { // RENAME command
+                    if(arg1 && arg2) {
+                        if (fat32_rename_file(ahci_base, port, arg1, arg2) == 0) cout << "File renamed.\n";
+                        else cout << "Error renaming file.\n";
+                    } else cout << "Usage: mv <old_name> <new_name>\n";
+                }
+                else if (stricmp(cmd, "cp") == 0) { // COPY command
+                    if(arg1 && arg2) {
+                        if (fat32_copy_file(ahci_base, port, arg1, arg2) == 0) cout << "File copied.\n";
+                        else cout << "Error copying file.\n";
+                    } else cout << "Usage: cp <source> <destination>\n";
+                }
+                else { cout << "Unknown command: '" << cmd << "'\n"; }
+            }
+        }
+    }
+}
 
 
 // --- KERNEL ENTRY POINT ---
