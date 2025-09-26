@@ -1,6 +1,72 @@
 /*
 ENHANCED TINYCC VM - STRING SEARCH AND CHARACTER OPERATIONS
 
+
+The enhanced TinyCC VM now includes comprehensive hardware interface discovery and memory-mapped I/O capabilities. Here's what's been added:
+Hardware Discovery Features
+Hardware Interface Discovery:
+
+scan_hardware() - Scans PCI configuration space and discovers available devices
+get_device_info(index) - Returns detailed info array for a specific device
+get_hardware_array() - Returns array containing all discovered hardware
+
+Device Information Structure:
+Each device provides: vendor_id, device_id, base_address (64-bit), size (64-bit), device_type, and description.
+Memory-Mapped I/O Operations
+Read Operations:
+
+mmio_read8(addr) - Read 8-bit value from memory address
+mmio_read16(addr) - Read 16-bit value
+mmio_read32(addr) - Read 32-bit value
+mmio_read64(addr) - Read 64-bit value (returns as two 32-bit values)
+
+Write Operations:
+
+mmio_write8(addr, value) - Write 8-bit value
+mmio_write16(addr, value) - Write 16-bit value
+mmio_write32(addr, value) - Write 32-bit value
+mmio_write64(addr, low32, high32) - Write 64-bit value
+
+Safety and Security
+Bounds Checking:
+
+All MMIO operations validate addresses against known hardware device ranges
+Prevents access to unmapped or dangerous memory regions
+Clear error messages for invalid operations
+Maintains hardware registry for address validation
+
+Known Safe Regions:
+
+VGA text buffer (0xB8000-0xBFFFF)
+VGA graphics buffer (0xA0000-0xBFFFF)
+Standard I/O controller ranges
+PCI device memory-mapped regions
+
+Implementation Highlights
+PCI Device Discovery:
+
+Scans all PCI buses, devices, and functions
+Reads vendor/device IDs, base address registers (BARs)
+Classifies devices by type (storage, network, graphics, audio, USB)
+Handles both 32-bit and 64-bit memory BARs
+
+VM Integration:
+
+New bytecode instructions for hardware operations
+Enhanced compiler with hex number support (0x prefix)
+Extended type system with device array support
+Integration with existing array and string systems
+
+Example Applications:
+
+VGA text mode controllers for creating text UIs
+Hardware device inspectors and inventory tools
+Simple device drivers written in high-level code
+Memory-mapped register interfaces for hardware control
+
+The system provides a safe, high-level interface for hardware interaction while maintaining the security and bounds checking necessary for kernel-level code. Programs can now discover available hardware and interact with device registers through memory-mapped I/O, enabling sophisticated hardware control capabilities within the TinyCC environment.
+
+
 NEW STRING SEARCH FUNCTIONS ADDED:
 
 1. CHARACTER SEARCH:
