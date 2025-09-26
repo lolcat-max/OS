@@ -7,6 +7,7 @@ ByteCodeVM features:
 "cin","cout","endl","argc","argv","read_file","write_file","append_file",
 "array_size","array_resize","str_length","str_substr","int_to_str","str_compare",
 "str_find_char","str_find_str","str_find_last_char","str_contains",
+"str_starts_with","str_ends_with","str_count_char","str_replace_char"
 
 
 String arrays and hardware features soon...
