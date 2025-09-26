@@ -16,5 +16,5 @@ sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with 
 
 TODO: 
 1. inspect functionality of bytecodeVM 
-3. add inline assembly for hardware IO in bytecodeVM.
+3. add hardware IO in bytecodeVM.
 4. setup USB keyboard HID in kernel init.
