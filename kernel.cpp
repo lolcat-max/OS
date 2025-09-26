@@ -962,7 +962,7 @@ void cmd_cat(uint64_t ahci_base, int port, const char* filename);
 void cmd_help() {
     cout << "--- KERNEL COMMANDS ---\n"
          << "  help, clear, pong, ls, rm, chkdsk\n"
-         << "  cat <file>, kbtest, gui\n"
+         << "  cat <file>, kbtest\n"
          << "  cp <src> <dest>, mv <old> <new>\n"
          << "  compile <file.cpp>, run <file.obj>\n"
          << "  exec <inline_code>\n"
@@ -1016,25 +1016,39 @@ static void int_to_string(int value, char* buffer) {
     
     buffer[j] = '\0';
 }
-
-// tinycc_vm_kernel_enhanced.cpp
-// Enhanced tinycc-style compiler to bytecode + VM runner with File I/O and Arrays
+// tinycc_vm_kernel_mmio_enhanced.cpp
+// Enhanced tinycc-style compiler to bytecode + VM runner with Hardware Interface Discovery and Memory-Mapped I/O
 // NEW Features added:
+// - Hardware Interface Discovery: scan_hardware() returns array of detected devices
+// - Memory-Mapped I/O: mmio_read8/16/32/64(addr), mmio_write8/16/32/64(addr, value)
+// - Hardware device structure with vendor_id, device_id, base_address, size
+// - Safety checks for MMIO access within known device ranges
+//
+// Previous Features:
 // - File I/O: read_file(filename), write_file(filename, content), append_file(filename, content)
 // - Arrays: int arr[size], string arr[size], arr[index] = value, value = arr[index]
 // - Array built-ins: array_size(arr), array_resize(arr, new_size)
-// - Printing entire integer/string arrays with cout << arr;
-// - Array initializer list support: int arr[3] = {10, 20, 30};
-//
-// Previous Features:
+// - String functions: str_length, str_substr, str_find_*, str_compare, etc.
 // - Types: int, char, string (string is pointer to char, token-based I/O)
-// - Decls: int/char/string name [= expr] ;
-// - Expr: + - * /, unary -, comparisons (== != < <= > >=), parentheses
 // - Control: if/else, while, break, continue
 // - I/O: cin >> chains (int/char/string), cout << chains (int/char/string/argv(i)/endl)
-// - Built-ins: argc (int), argv(i) (string pointer)
-// - Program form: int main() { ... } with implicit return 0 if missing
-// - Object I/O: saves/loads TVM1 object via FAT32 helpers
+
+// tinycc_vm_kernel_mmio_enhanced.cpp
+// Enhanced tinycc-style compiler to bytecode + VM runner with Hardware Interface Discovery and Memory-Mapped I/O
+// NEW Features added:
+// - Hardware Interface Discovery: scan_hardware() returns array of detected devices
+// - Memory-Mapped I/O: mmio_read8/16/32/64(addr), mmio_write8/16/32/64(addr, value)
+// - Hardware device structure with vendor_id, device_id, base_address, size
+// - Safety checks for MMIO access within known device ranges
+//
+// Previous Features:
+// - File I/O: read_file(filename), write_file(filename, content), append_file(filename, content)
+// - Arrays: int arr[size], string arr[size], arr[index] = value, value = arr[index]
+// - Array built-ins: array_size(arr), array_resize(arr, new_size)
+// - String functions: str_length, str_substr, str_find_*, str_compare, etc.
+// - Types: int, char, string (string is pointer to char, token-based I/O)
+// - Control: if/else, while, break, continue
+// - I/O: cin >> chains (int/char/string), cout << chains (int/char/string/argv(i)/endl)
 
 #include "terminal_hooks.h"
 #include "terminal_io.h"
@@ -1067,8 +1081,172 @@ static inline int tcc_is_alpha(char c){ return (c>='a'&&c<='z')||(c>='A'&&c<='Z'
 static inline int tcc_is_alnum(char c){ return tcc_is_alpha(c)||tcc_is_digit(c); }
 static inline int tcc_strlen(const char* s){ int n=0; while(s && s[n]) ++n; return n; }
 
+// Helper functions for hex conversion and PCI access
+static void uint32_to_hex_string(uint32_t value, char* buffer) {
+    const char hex_chars[] = "0123456789ABCDEF";
+    for(int i = 7; i >= 0; i--) {
+        buffer[7-i] = hex_chars[(value >> (i*4)) & 0xF];
+    }
+    buffer[8] = 0;
+}
+
+static void uint64_to_hex_string(uint64_t value, char* buffer) {
+    const char hex_chars[] = "0123456789ABCDEF";
+    for(int i = 15; i >= 0; i--) {
+        buffer[15-i] = hex_chars[(value >> (i*4)) & 0xF];
+    }
+    buffer[16] = 0;
+}
+
+// Simple PCI configuration space access
+static uint32_t pci_config_read_dword(uint16_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | ((uint32_t)device << 11) | 
+                      ((uint32_t)function << 8) | (offset & 0xFC);
+    
+    // Write address to CONFIG_ADDRESS (0xCF8)
+    asm volatile("outl %0, %w1" : : "a"(address), "Nd"(0xCF8) : "memory");
+    
+    // Read data from CONFIG_DATA (0xCFC)
+    uint32_t result;
+    asm volatile("inl %w1, %0" : "=a"(result) : "Nd"(0xCFC) : "memory");
+    
+    return result;
+}
+
 // ============================================================
-// Enhanced Bytecode ISA with File I/O, Arrays, and String Concatenation
+// Hardware Interface Discovery Structures
+// ============================================================
+struct HardwareDevice {
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint64_t base_address;
+    uint64_t size;
+    uint32_t device_type;  // 0=Unknown, 1=Storage, 2=Network, 3=Graphics, 4=Audio, 5=USB
+    char description[64];
+};
+
+// Global hardware registry
+static const int MAX_HARDWARE_DEVICES = 32;
+static HardwareDevice hardware_registry[MAX_HARDWARE_DEVICES];
+static int hardware_count = 0;
+
+// Hardware discovery functions
+static void discover_pci_devices() {
+    // Scan PCI configuration space for devices
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t device = 0; device < 32; device++) {
+            for (uint8_t function = 0; function < 8; function++) {
+                uint32_t vendor_device = pci_config_read_dword(bus, device, function, 0);
+                if ((vendor_device & 0xFFFF) == 0xFFFF) continue; // No device
+                
+                if (hardware_count >= MAX_HARDWARE_DEVICES) return;
+                
+                HardwareDevice& dev = hardware_registry[hardware_count];
+                dev.vendor_id = vendor_device & 0xFFFF;
+                dev.device_id = (vendor_device >> 16) & 0xFFFF;
+                
+                // Read BAR0 for base address
+                uint32_t bar0 = pci_config_read_dword(bus, device, function, 0x10);
+                if (bar0 & 0x1) {
+                    // I/O port
+                    dev.base_address = bar0 & 0xFFFFFFFC;
+                    dev.size = 0x100; // Assume 256 bytes for I/O ports
+                } else {
+                    // Memory mapped
+                    dev.base_address = bar0 & 0xFFFFFFF0;
+                    if ((bar0 & 0x6) == 0x4) {
+                        // 64-bit BAR
+                        uint32_t bar1 = pci_config_read_dword(bus, device, function, 0x14);
+                        dev.base_address |= ((uint64_t)bar1 << 32);
+                    }
+                    dev.size = 0x1000; // Assume 4KB for memory mapped
+                }
+                
+                // Determine device type based on class code
+                uint32_t class_code = pci_config_read_dword(bus, device, function, 0x08);
+                uint8_t base_class = (class_code >> 24) & 0xFF;
+                
+                switch (base_class) {
+                    case 0x01: dev.device_type = 1; simple_strcpy(dev.description, "Storage Controller"); break;
+                    case 0x02: dev.device_type = 2; simple_strcpy(dev.description, "Network Controller"); break;
+                    case 0x03: dev.device_type = 3; simple_strcpy(dev.description, "Display Controller"); break;
+                    case 0x04: dev.device_type = 4; simple_strcpy(dev.description, "Multimedia Controller"); break;
+                    case 0x0C: 
+                        if (((class_code >> 16) & 0xFF) == 0x03) {
+                            dev.device_type = 5; 
+                            simple_strcpy(dev.description, "USB Controller");
+                        } else {
+                            dev.device_type = 0; 
+                            simple_strcpy(dev.description, "Serial Bus Controller");
+                        }
+                        break;
+                    default: dev.device_type = 0; simple_strcpy(dev.description, "Unknown Device"); break;
+                }
+                
+                hardware_count++;
+                
+                if (function == 0 && !(pci_config_read_dword(bus, device, function, 0x0C) & 0x800000)) {
+                    break; // Single function device
+                }
+            }
+        }
+    }
+}
+
+static void discover_memory_regions() {
+    // Add known memory regions
+    if (hardware_count < MAX_HARDWARE_DEVICES) {
+        HardwareDevice& dev = hardware_registry[hardware_count];
+        dev.vendor_id = 0x0000;
+        dev.device_id = 0x0001;
+        dev.base_address = 0xB8000; // VGA text mode buffer
+        dev.size = 0x8000;
+        dev.device_type = 3;
+        simple_strcpy(dev.description, "VGA Text Buffer");
+        hardware_count++;
+    }
+    
+    if (hardware_count < MAX_HARDWARE_DEVICES) {
+        HardwareDevice& dev = hardware_registry[hardware_count];
+        dev.vendor_id = 0x0000;
+        dev.device_id = 0x0002;
+        dev.base_address = 0xA0000; // VGA graphics buffer
+        dev.size = 0x20000;
+        dev.device_type = 3;
+        simple_strcpy(dev.description, "VGA Graphics Buffer");
+        hardware_count++;
+    }
+}
+
+static int scan_hardware() {
+    hardware_count = 0;
+    discover_pci_devices();
+    discover_memory_regions();
+    return hardware_count;
+}
+
+// Safety check for MMIO access
+static bool is_safe_mmio_address(uint64_t addr, uint64_t size) {
+    // Check if address falls within any known device range
+    for (int i = 0; i < hardware_count; i++) {
+        const HardwareDevice& dev = hardware_registry[i];
+        if (addr >= dev.base_address && 
+            addr + size <= dev.base_address + dev.size) {
+            return true;
+        }
+    }
+    
+    // Allow access to standard VGA and system areas even if not enumerated
+    if (addr >= 0xA0000 && addr < 0x100000) return true; // VGA/BIOS area
+    if (addr >= 0xB8000 && addr < 0xC0000) return true; // VGA text buffer
+    if (addr >= 0x3C0 && addr < 0x3E0) return true;     // VGA registers
+    if (addr >= 0x60 && addr < 0x70) return true;       // Keyboard controller
+    
+    return false;
+}
+
+// ============================================================
+// Enhanced Bytecode ISA with Hardware Discovery and MMIO
 // ============================================================
 enum TOp : unsigned char {
     // stack/data
@@ -1088,38 +1266,33 @@ enum TOp : unsigned char {
     T_READ_INT, T_READ_CHAR, T_READ_STR,
     T_PUSH_ARGC, T_PUSH_ARGV_PTR,
 
-    // NEW: File I/O operations
-    T_READ_FILE,      // (filename) -> content_string
-    T_WRITE_FILE,     // (filename, content) -> success_int
-    T_APPEND_FILE,    // (filename, content) -> success_int
+    // File I/O operations
+    T_READ_FILE, T_WRITE_FILE, T_APPEND_FILE,
 
-    // NEW: Array operations
-    T_ALLOC_ARRAY,    // (size) -> array_ptr
-    T_LOAD_ARRAY,     // (array_ptr, index) -> value
-    T_STORE_ARRAY,    // (array_ptr, index, value) -> void
-    T_ARRAY_SIZE,     // (array_ptr) -> size
-    T_ARRAY_RESIZE,   // (array_ptr, new_size) -> new_array_ptr
+    // Array operations
+    T_ALLOC_ARRAY, T_LOAD_ARRAY, T_STORE_ARRAY, T_ARRAY_SIZE, T_ARRAY_RESIZE,
 
-    // NEW: String operations
-    T_STR_CONCAT,     // (str1, str2) -> concatenated_string
-    T_STR_LENGTH,     // (str) -> length_int
-    T_STR_SUBSTR,     // (str, start, len) -> substring
-    T_INT_TO_STR,     // (int) -> string representation
-    T_STR_COMPARE,    // (str1, str2) -> comparison result (-1, 0, 1)
+    // String operations
+    T_STR_CONCAT, T_STR_LENGTH, T_STR_SUBSTR, T_INT_TO_STR, T_STR_COMPARE,
+    T_STR_FIND_CHAR, T_STR_FIND_STR, T_STR_FIND_LAST_CHAR, T_STR_CONTAINS,
+    T_STR_STARTS_WITH, T_STR_ENDS_WITH, T_STR_COUNT_CHAR, T_STR_REPLACE_CHAR,
     
-    // NEW: String search operations
-    T_STR_FIND_CHAR,  // (str, char) -> index (-1 if not found)
-    T_STR_FIND_STR,   // (str, substr) -> index (-1 if not found)
-    T_STR_FIND_LAST_CHAR, // (str, char) -> last index (-1 if not found)
-    T_STR_CONTAINS,   // (str, substr) -> boolean (1/0)
-    T_STR_STARTS_WITH, // (str, prefix) -> boolean (1/0)
-    T_STR_ENDS_WITH,  // (str, suffix) -> boolean (1/0)
-    T_STR_COUNT_CHAR, // (str, char) -> count of occurrences
-    T_STR_REPLACE_CHAR // (str, old_char, new_char) -> new string
+    // NEW: Hardware Discovery and Memory-Mapped I/O
+    T_SCAN_HARDWARE,    // () -> device_count
+    T_GET_DEVICE_INFO,  // (device_index) -> device_array_handle
+    T_MMIO_READ8,       // (address) -> uint8_value
+    T_MMIO_READ16,      // (address) -> uint16_value  
+    T_MMIO_READ32,      // (address) -> uint32_value
+    T_MMIO_READ64,      // (address) -> uint64_value (split into two 32-bit values)
+    T_MMIO_WRITE8,      // (address, value) -> success
+    T_MMIO_WRITE16,     // (address, value) -> success
+    T_MMIO_WRITE32,     // (address, value) -> success
+    T_MMIO_WRITE64,     // (address, low32, high32) -> success
+    T_GET_HARDWARE_ARRAY // () -> hardware_device_array_handle
 };
 
 // ============================================================
-// Enhanced Program buffers with array support
+// Enhanced Program buffers with hardware support
 // ============================================================
 struct TProgram {
     static const int CODE_MAX = 8192;
@@ -1132,8 +1305,8 @@ struct TProgram {
 
     static const int LOC_MAX = 32;
     char  loc_name[LOC_MAX][32];
-    unsigned char loc_type[LOC_MAX]; // 0=int,1=char,2=string,3=int_array,4=string_array
-    int   loc_array_size[LOC_MAX];   // NEW: for array declarations
+    unsigned char loc_type[LOC_MAX]; // 0=int,1=char,2=string,3=int_array,4=string_array,5=device_array
+    int   loc_array_size[LOC_MAX];
     int   loc_count = 0;
 
     int add_local(const char* name, unsigned char t, int array_size = 0){
@@ -1167,7 +1340,7 @@ struct TProgram {
 };
 
 // ============================================================
-// Enhanced Tokenizer with array syntax
+// Enhanced Tokenizer with hardware and MMIO keywords
 // ============================================================
 enum TTokType { TT_EOF, TT_ID, TT_NUM, TT_STR, TT_CH, TT_KW, TT_OP, TT_PUNC };
 struct TTok { TTokType t; char v[64]; int ival; };
@@ -1188,19 +1361,38 @@ struct TLex {
 
     TTok number(){
         TTok t; t.t=TT_NUM; t.ival=0; int i=0;
-        while(tcc_is_digit(src[pos])){ t.v[i++]=src[pos]; t.ival = t.ival*10 + (src[pos]-'0'); pos++; if(i>=63) break; }
+        // Support hex numbers (0x prefix)
+        if(src[pos] == '0' && (src[pos+1] == 'x' || src[pos+1] == 'X')) {
+            pos += 2;
+            t.v[i++] = '0'; t.v[i++] = 'x';
+            while(i < 63 && ((src[pos] >= '0' && src[pos] <= '9') || 
+                           (src[pos] >= 'a' && src[pos] <= 'f') ||
+                           (src[pos] >= 'A' && src[pos] <= 'F'))) {
+                char c = src[pos];
+                t.v[i++] = c;
+                if(c >= '0' && c <= '9') t.ival = t.ival * 16 + (c - '0');
+                else if(c >= 'a' && c <= 'f') t.ival = t.ival * 16 + (c - 'a' + 10);
+                else if(c >= 'A' && c <= 'F') t.ival = t.ival * 16 + (c - 'A' + 10);
+                pos++;
+            }
+        } else {
+            while(tcc_is_digit(src[pos])){ t.v[i++]=src[pos]; t.ival = t.ival*10 + (src[pos]-'0'); pos++; if(i>=63) break; }
+        }
         t.v[i]=0; return t;
     }
 
     TTok ident(){
         TTok t; t.t=TT_ID; int i=0;
         while(tcc_is_alnum(src[pos])){ t.v[i++]=src[pos++]; if(i>=63) break; } t.v[i]=0;
-        // NEW: Added file I/O, array built-ins, and string functions
+        // Enhanced keywords with hardware and MMIO functions
         const char* kw[]={"int","char","string","return","if","else","while","break","continue",
                          "cin","cout","endl","argc","argv","read_file","write_file","append_file",
                          "array_size","array_resize","str_length","str_substr","int_to_str","str_compare",
                          "str_find_char","str_find_str","str_find_last_char","str_contains",
-                         "str_starts_with","str_ends_with","str_count_char","str_replace_char",0};
+                         "str_starts_with","str_ends_with","str_count_char","str_replace_char",
+                         "scan_hardware","get_device_info","get_hardware_array",
+                         "mmio_read8","mmio_read16","mmio_read32","mmio_read64",
+                         "mmio_write8","mmio_write16","mmio_write32","mmio_write64",0};
         for(int k=0; kw[k]; ++k){ if(simple_strcmp(t.v,kw[k])==0){ t.t=TT_KW; break; } }
         return t;
     }
@@ -1230,14 +1422,14 @@ struct TLex {
         if(src[pos]==0){ TTok t; t.t=TT_EOF; t.v[0]=0; return t; }
         if(src[pos]=='"') return string();
         if(src[pos]=='\'') return chlit();
-        if(tcc_is_digit(src[pos])) return number();
+        if(tcc_is_digit(src[pos]) || (src[pos]=='0' && (src[pos+1]=='x'||src[pos+1]=='X'))) return number();
         if(tcc_is_alpha(src[pos])) return ident();
         return op_or_punc();
     }
 };
 
 // ============================================================
-// Enhanced Parser / Compiler with File I/O and Arrays
+// Enhanced Parser / Compiler with Hardware and MMIO support
 // ============================================================
 struct TCompiler {
     TLex lx; TTok tk; TProgram pr;
@@ -1256,7 +1448,7 @@ struct TCompiler {
         if(tk.t==TT_KW && simple_strcmp(tk.v,"argc")==0){ pr.emit1(T_PUSH_ARGC); adv(); return; }
         if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); return; }
         
-        // NEW: File I/O built-ins
+        // File I/O built-ins
         if(tk.t==TT_KW && simple_strcmp(tk.v,"read_file")==0){ 
             adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_READ_FILE); return; 
         }
@@ -1267,14 +1459,15 @@ struct TCompiler {
             adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_APPEND_FILE); return; 
         }
         
-        // NEW: Array built-ins
+        // Array built-ins
         if(tk.t==TT_KW && simple_strcmp(tk.v,"array_size")==0){ 
             adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_ARRAY_SIZE); return; 
         }
         if(tk.t==TT_KW && simple_strcmp(tk.v,"array_resize")==0){ 
             adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_ARRAY_RESIZE); return; 
         }
-        // NEW: String built-ins
+        
+        // String built-ins
         if(tk.t==TT_KW && simple_strcmp(tk.v,"str_length")==0){ 
             adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_STR_LENGTH); return; 
         }
@@ -1289,7 +1482,7 @@ struct TCompiler {
             adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_COMPARE); return; 
         }
         
-        // NEW: String search functions
+        // String search functions
         if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_char")==0){ 
             adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_CHAR); return; 
         }
@@ -1316,6 +1509,44 @@ struct TCompiler {
             parse_expression(); expect(")"); pr.emit1(T_STR_REPLACE_CHAR); return; 
         }
         
+        // NEW: Hardware Discovery Functions
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"scan_hardware")==0){ 
+            adv(); expect("("); expect(")"); pr.emit1(T_SCAN_HARDWARE); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"get_device_info")==0){ 
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_GET_DEVICE_INFO); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"get_hardware_array")==0){ 
+            adv(); expect("("); expect(")"); pr.emit1(T_GET_HARDWARE_ARRAY); return; 
+        }
+        
+        // NEW: Memory-Mapped I/O Functions
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read8")==0){ 
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ8); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read16")==0){ 
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ16); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read32")==0){ 
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ32); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read64")==0){ 
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ64); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write8")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE8); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write16")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE16); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write32")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE32); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write64")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(","); 
+            parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE64); return; 
+        }
+        
         if(tk.t==TT_PUNC && tk.v[0]=='('){ adv(); parse_expression(); expect(")"); return; }
         
         if(tk.t==TT_ID){
@@ -1324,7 +1555,7 @@ struct TCompiler {
             char var_name[32]; simple_strcpy(var_name, tk.v);
             adv();
             
-            // NEW: Array indexing
+            // Array indexing
             if(tk.t==TT_PUNC && tk.v[0]=='['){
                 pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // push handle
                 adv(); // past '['
@@ -1387,7 +1618,7 @@ struct TCompiler {
         char nm[32]; simple_strcpy(nm, tk.v); adv();
         
         int array_size = 0;
-        // NEW: Array declaration syntax: int arr[size] or string arr[size]
+        // Array declaration syntax: int arr[size] or string arr[size]
         if(tk.t==TT_PUNC && tk.v[0]=='['){
             adv();
             if(tk.t==TT_NUM){ 
@@ -1456,7 +1687,7 @@ struct TCompiler {
                     char var_name[32]; simple_strcpy(var_name, tk.v);
                     int idx = pr.get_local(tk.v); int ty = pr.get_local_type(idx); adv();
                     
-                    // MODIFIED: Handle array element printing vs whole array printing
+                    // Handle array element printing vs whole array printing
                     if(tk.t==TT_PUNC && tk.v[0]=='['){
                         pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // load array
                         adv(); // past '['
@@ -1465,9 +1696,10 @@ struct TCompiler {
                         pr.emit1(T_LOAD_ARRAY); // load element
                         if (ty == 3) pr.emit1(T_PRINT_INT);       // int array element
                         else if (ty == 4) pr.emit1(T_PRINT_STR);  // string array element
+                        else if (ty == 5) pr.emit1(T_PRINT_INT);  // device array element
                     } else {
                         pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);
-                        if(ty==4) pr.emit1(T_PRINT_STRING_ARRAY); // NEW: Print whole string array
+                        if(ty==4) pr.emit1(T_PRINT_STRING_ARRAY); // Print whole string array
                         else if(ty==3) pr.emit1(T_PRINT_INT_ARRAY); // Print whole int array
                         else if(ty==2) pr.emit1(T_PRINT_STR);
                         else if(ty==1) pr.emit1(T_PRINT_CHAR);
@@ -1507,14 +1739,13 @@ struct TCompiler {
 			return;
 		}
 
-
         if(tk.t==TT_ID){
             int idx = pr.get_local(tk.v);
             if(idx<0){ cout << "Unknown var "; cout << tk.v; cout << "\n"; }
             int ty = pr.get_local_type(idx);
             adv(); 
             
-            // NEW: Array element assignment (FIXED)
+            // Array element assignment
             if(tk.t==TT_PUNC && tk.v[0]=='['){
                 pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);  // 1. Push handle
                 adv(); // past '['
@@ -1541,10 +1772,9 @@ struct TCompiler {
             return;
         }
 
-		// If we get here, it wasn't cout, cin, or an assignment.
-        // Treat it as an expression statement (e.g., a function call).
+        // Expression statement
         parse_expression();
-        pr.emit1(T_POP); // Pop the result of the expression, since it's not used.
+        pr.emit1(T_POP); // Pop unused result
         expect(";");
     }
 
@@ -1610,7 +1840,7 @@ struct TCompiler {
 };
 
 // ============================================================
-// Enhanced VM with File I/O, Arrays, and String Concatenation
+// Enhanced VM with Hardware Discovery and Memory-Mapped I/O
 // ============================================================
 struct TinyVM {
     static const int STK_MAX = 1024;
@@ -1621,12 +1851,12 @@ struct TinyVM {
     char str_in[256];
     uint64_t ahci_base; int port; // for file I/O
     
-    // NEW: String pool for dynamic string management
+    // String pool for dynamic string management
     static const int STRING_POOL_SIZE = 8192;
     char string_pool[STRING_POOL_SIZE];
     int string_pool_top = 0;
     
-    // NEW: Simple array management
+    // Simple array management
     struct Array {
         int* data;
         int size;
@@ -1635,15 +1865,102 @@ struct TinyVM {
     static const int MAX_ARRAYS = 64;
     Array arrays[MAX_ARRAYS];
     int array_count = 0;
+    
+    // Special array handle for hardware devices
+    int hardware_array_handle = 0;
 
     inline void push(int v){ if(sp<STK_MAX) stk[sp++]=v; }
     inline int  pop(){ return sp?stk[--sp]:0; }
 
-    // NEW: String management functions
+    // Memory-Mapped I/O functions
+    uint8_t mmio_read_8(uint64_t addr) {
+        if (!is_safe_mmio_address(addr, 1)) {
+            cout << "MMIO: Unsafe read8 at 0x"; 
+            char hex[17]; uint64_to_hex_string(addr, hex); 
+            cout << hex << "\n";
+            return 0xFF;
+        }
+        return *(volatile uint8_t*)addr;
+    }
+
+    uint16_t mmio_read_16(uint64_t addr) {
+        if (!is_safe_mmio_address(addr, 2)) {
+            cout << "MMIO: Unsafe read16 at 0x"; 
+            char hex[17]; uint64_to_hex_string(addr, hex); 
+            cout << hex << "\n";
+            return 0xFFFF;
+        }
+        return *(volatile uint16_t*)addr;
+    }
+
+    uint32_t mmio_read_32(uint64_t addr) {
+        if (!is_safe_mmio_address(addr, 4)) {
+            cout << "MMIO: Unsafe read32 at 0x"; 
+            char hex[17]; uint64_to_hex_string(addr, hex); 
+            cout << hex << "\n";
+            return 0xFFFFFFFF;
+        }
+        return *(volatile uint32_t*)addr;
+    }
+
+    uint64_t mmio_read_64(uint64_t addr) {
+        if (!is_safe_mmio_address(addr, 8)) {
+            cout << "MMIO: Unsafe read64 at 0x"; 
+            char hex[17]; uint64_to_hex_string(addr, hex); 
+            cout << hex << "\n";
+            return 0xFFFFFFFFFFFFFFFFULL;
+        }
+        return *(volatile uint64_t*)addr;
+    }
+
+    bool mmio_write_8(uint64_t addr, uint8_t value) {
+        if (!is_safe_mmio_address(addr, 1)) {
+            cout << "MMIO: Unsafe write8 at 0x"; 
+            char hex[17]; uint64_to_hex_string(addr, hex); 
+            cout << hex << "\n";
+            return false;
+        }
+        *(volatile uint8_t*)addr = value;
+        return true;
+    }
+
+    bool mmio_write_16(uint64_t addr, uint16_t value) {
+        if (!is_safe_mmio_address(addr, 2)) {
+            cout << "MMIO: Unsafe write16 at 0x"; 
+            char hex[17]; uint64_to_hex_string(addr, hex); 
+            cout << hex << "\n";
+            return false;
+        }
+        *(volatile uint16_t*)addr = value;
+        return true;
+    }
+
+    bool mmio_write_32(uint64_t addr, uint32_t value) {
+        if (!is_safe_mmio_address(addr, 4)) {
+            cout << "MMIO: Unsafe write32 at 0x"; 
+            char hex[17]; uint64_to_hex_string(addr, hex); 
+            cout << hex << "\n";
+            return false;
+        }
+        *(volatile uint32_t*)addr = value;
+        return true;
+    }
+
+    bool mmio_write_64(uint64_t addr, uint64_t value) {
+        if (!is_safe_mmio_address(addr, 8)) {
+            cout << "MMIO: Unsafe write64 at 0x"; 
+            char hex[17]; uint64_to_hex_string(addr, hex); 
+            cout << hex << "\n";
+            return false;
+        }
+        *(volatile uint64_t*)addr = value;
+        return true;
+    }
+
+    // String management functions
     const char* alloc_string(int len) {
         if(string_pool_top + len + 1 > STRING_POOL_SIZE) {
-            // Simple garbage collection - reset pool (naive approach)
-            string_pool_top = 0;
+            string_pool_top = 0; // Simple reset
         }
         if(string_pool_top + len + 1 > STRING_POOL_SIZE) return nullptr;
         char* result = &string_pool[string_pool_top];
@@ -1695,7 +2012,7 @@ struct TinyVM {
         return simple_strcmp(a, b);
     }
 
-    // NEW: String search and manipulation functions
+    // String search and manipulation functions (abbreviated for space)
     int find_char(const char* str, char c) {
         if(!str) return -1;
         for(int i = 0; str[i]; i++) {
@@ -1715,7 +2032,7 @@ struct TinyVM {
 
     int find_string(const char* haystack, const char* needle) {
         if(!haystack || !needle) return -1;
-        if(!needle[0]) return 0; // empty string found at position 0
+        if(!needle[0]) return 0;
         
         int hay_len = tcc_strlen(haystack);
         int needle_len = tcc_strlen(needle);
@@ -1726,7 +2043,7 @@ struct TinyVM {
             for(j = 0; j < needle_len; j++) {
                 if(haystack[i + j] != needle[j]) break;
             }
-            if(j == needle_len) return i; // found match
+            if(j == needle_len) return i;
         }
         return -1;
     }
@@ -1737,19 +2054,19 @@ struct TinyVM {
 
     int string_starts_with(const char* str, const char* prefix) {
         if(!str || !prefix) return 0;
-        if(!prefix[0]) return 1; // empty prefix
+        if(!prefix[0]) return 1;
         
         int i = 0;
         while(prefix[i] && str[i]) {
             if(str[i] != prefix[i]) return 0;
             i++;
         }
-        return prefix[i] == 0 ? 1 : 0; // prefix fully matched
+        return prefix[i] == 0 ? 1 : 0;
     }
 
     int string_ends_with(const char* str, const char* suffix) {
         if(!str || !suffix) return 0;
-        if(!suffix[0]) return 1; // empty suffix
+        if(!suffix[0]) return 1;
         
         int str_len = tcc_strlen(str);
         int suffix_len = tcc_strlen(suffix);
@@ -1785,28 +2102,26 @@ struct TinyVM {
         return result;
     }
 
-    // Check if values on stack are strings (heuristic based on pointer range)
+    // Check if values on stack are strings
     bool is_string_ptr(int val) {
         const char* ptr = (const char*)val;
-        // Check if it's in our literal pool or string pool
         return (ptr >= P->lit && ptr < P->lit + P->lit_top) ||
                (ptr >= string_pool && ptr < string_pool + string_pool_top);
     }
 
-    // NEW: Array management functions
+    // Array management functions
     int alloc_array(int size) {
         if(array_count >= MAX_ARRAYS) return 0;
         Array& arr = arrays[array_count];
         arr.size = size;
         arr.capacity = size;
-        // Allocate array data (simplified - in real kernel you'd use proper allocator)
-        static int array_pool[MAX_ARRAYS * 256]; // Static pool for simplicity
+        static int array_pool[MAX_ARRAYS * 256];
         static int pool_offset = 0;
         if(pool_offset + size > MAX_ARRAYS * 256) return 0;
         arr.data = &array_pool[pool_offset];
         pool_offset += size;
-        for(int i = 0; i < size; i++) arr.data[i] = 0; // initialize to 0
-        return ++array_count; // return 1-based handle
+        for(int i = 0; i < size; i++) arr.data[i] = 0;
+        return ++array_count;
     }
 
     Array* get_array(int handle) {
@@ -1818,7 +2133,6 @@ struct TinyVM {
         Array* arr = get_array(handle);
         if(!arr || new_size <= 0) return 0;
         
-        // For simplicity, create new array and copy data
         int new_handle = alloc_array(new_size);
         Array* new_arr = get_array(new_handle);
         if(!new_arr) return 0;
@@ -1830,16 +2144,62 @@ struct TinyVM {
         return new_handle;
     }
 
+    // NEW: Create hardware device info array
+    int create_device_info_array(int device_index) {
+        if(device_index < 0 || device_index >= hardware_count) return 0;
+        
+        const HardwareDevice& dev = hardware_registry[device_index];
+        
+        // Create array with device info: [vendor_id, device_id, base_addr_low, base_addr_high, size_low, size_high, device_type]
+        int handle = alloc_array(7);
+        Array* arr = get_array(handle);
+        if(!arr) return 0;
+        
+        arr->data[0] = dev.vendor_id;
+        arr->data[1] = dev.device_id;
+        arr->data[2] = (uint32_t)(dev.base_address & 0xFFFFFFFF);      // low 32 bits
+        arr->data[3] = (uint32_t)((dev.base_address >> 32) & 0xFFFFFFFF); // high 32 bits
+        arr->data[4] = (uint32_t)(dev.size & 0xFFFFFFFF);              // size low 32 bits
+        arr->data[5] = (uint32_t)((dev.size >> 32) & 0xFFFFFFFF);      // size high 32 bits
+        arr->data[6] = dev.device_type;
+        
+        return handle;
+    }
+
+    // NEW: Create array containing all hardware devices
+    int create_hardware_array() {
+        if(hardware_array_handle > 0) return hardware_array_handle; // Return existing handle
+        
+        hardware_array_handle = alloc_array(hardware_count * 7); // 7 fields per device
+        Array* arr = get_array(hardware_array_handle);
+        if(!arr) return 0;
+        
+        for(int i = 0; i < hardware_count; i++) {
+            const HardwareDevice& dev = hardware_registry[i];
+            int base = i * 7;
+            arr->data[base + 0] = dev.vendor_id;
+            arr->data[base + 1] = dev.device_id;
+            arr->data[base + 2] = (uint32_t)(dev.base_address & 0xFFFFFFFF);
+            arr->data[base + 3] = (uint32_t)((dev.base_address >> 32) & 0xFFFFFFFF);
+            arr->data[base + 4] = (uint32_t)(dev.size & 0xFFFFFFFF);
+            arr->data[base + 5] = (uint32_t)((dev.size >> 32) & 0xFFFFFFFF);
+            arr->data[base + 6] = dev.device_type;
+        }
+        
+        return hardware_array_handle;
+    }
+
     int run(TProgram& prog, int ac, const char** av, uint64_t base, int p){
         P=&prog; argc=ac; argv=av; sp=0; ahci_base=base; port=p;
         for (int i=0;i<TProgram::LOC_MAX;i++) locals[i]=0;
-        array_count = 0; // reset arrays
-        string_pool_top = 0; // reset string pool
+        array_count = 0;
+        hardware_array_handle = 0;
+        string_pool_top = 0;
         int ip=0;
         
         // Initialize arrays declared in locals
         for(int i = 0; i < P->loc_count; i++) {
-            if(P->loc_type[i] == 3 || P->loc_type[i] == 4) { // array types
+            if(P->loc_type[i] == 3 || P->loc_type[i] == 4) {
                 int arr_handle = alloc_array(P->loc_array_size[i]);
                 locals[i] = arr_handle;
             }
@@ -1938,9 +2298,7 @@ struct TinyVM {
                             char b[16];
                             int_to_string(arr->data[i], b);
                             cout << b;
-                            if (i < arr->size - 1) {
-                                cout << ", ";
-                            }
+                            if (i < arr->size - 1) cout << ", ";
                         }
                         cout << "]";
                     } else {
@@ -1958,16 +2316,13 @@ struct TinyVM {
                             cout << "\"";
                             if (p) cout << p;
                             cout << "\"";
-                            if (i < arr->size - 1) {
-                                cout << ", ";
-                            }
+                            if (i < arr->size - 1) cout << ", ";
                         }
                         cout << "]";
                     } else {
                         cout << "(null array)";
                     }
                 } break;
-
 
                 case T_READ_INT: { char t[32]; cin >> t; push(simple_atoi(t)); } break;
                 case T_READ_CHAR:{ char t[4]; cin >> t; push((unsigned char)t[0]); } break;
@@ -1976,7 +2331,7 @@ struct TinyVM {
                 case T_PUSH_ARGC: { push(argc); } break;
                 case T_PUSH_ARGV_PTR: { int idx=pop(); const char* p=(idx>=0 && idx<argc && argv)? argv[idx]:""; push((int)p); } break;
 
-                // NEW: File I/O operations
+                // File I/O operations
                 case T_READ_FILE: {
                     const char* filename = (const char*)pop();
                     static char file_buffer[4096];
@@ -1986,31 +2341,28 @@ struct TinyVM {
                         file_buffer[n] = 0;
                         push((int)file_buffer);
                     } else {
-                        push((int)""); // return empty string on failure
+                        push((int)"");
                     }
                 } break;
 
                 case T_WRITE_FILE: {
 					const char* content = (const char*)pop();
 					const char* filename = (const char*)pop();
-
                     int len = tcc_strlen(content);
                     int result = fat32_write_file(ahci_base, port, filename, 
                                                 (const unsigned char*)content, len);
-                    push(result >= 0 ? 1 : 0); // return success/failure
+                    push(result >= 0 ? 1 : 0);
                 } break;
 
                 case T_APPEND_FILE: {
                     const char* content = (const char*)pop();
                     const char* filename = (const char*)pop();
-                    // Read existing content first
                     static char existing_buffer[4096];
                     int n = fat32_read_file_to_buffer(ahci_base, port, filename, 
                                                     (unsigned char*)existing_buffer, sizeof(existing_buffer)-1);
                     if(n < 0) n = 0;
                     existing_buffer[n] = 0;
                     
-                    // Append new content
                     int content_len = tcc_strlen(content);
                     if(n + content_len < sizeof(existing_buffer)) {
                         simple_memcpy(&existing_buffer[n], content, content_len + 1);
@@ -2018,11 +2370,11 @@ struct TinyVM {
                                                     (const unsigned char*)existing_buffer, n + content_len);
                         push(result >= 0 ? 1 : 0);
                     } else {
-                        push(0); // buffer too small
+                        push(0);
                     }
                 } break;
 
-                // NEW: Array operations
+                // Array operations
                 case T_ALLOC_ARRAY: {
                     int size = pop();
                     int handle = alloc_array(size);
@@ -2036,7 +2388,7 @@ struct TinyVM {
                     if(arr && index >= 0 && index < arr->size) {
                         push(arr->data[index]);
                     } else {
-                        push(0); // out of bounds or invalid array
+                        push(0);
                     }
                 } break;
 
@@ -2048,7 +2400,6 @@ struct TinyVM {
                     if(arr && index >= 0 && index < arr->size) {
                         arr->data[index] = value;
                     }
-                    // Note: no return value for store operation
                 } break;
 
                 case T_ARRAY_SIZE: {
@@ -2064,7 +2415,7 @@ struct TinyVM {
                     push(new_handle);
                 } break;
 
-                // NEW: String operations
+                // String operations
                 case T_STR_CONCAT: {
                     const char* b = (const char*)pop();
                     const char* a = (const char*)pop();
@@ -2097,7 +2448,7 @@ struct TinyVM {
                     push(string_compare(a, b));
                 } break;
 
-                // NEW: String search operations
+                // String search operations
                 case T_STR_FIND_CHAR: {
                     char c = (char)pop();
                     const char* str = (const char*)pop();
@@ -2148,6 +2499,81 @@ struct TinyVM {
                     push((int)result);
                 } break;
 
+                // NEW: Hardware Discovery and MMIO Operations
+                case T_SCAN_HARDWARE: {
+                    int count = scan_hardware();
+                    push(count);
+                    cout << "Hardware scan found "; 
+                    char buf[16]; int_to_string(count, buf); cout << buf;
+                    cout << " devices\n";
+                } break;
+
+                case T_GET_DEVICE_INFO: {
+                    int device_index = pop();
+                    int handle = create_device_info_array(device_index);
+                    push(handle);
+                } break;
+
+                case T_GET_HARDWARE_ARRAY: {
+                    int handle = create_hardware_array();
+                    push(handle);
+                } break;
+
+                case T_MMIO_READ8: {
+                    uint64_t addr = (uint64_t)pop();
+                    uint8_t value = mmio_read_8(addr);
+                    push((int)value);
+                } break;
+
+                case T_MMIO_READ16: {
+                    uint64_t addr = (uint64_t)pop();
+                    uint16_t value = mmio_read_16(addr);
+                    push((int)value);
+                } break;
+
+                case T_MMIO_READ32: {
+                    uint64_t addr = (uint64_t)pop();
+                    uint32_t value = mmio_read_32(addr);
+                    push((int)value);
+                } break;
+
+                case T_MMIO_READ64: {
+                    uint64_t addr = (uint64_t)pop();
+                    uint64_t value = mmio_read_64(addr);
+                    push((int)(value >> 32));    // high 32 bits first
+                    push((int)(value & 0xFFFFFFFF)); // low 32 bits second
+                } break;
+
+                case T_MMIO_WRITE8: {
+                    uint8_t value = (uint8_t)pop();
+                    uint64_t addr = (uint64_t)pop();
+                    bool success = mmio_write_8(addr, value);
+                    push(success ? 1 : 0);
+                } break;
+
+                case T_MMIO_WRITE16: {
+                    uint16_t value = (uint16_t)pop();
+                    uint64_t addr = (uint64_t)pop();
+                    bool success = mmio_write_16(addr, value);
+                    push(success ? 1 : 0);
+                } break;
+
+                case T_MMIO_WRITE32: {
+                    uint32_t value = (uint32_t)pop();
+                    uint64_t addr = (uint64_t)pop();
+                    bool success = mmio_write_32(addr, value);
+                    push(success ? 1 : 0);
+                } break;
+
+                case T_MMIO_WRITE64: {
+                    uint32_t high32 = (uint32_t)pop();
+                    uint32_t low32 = (uint32_t)pop();
+                    uint64_t addr = (uint64_t)pop();
+                    uint64_t value = ((uint64_t)high32 << 32) | low32;
+                    bool success = mmio_write_64(addr, value);
+                    push(success ? 1 : 0);
+                } break;
+
                 case T_RET: { int rv=pop(); return rv; }
                 default: return -1;
             }
@@ -2157,20 +2583,20 @@ struct TinyVM {
 };
 
 // ============================================================
-// Enhanced Object I/O (TVM2 - updated version)
+// Enhanced Object I/O (TVM3 - with hardware support)
 // ============================================================
 struct TVMObject {
     static int save(uint64_t base, int port, const char* path, const TProgram& P){
-        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 64 ];
+        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 128 ];
         int off=0;
-        buf[off++]='T'; buf[off++]='V'; buf[off++]='M'; buf[off++]='2'; // Updated version
+        buf[off++]='T'; buf[off++]='V'; buf[off++]='M'; buf[off++]='3'; // Version 3 with hardware support
         *(int*)&buf[off]=P.pc; off+=4;
         *(int*)&buf[off]=P.lit_top; off+=4;
         *(int*)&buf[off]=P.loc_count; off+=4;
         simple_memcpy(&buf[off], P.code, P.pc); off+=P.pc;
         simple_memcpy(&buf[off], P.lit, P.lit_top); off+=P.lit_top;
         
-        // NEW: Save local variable metadata (names, types, array sizes)
+        // Save local variable metadata (names, types, array sizes)
         for(int i = 0; i < P.loc_count; i++) {
             int name_len = tcc_strlen(P.loc_name[i]) + 1;
             simple_memcpy(&buf[off], P.loc_name[i], name_len); off += name_len;
@@ -2182,10 +2608,10 @@ struct TVMObject {
     }
     
     static int load(uint64_t base, int port, const char* path, TProgram& P){
-        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 64 ];
+        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 128 ];
         int n = fat32_read_file_to_buffer(base, port, path, buf, sizeof(buf));
         if(n<16) return -1;
-        if(!(buf[0]=='T'&&buf[1]=='V'&&buf[2]=='M'&&(buf[3]=='1'||buf[3]=='2'))) return -2;
+        if(!(buf[0]=='T'&&buf[1]=='V'&&buf[2]=='M'&&(buf[3]=='1'||buf[3]=='2'||buf[3]=='3'))) return -2;
         int cp=*(int*)&buf[4], lp=*(int*)&buf[8], lc=*(int*)&buf[12];
         if(cp<0||cp>TProgram::CODE_MAX||lp<0||lp>TProgram::LIT_MAX||lc<0||lc>TProgram::LOC_MAX) return -3;
         P.pc=cp; P.lit_top=lp; P.loc_count=lc;
@@ -2193,22 +2619,22 @@ struct TVMObject {
         simple_memcpy(P.code, &buf[off], cp); off+=cp;
         simple_memcpy(P.lit, &buf[off], lp); off+=lp;
         
-        // NEW: Load local variable metadata if TVM2 format
-        if(buf[3] == '2') {
+        // Load local variable metadata if TVM2/TVM3 format
+        if(buf[3] >= '2') {
             for(int i = 0; i < lc; i++) {
                 int name_len = 0;
                 while(off + name_len < n && buf[off + name_len] != 0) name_len++;
                 if(name_len < 32) {
                     simple_memcpy(P.loc_name[i], &buf[off], name_len + 1);
                 } else {
-                    P.loc_name[i][0] = 0; // truncate long names
+                    P.loc_name[i][0] = 0;
                 }
                 off += name_len + 1;
                 P.loc_type[i] = buf[off++];
                 P.loc_array_size[i] = *(int*)&buf[off]; off += 4;
             }
         } else {
-            // TVM1 compatibility - clear metadata
+            // TVM1 compatibility
             for(int i = 0; i < lc; i++) {
                 P.loc_name[i][0] = 0;
                 P.loc_type[i] = 0;
@@ -2244,7 +2670,7 @@ static int tinyvm_run_obj(uint64_t ahci_base, int port, const char* obj_path, in
 }
 
 // ============================================================
-// Enhanced Shell glue
+// Enhanced Shell glue with hardware discovery info
 // ============================================================
 extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename){
     if (!filename) { cout << "Usage: compile <file.cpp>\n"; return; }
@@ -2273,311 +2699,6 @@ extern "C" void cmd_exec(const char* code_text){
     int rv = vm.run(P, 0, argvv, 0, 0); // no file I/O in exec mode
     char b[16]; int_to_string(rv,b); cout << b;
 }
-
-
-
-
-
-
-// 1) Keep Framebuffer defined before any get_boot_framebuffer usage
-struct Framebuffer {
-    uint8_t* ptr;      // Linear framebuffer base (kernel virtual)
-    uint32_t width;    // pixels
-    uint32_t height;   // pixels
-    uint32_t pitch;    // bytes per scanline
-    uint32_t bpp;      // bits per pixel (expect 32)
-    uint32_t pixel_format; // 0 = XRGB8888, 1 = BGRA8888 (implementation choice)
-};
-
-// 2) C-linkage globals written by boot.S (define exactly once)
-extern "C" {
-    uint32_t multiboot_magic;
-    uint32_t multiboot_info_ptr;
-}
-
-// 3) Provide only a prototype before start_gui
-extern "C" bool get_boot_framebuffer(Framebuffer& out);
-
-
-
-// ---- Multiboot info layout (includes framebuffer fields when flags bit 12 set)
-#pragma pack(push,1)
-struct multiboot_info_t {
-    uint32_t flags;
-    uint32_t mem_lower, mem_upper;
-    uint32_t boot_device;
-    uint32_t cmdline;
-    uint32_t mods_count, mods_addr;
-    uint32_t syms[4];
-    uint32_t mmap_length, mmap_addr;
-    uint32_t drives_length, drives_addr;
-    uint32_t config_table;
-    uint32_t boot_loader_name;
-    uint32_t apm_table;
-    uint32_t vbe_control_info;
-    uint32_t vbe_mode_info;
-    uint16_t vbe_mode;
-    uint16_t vbe_interface_seg, vbe_interface_off, vbe_interface_len;
-    uint64_t framebuffer_addr;   // present if flags bit 12 set
-    uint32_t framebuffer_pitch;
-    uint32_t framebuffer_width;
-    uint32_t framebuffer_height;
-    uint8_t  framebuffer_bpp;
-    uint8_t  framebuffer_type;   // 0=indexed, 1=RGB, 2=text
-    uint8_t  color_info[6];      // RGB: r_pos,r_size,g_pos,g_size,b_pos,b_size
-};
-#pragma pack(pop)
-
-// Detect 32bpp pixel ordering from Multiboot color_info
-static uint32_t detect_pixel_format(const multiboot_info_t* mb) {
-    if (mb->framebuffer_type != 1 || mb->framebuffer_bpp != 32) return 0; // default
-    uint8_t rpos = mb->color_info[0], rsz = mb->color_info[1];
-    uint8_t gpos = mb->color_info[2], gsz = mb->color_info[3];
-    uint8_t bpos = mb->color_info[4], bsz = mb->color_info[5];
-    if (rsz == 8 && gsz == 8 && bsz == 8 && rpos == 16 && gpos == 8 && bpos == 0) return 0;
-    if (rsz == 8 && gsz == 8 && bsz == 8 && rpos == 0 && gpos == 8 && bpos == 16) return 1;
-    return 0;
-}
-
-// 4) Full implementation placed AFTER Framebuffer and Multiboot structs
-extern "C" bool get_boot_framebuffer(Framebuffer& out) {
-    // EAX magic must be 0x2BADB002 (captured by boot.S)
-    if (multiboot_magic != 0x2BADB002u) return false;
-    const auto* mb = (const multiboot_info_t*)(uintptr_t)multiboot_info_ptr;
-    if (!mb) return false;
-    if (!(mb->flags & (1u << 12))) return false; // framebuffer fields not present
-
-    // GRUB provides a physical LFB; ensure it is mapped or identity-mapped
-    uint64_t phys = mb->framebuffer_addr;
-    out.ptr   = (uint8_t*)(uintptr_t)phys;
-    out.width = mb->framebuffer_width;
-    out.height= mb->framebuffer_height;
-    out.pitch = mb->framebuffer_pitch;
-    out.bpp   = mb->framebuffer_bpp;
-    out.pixel_format = detect_pixel_format(mb);
-
-    // Require 32bpp linear framebuffer
-    if (!out.ptr) return false;
-    if (out.bpp != 32) return false;
-    if (out.pitch < out.width * 4) return false;
-    return true;
-}
-
-
-
-// ---- Minimal GUI environment (framebuffer + PSF font + demo) ----
-
-
-
-static Framebuffer g_fb = {};
-static uint32_t*   g_back = nullptr;
-
-// Platform stub: provide a framebuffer from boot services/bootloader.
-// Implement this to populate out with a valid linear framebuffer mapping.
-extern "C" bool get_boot_framebuffer(Framebuffer& out);
-
-// Simple terminal fallback if no framebuffer is present.
-static void gui_fallback_text() {
-    cout << "[GUI] No framebuffer available. Implement get_boot_framebuffer() (e.g., VBE/Limine/UEFI GOP)\\n";
-}
-
-// Allocate/destroy backbuffer
-static bool fb_alloc_backbuffer() {
-    if (!g_fb.ptr || g_fb.bpp != 32 || g_fb.pitch < g_fb.width * 4) return false;
-    size_t bytes = size_t(g_fb.pitch) * g_fb.height;
-    g_back = (uint32_t*) new uint8_t[bytes];
-    if (!g_back) return false;
-    // Clear
-    for (uint32_t y = 0; y < g_fb.height; ++y) {
-        uint32_t* row = (uint32_t*)((uint8_t*)g_back + y * g_fb.pitch);
-        for (uint32_t x = 0; x < g_fb.width; ++x) row[x] = 0xFF101010; // dark gray
-    }
-    return true;
-}
-static void fb_free_backbuffer() { if (g_back) { delete[] (uint8_t*)g_back; g_back = nullptr; } }
-// Present: copy backbuffer -> front
-static void fb_present() {
-    if (!g_back || !g_fb.ptr) return;
-    for (uint32_t y = 0; y < g_fb.height; ++y) {
-        void* dst = g_fb.ptr + y * g_fb.pitch;
-        void* src = ((uint8_t*)g_back) + y * g_fb.pitch;
-        memcpy(dst, src, g_fb.pitch);
-    }
-}
-
-// Pixel write (XRGB8888 default)
-static inline void put_px(uint32_t x, uint32_t y, uint32_t color) {
-    if (!g_back) return;
-    if (x >= g_fb.width || y >= g_fb.height) return;
-    uint32_t* row = (uint32_t*)((uint8_t*)g_back + y * g_fb.pitch);
-    if (g_fb.pixel_format == 0) { // XRGB8888
-        row[x] = color;
-    } else { // BGRA8888-like, swap channels if needed
-        uint8_t r = (color >> 16) & 0xFF;
-        uint8_t g = (color >> 8) & 0xFF;
-        uint8_t b = color & 0xFF;
-        row[x] = (uint32_t(b) << 16) | (uint32_t(g) << 8) | uint32_t(r) | 0xFF000000u;
-    }
-}
-static void draw_rect(int x, int y, int w, int h, uint32_t color) {
-    if (w <= 0 || h <= 0) return;
-    for (int xx = x; xx < x + w; ++xx) {
-        put_px(xx, y, color);
-        put_px(xx, y + h - 1, color);
-    }
-    for (int yy = y; yy < y + h; ++yy) {
-        put_px(x, yy, color);
-        put_px(x + w - 1, yy, color);
-    }
-}
-
-
-static void fill_rect(int x, int y, int w, int h, uint32_t color) {
-    if (!g_back) return;
-    if (w <= 0 || h <= 0) return;
-    int x0 = x < 0 ? 0 : x;
-    int y0 = y < 0 ? 0 : y;
-    int x1 = x + w; if (x1 > int(g_fb.width)) x1 = int(g_fb.width);
-    int y1 = y + h; if (y1 > int(g_fb.height)) y1 = int(g_fb.height);
-    for (int yy = y0; yy < y1; ++yy) {
-        uint32_t* row = (uint32_t*)((uint8_t*)g_back + yy * g_fb.pitch);
-        for (int xx = x0; xx < x1; ++xx) row[xx] = color;
-    }
-}
-
-
-// ----- PSF1 loader (tiny) -----
-#pragma pack(push,1)
-struct PSF1Header {
-    uint8_t magic[2];   // 0x36,0x04
-    uint8_t mode;       // bit0=512glyphs
-    uint8_t charsize;   // bytes per glyph
-};
-#pragma pack(pop)
-
-struct PSFFont {
-    const uint8_t* glyphs = nullptr;
-    uint32_t glyph_count = 0;  // 256 or 512
-    uint32_t char_w = 8;       // PSF1 is 8 pixels wide
-    uint32_t char_h = 0;       // derived from charsize
-};
-
-static bool load_psf_from_memory(const uint8_t* buf, size_t size, PSFFont& out) {
-    if (size < sizeof(PSF1Header)) return false;
-    const PSF1Header* h = (const PSF1Header*)buf;
-    if (h->magic[0] != 0x36 || h->magic[1] != 0x04) return false;
-    out.glyph_count = (h->mode & 0x01) ? 512u : 256u;
-    out.char_h = h->charsize;
-    size_t need = sizeof(PSF1Header) + out.glyph_count * out.char_h;
-    if (size < need) return false;
-    out.glyphs = buf + sizeof(PSF1Header);
-    return true;
-}
-
-static void draw_glyph(const PSFFont& f, int x, int y, uint32_t fg, uint32_t bg, uint32_t ch) {
-    uint32_t idx = ch;
-    if (idx >= f.glyph_count) idx = '?';
-    const uint8_t* g = f.glyphs + idx * f.char_h;
-    for (uint32_t row = 0; row < f.char_h; ++row) {
-        uint8_t bits = g[row];
-        for (uint32_t col = 0; col < 8; ++col) {
-            bool on = (bits >> (7 - col)) & 1;
-            put_px(x + col, y + row, on ? fg : bg);
-        }
-    }
-}
-
-static void draw_text(const PSFFont& f, int x, int y, uint32_t fg, uint32_t bg, const char* s) {
-    int cx = x;
-    for (; *s; ++s) {
-        if (*s == '\n') { y += int(f.char_h); cx = x; continue; }
-        draw_glyph(f, cx, y, fg, bg, (uint8_t)*s);
-        cx += 8;
-    }
-}
-
-// Demo desktop
-static void draw_desktop(const PSFFont& font) {
-    // Background gradient
-    for (uint32_t y = 0; y < g_fb.height; ++y) {
-        uint8_t c = uint8_t((y * 255u) / (g_fb.height ? g_fb.height : 1));
-        uint32_t color = 0xFF000030u | (uint32_t(c) << 8);
-        for (uint32_t x = 0; x < g_fb.width; ++x) put_px(x, y, color);
-    }
-    // Taskbar
-    fill_rect(0, int(g_fb.height) - 28, g_fb.width, 28, 0xFF202020);
-    draw_rect(0, int(g_fb.height) - 28, g_fb.width, 28, 0xFF404040);
-    draw_text(font, 8, int(g_fb.height) - 22, 0xFFFFFFFF, 0xFF202020, "gui demo  (ESC to exit)");
-}
-
-static void draw_window(const PSFFont& font, int x, int y, int w, int h, const char* title) {
-    fill_rect(x, y, w, h, 0xFF2A2A2A);
-    draw_rect(x, y, w, h, 0xFF707070);
-    // Title bar
-    fill_rect(x+1, y+1, w-2, 18, 0xFF3A70B0);
-    draw_text(font, x+8, y+4, 0xFFFFFFFF, 0xFF3A70B0, title);
-    // Content area
-    fill_rect(x+1, y+20, w-2, h-21, 0xFF1C1C1C);
-}
-
-static bool load_font_file(uint64_t ahci_base, int port, PSFFont& outfont) {
-    static uint8_t buf[64*1024]; // big enough for PSF1/512*charsize
-    fat32_read_file_to_buffer(ahci_base, port, "/font.psf", buf, sizeof(buf));
-    return load_psf_from_memory(buf, (size_t)buf, outfont);
-}
-
-// Expose a start_gui(...) entry
-extern "C" void start_gui(uint64_t ahci_base, int port) {
-    if (!get_boot_framebuffer(g_fb)) {
-        gui_fallback_text();
-        return;
-    }
-    if (!fb_alloc_backbuffer()) {
-        cout << "[GUI] Failed to allocate backbuffer.\\n";
-        return;
-    }
-
-    PSFFont font = {};
-    if (!load_font_file(ahci_base, port, font)) {
-        // Provide a minimal 8x8 fallback if font.psf missing
-        cout << "[GUI] Could not load /font.psf. Using blank background without text.\\n";
-    }
-
-    int wx = 60, wy = 60, ww = 360, wh = 220;
-    bool running = true;
-    while (running) {
-        // Draw frame
-        if (font.glyphs) draw_desktop(font);
-        else fill_rect(0,0,g_fb.width,g_fb.height,0xFF202028);
-        draw_window(font, wx, wy, ww, wh, "Demo Window");
-        fb_present();
-
-        // Simple input: arrow keys move window, ESC exits (using existing cin)
-        // Non-blocking read is ideal; if not available, do a lightweight poll loop.
-        // For demonstration, use a tiny blocking read of one character.
-        char cbuf[4] = {0};
-        cin >> cbuf; // adapt to your non-blocking input if available
-        char c = cbuf[0];
-        if (c == 27 /*ESC*/) { running = false; }
-        else if (c == 'h') { wx -= 10; }
-        else if (c == 'l') { wx += 10; }
-        else if (c == 'k') { wy -= 10; }
-        else if (c == 'j') { wy += 10; }
-
-        // Clamp
-        if (wx < 0) wx = 0; if (wy < 0) wy = 0;
-        if (wx + ww > int(g_fb.width))  wx = int(g_fb.width)  - ww;
-        if (wy + wh > int(g_fb.height)) wy = int(g_fb.height) - wh;
-    }
-
-    fb_free_backbuffer();
-    cout << "[GUI] Exited.\\n";
-}
-
-// ---- End minimal GUI ----
-
-
-
 
 // --- COMMAND PROMPT (Rewritten for better argument parsing) ---
 void command_prompt() {
@@ -2621,9 +2742,6 @@ void command_prompt() {
         // --- Command Handling ---
         if (stricmp(cmd, "help") == 0) cmd_help();
 		// inside commandprompt() command handling:
-		else if (stricmp(cmd, "gui") == 0) {
-			start_gui(ahci_base, port);
-		}
 		else if (stricmp(cmd, "compile") == 0) {
 			cmd_compile(ahci_base, port, arg1);
 		}
