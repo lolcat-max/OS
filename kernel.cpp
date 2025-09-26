@@ -1486,8 +1486,11 @@ struct TCompiler {
                 else if(ty==1) pr.emit1(T_READ_CHAR);
                 else pr.emit1(T_READ_INT);
                 pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
-                if(tk.t==TT_PUNC && tk.v[0]==';'){ adv(); break; }
-            }
+                  // If it wasn't a recognized statement, treat it as a function call or other expression.
+				parse_expression();
+				pr.emit1(T_POP); // Pop the function's return value, since it's not being used.
+				expect(";");
+			}
             return;
         }
 
@@ -1524,8 +1527,11 @@ struct TCompiler {
             return;
         }
 
-        while(!(tk.t==TT_PUNC && tk.v[0]==';') && tk.t!=TT_EOF) adv();
-        if(tk.t==TT_PUNC && tk.v[0]==';') adv();
+		// If we get here, it wasn't cout, cin, or an assignment.
+        // Treat it as an expression statement (e.g., a function call).
+        parse_expression();
+        pr.emit1(T_POP); // Pop the result of the expression, since it's not used.
+        expect(";");
     }
 
     void parse_if(){
@@ -1971,8 +1977,9 @@ struct TinyVM {
                 } break;
 
                 case T_WRITE_FILE: {
-                    const char* content = (const char*)pop();
-                    const char* filename = (const char*)pop();
+					const char* content = (const char*)pop();
+					const char* filename = (const char*)pop();
+
                     int len = tcc_strlen(content);
                     int result = fat32_write_file(ahci_base, port, filename, 
                                                 (const unsigned char*)content, len);
