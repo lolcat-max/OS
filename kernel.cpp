@@ -1017,13 +1017,14 @@ static void int_to_string(int value, char* buffer) {
     buffer[j] = '\0';
 }
 
-
 // tinycc_vm_kernel_enhanced.cpp
 // Enhanced tinycc-style compiler to bytecode + VM runner with File I/O and Arrays
 // NEW Features added:
 // - File I/O: read_file(filename), write_file(filename, content), append_file(filename, content)
-// - Arrays: int arr[size], arr[index] = value, value = arr[index]
+// - Arrays: int arr[size], string arr[size], arr[index] = value, value = arr[index]
 // - Array built-ins: array_size(arr), array_resize(arr, new_size)
+// - Printing entire integer/string arrays with cout << arr;
+// - Array initializer list support: int arr[3] = {10, 20, 30};
 //
 // Previous Features:
 // - Types: int, char, string (string is pointer to char, token-based I/O)
@@ -1083,7 +1084,7 @@ enum TOp : unsigned char {
     T_JMP, T_JZ, T_JNZ, T_RET,
 
     // I/O and args
-    T_PRINT_INT, T_PRINT_CHAR, T_PRINT_STR, T_PRINT_ENDL,
+    T_PRINT_INT, T_PRINT_CHAR, T_PRINT_STR, T_PRINT_ENDL, T_PRINT_INT_ARRAY, T_PRINT_STRING_ARRAY,
     T_READ_INT, T_READ_CHAR, T_READ_STR,
     T_PUSH_ARGC, T_PUSH_ARGV_PTR,
 
@@ -1131,7 +1132,7 @@ struct TProgram {
 
     static const int LOC_MAX = 32;
     char  loc_name[LOC_MAX][32];
-    unsigned char loc_type[LOC_MAX]; // 0=int,1=char,2=string,3=int_array
+    unsigned char loc_type[LOC_MAX]; // 0=int,1=char,2=string,3=int_array,4=string_array
     int   loc_array_size[LOC_MAX];   // NEW: for array declarations
     int   loc_count = 0;
 
@@ -1325,9 +1326,10 @@ struct TCompiler {
             
             // NEW: Array indexing
             if(tk.t==TT_PUNC && tk.v[0]=='['){
-                adv(); parse_expression(); expect("]");
-                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // load array pointer
-                // stack now has: [index, array_ptr]
+                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // push handle
+                adv(); // past '['
+                parse_expression(); // push index
+                expect("]");
                 pr.emit1(T_LOAD_ARRAY);
                 return;
             }
@@ -1385,7 +1387,7 @@ struct TCompiler {
         char nm[32]; simple_strcpy(nm, tk.v); adv();
         
         int array_size = 0;
-        // NEW: Array declaration syntax: int arr[size]
+        // NEW: Array declaration syntax: int arr[size] or string arr[size]
         if(tk.t==TT_PUNC && tk.v[0]=='['){
             adv();
             if(tk.t==TT_NUM){ 
@@ -1395,15 +1397,40 @@ struct TCompiler {
                 cout << "Expected array size\n"; return;
             }
             expect("]");
-            tkind = 3; // mark as array type
+            
+            if (tkind == 0) tkind = 3; // int -> int_array
+            else if (tkind == 2) tkind = 4; // string -> string_array
         }
         
         int idx = pr.add_local(nm, tkind, array_size);
+
+        // If it's an array, allocate it now, before parsing initializer
+        if (tkind == 3 || tkind == 4) {
+            pr.emit1(T_PUSH_IMM); pr.emit4(array_size);
+            pr.emit1(T_ALLOC_ARRAY);
+            pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
+        }
         
         if(accept("=")){ 
-            if(tkind==3){ // array initialization
-                cout << "Array initialization not supported yet\n";
-                parse_expression(); // consume the expression
+            if(tkind==3 || tkind==4){ // Array initialization
+                expect("{");
+                int i = 0;
+                do {
+                    if (tk.t == TT_PUNC && tk.v[0] == '}') break; // empty list or trailing comma
+                    if (i >= array_size) {
+                        cout << "Too many initializers for array\n";
+                        while(!accept("}")) { if(tk.t==TT_EOF) break; adv(); }
+                        goto end_init;
+                    }
+
+                    pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);      // 1. Push handle
+                    pr.emit1(T_PUSH_IMM); pr.emit4(i);          // 2. Push index
+                    parse_expression();                         // 3. Push value
+                    pr.emit1(T_STORE_ARRAY);                    // 4. Store
+                    i++;
+                } while(accept(","));
+                expect("}");
+                end_init:;
             } else if(tkind==2){ // string
                 if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); }
                 else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); }
@@ -1414,10 +1441,6 @@ struct TCompiler {
                 parse_expression();
                 pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
             }
-        } else if(tkind==3){ // array without initialization - allocate
-            pr.emit1(T_PUSH_IMM); pr.emit4(array_size);
-            pr.emit1(T_ALLOC_ARRAY);
-            pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
         }
         expect(";");
     }
@@ -1433,15 +1456,20 @@ struct TCompiler {
                     char var_name[32]; simple_strcpy(var_name, tk.v);
                     int idx = pr.get_local(tk.v); int ty = pr.get_local_type(idx); adv();
                     
-                    // NEW: Handle array element printing
+                    // MODIFIED: Handle array element printing vs whole array printing
                     if(tk.t==TT_PUNC && tk.v[0]=='['){
-                        adv(); parse_expression(); expect("]");
                         pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // load array
+                        adv(); // past '['
+                        parse_expression(); // push index
+                        expect("]");
                         pr.emit1(T_LOAD_ARRAY); // load element
-                        pr.emit1(T_PRINT_INT); // assume int array for now
+                        if (ty == 3) pr.emit1(T_PRINT_INT);       // int array element
+                        else if (ty == 4) pr.emit1(T_PRINT_STR);  // string array element
                     } else {
                         pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);
-                        if(ty==2) pr.emit1(T_PRINT_STR);
+                        if(ty==4) pr.emit1(T_PRINT_STRING_ARRAY); // NEW: Print whole string array
+                        else if(ty==3) pr.emit1(T_PRINT_INT_ARRAY); // Print whole int array
+                        else if(ty==2) pr.emit1(T_PRINT_STR);
                         else if(ty==1) pr.emit1(T_PRINT_CHAR);
                         else pr.emit1(T_PRINT_INT);
                     }
@@ -1464,19 +1492,20 @@ struct TCompiler {
         }
 
         if(tk.t==TT_ID){
-            char var_name[32]; simple_strcpy(var_name, tk.v);
             int idx = pr.get_local(tk.v);
             if(idx<0){ cout << "Unknown var "; cout << tk.v; cout << "\n"; }
             int ty = pr.get_local_type(idx);
             adv(); 
             
-            // NEW: Array element assignment
+            // NEW: Array element assignment (FIXED)
             if(tk.t==TT_PUNC && tk.v[0]=='['){
-                adv(); parse_expression(); expect("]"); expect("=");
-                parse_expression();
-                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // load array pointer
-                // stack now has: [value, index, array_ptr]
-                pr.emit1(T_STORE_ARRAY);
+                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);  // 1. Push handle
+                adv(); // past '['
+                parse_expression();                     // 2. Push index
+                expect("]");
+                expect("=");
+                parse_expression();                     // 3. Push value
+                pr.emit1(T_STORE_ARRAY);                // 4. Store
                 expect(";");
                 return;
             }
@@ -1790,7 +1819,7 @@ struct TinyVM {
         
         // Initialize arrays declared in locals
         for(int i = 0; i < P->loc_count; i++) {
-            if(P->loc_type[i] == 3) { // array type
+            if(P->loc_type[i] == 3 || P->loc_type[i] == 4) { // array types
                 int arr_handle = alloc_array(P->loc_array_size[i]);
                 locals[i] = arr_handle;
             }
@@ -1879,6 +1908,46 @@ struct TinyVM {
                 case T_PRINT_CHAR:{ int v=pop(); char b[2]; b[0]=(char)(v&0xff); b[1]=0; cout << b; } break;
                 case T_PRINT_STR: { const char* p=(const char*)pop(); if(p) cout << p; } break;
                 case T_PRINT_ENDL:{ cout << "\n"; } break;
+                
+                case T_PRINT_INT_ARRAY: {
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    if (arr) {
+                        cout << "[";
+                        for (int i = 0; i < arr->size; i++) {
+                            char b[16];
+                            int_to_string(arr->data[i], b);
+                            cout << b;
+                            if (i < arr->size - 1) {
+                                cout << ", ";
+                            }
+                        }
+                        cout << "]";
+                    } else {
+                        cout << "(null array)";
+                    }
+                } break;
+
+                case T_PRINT_STRING_ARRAY: {
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    if (arr) {
+                        cout << "[";
+                        for (int i = 0; i < arr->size; i++) {
+                            const char* p = (const char*)arr->data[i];
+                            cout << "\"";
+                            if (p) cout << p;
+                            cout << "\"";
+                            if (i < arr->size - 1) {
+                                cout << ", ";
+                            }
+                        }
+                        cout << "]";
+                    } else {
+                        cout << "(null array)";
+                    }
+                } break;
+
 
                 case T_READ_INT: { char t[32]; cin >> t; push(simple_atoi(t)); } break;
                 case T_READ_CHAR:{ char t[4]; cin >> t; push((unsigned char)t[0]); } break;
@@ -2183,7 +2252,6 @@ extern "C" void cmd_exec(const char* code_text){
     int rv = vm.run(P, 0, argvv, 0, 0); // no file I/O in exec mode
     char b[16]; int_to_string(rv,b); cout << b;
 }
-
 
 
 
