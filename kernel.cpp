@@ -1478,21 +1478,35 @@ struct TCompiler {
             }
             return;
         }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"cin")==0){ adv();
-            for(;;){
-                expect(">>"); if(tk.t!=TT_ID){ cout << "cin expects identifier\n"; return; }
-                int idx = pr.get_local(tk.v); int ty = pr.get_local_type(idx); adv();
-                if(ty==2) pr.emit1(T_READ_STR);
-                else if(ty==1) pr.emit1(T_READ_CHAR);
-                else pr.emit1(T_READ_INT);
-                pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
-                  // If it wasn't a recognized statement, treat it as a function call or other expression.
-				parse_expression();
-				pr.emit1(T_POP); // Pop the function's return value, since it's not being used.
-				expect(";");
+		if (tk.t==TT_KW && simple_strcmp(tk.v,"cin")==0) { 
+			adv();
+			for (;;) {
+				expect(">>");
+				if (tk.t != TT_ID) { 
+					cout << "cin expects identifier\n"; 
+					return; 
+				}
+				int idx = pr.get_local(tk.v);
+				int ty  = pr.get_local_type(idx);
+				adv(); // past identifier
+
+				// Read into scalar variable based on its type
+				if (ty == 2)       pr.emit1(T_READ_STR);   // string
+				else if (ty == 1)  pr.emit1(T_READ_CHAR);  // char
+				else               pr.emit1(T_READ_INT);   // int (default)
+
+				pr.emit1(T_STORE_LOCAL);
+				pr.emit4(idx);
+
+				// End the chain only at a semicolon; otherwise continue parsing >>
+				if (tk.t == TT_PUNC && tk.v[0] == ';') {
+					adv(); 
+					break; 
+				}
 			}
-            return;
-        }
+			return;
+		}
+
 
         if(tk.t==TT_ID){
             int idx = pr.get_local(tk.v);
