@@ -7,7 +7,9 @@ ByteCodeVM features:
 "cin","cout","endl","argc","argv","read_file","write_file","append_file",
 "array_size","array_resize","str_length","str_substr","int_to_str","str_compare",
 "str_find_char","str_find_str","str_find_last_char","str_contains",
-Hardware features soon...
+
+
+Arrays and hardware features soon...
 
 sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with your USB drive, the OS is programmed to select sata port 0 for all file operations recommended not to boot on drive 0, use USB or arbitrary drive to install)
 
