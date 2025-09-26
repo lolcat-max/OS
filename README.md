@@ -9,7 +9,7 @@ ByteCodeVM features:
 "str_find_char","str_find_str","str_find_last_char","str_contains",
 
 
-Arrays and hardware features soon...
+String arrays and hardware features soon...
 
 sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with your USB drive, the OS is programmed to select sata port 0 for all file operations recommended not to boot on drive 0, use USB or arbitrary drive to install)
 
