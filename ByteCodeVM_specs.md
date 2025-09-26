@@ -272,26 +272,4 @@ TECHNICAL IMPLEMENTATION:
     cout << "Updated contents: " << updated << endl;
     return 0;
 }
-
-3. Combined Example:
-int main() {
-    int numbers[5];
-    string filename = "numbers.txt";
-    
-    // Fill array
-    for(int i = 0; i < 5; i++) {
-        numbers[i] = i * i;
-    }
-    
-    // Write array to file (as text)
-    string output = "";
-    for(int i = 0; i < array_size(numbers); i++) {
-        // Note: This would need string concatenation support
-        // which isn't implemented yet
-        cout << numbers[i] << " ";
-    }
-    cout << endl;
-    
-    return 0;
-}
 */
