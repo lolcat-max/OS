@@ -1018,10 +1018,14 @@ static void int_to_string(int value, char* buffer) {
 }
 
 
-
-// tinycc_vm_kernel.cpp
-// Self-hosted tinycc-style compiler to bytecode + VM runner inside kernel.
-// Features:
+// tinycc_vm_kernel_enhanced.cpp
+// Enhanced tinycc-style compiler to bytecode + VM runner with File I/O and Arrays
+// NEW Features added:
+// - File I/O: read_file(filename), write_file(filename, content), append_file(filename, content)
+// - Arrays: int arr[size], arr[index] = value, value = arr[index]
+// - Array built-ins: array_size(arr), array_resize(arr, new_size)
+//
+// Previous Features:
 // - Types: int, char, string (string is pointer to char, token-based I/O)
 // - Decls: int/char/string name [= expr] ;
 // - Expr: + - * /, unary -, comparisons (== != < <= > >=), parentheses
@@ -1030,31 +1034,6 @@ static void int_to_string(int value, char* buffer) {
 // - Built-ins: argc (int), argv(i) (string pointer)
 // - Program form: int main() { ... } with implicit return 0 if missing
 // - Object I/O: saves/loads TVM1 object via FAT32 helpers
-//
-// Requires existing kernel wrappers and helpers already present in your tree:
-// - cout, cin (iostream_wrapper.h) for console printing/input
-// - simple_strcmp, simple_strcpy, simple_memcpy, simple_atoi, int_to_string
-// - FAT32 I/O: fat32_read_file_to_buffer, fat32_write_file
-// - Command shell provides: parts[], part_count (tokenized command line)
-// - Keep cmd_compile/cmd_run signatures; command_prompt dispatch remains unchanged.
-
-// kernel.cpp — tinycc VM edition
-// Self-hosted tiny compiler -> bytecode VM with console I/O and filesystem I/O.
-// Features:
-// - Types: int, char, string (string is pointer to char for printing/assignment)
-// - Decls: int/char/string name [= expr] ;
-// - Expr: + - * /, unary -, comparisons (== != < <= > >=), parentheses
-// - Control: if/else, while, break, continue
-// - I/O: cin >> chains (int/char/string), cout << chains (int/char/string/argv(i)/endl)
-// - Built-ins: argc (int), argv(i) (string pointer)
-// - Program: int main() { ... } with implicit return 0 if missing
-// - Object I/O: TVM1 object saved/loaded via existing FAT32 helpers
-//
-// Kernel dependencies expected (already present in your tree):
-// - cout, cin from iostream_wrapper.h
-// - simple_strcmp, simple_strcpy, simple_memcpy, simple_atoi, int_to_string
-// - fat32_read_file_to_buffer, fat32_write_file
-// - parts[], part_count (command shell tokenization)
 
 #include "terminal_hooks.h"
 #include "terminal_io.h"
@@ -1088,7 +1067,7 @@ static inline int tcc_is_alnum(char c){ return tcc_is_alpha(c)||tcc_is_digit(c);
 static inline int tcc_strlen(const char* s){ int n=0; while(s && s[n]) ++n; return n; }
 
 // ============================================================
-// Bytecode ISA
+// Enhanced Bytecode ISA with File I/O, Arrays, and String Concatenation
 // ============================================================
 enum TOp : unsigned char {
     // stack/data
@@ -1106,11 +1085,40 @@ enum TOp : unsigned char {
     // I/O and args
     T_PRINT_INT, T_PRINT_CHAR, T_PRINT_STR, T_PRINT_ENDL,
     T_READ_INT, T_READ_CHAR, T_READ_STR,
-    T_PUSH_ARGC, T_PUSH_ARGV_PTR
+    T_PUSH_ARGC, T_PUSH_ARGV_PTR,
+
+    // NEW: File I/O operations
+    T_READ_FILE,      // (filename) -> content_string
+    T_WRITE_FILE,     // (filename, content) -> success_int
+    T_APPEND_FILE,    // (filename, content) -> success_int
+
+    // NEW: Array operations
+    T_ALLOC_ARRAY,    // (size) -> array_ptr
+    T_LOAD_ARRAY,     // (array_ptr, index) -> value
+    T_STORE_ARRAY,    // (array_ptr, index, value) -> void
+    T_ARRAY_SIZE,     // (array_ptr) -> size
+    T_ARRAY_RESIZE,   // (array_ptr, new_size) -> new_array_ptr
+
+    // NEW: String operations
+    T_STR_CONCAT,     // (str1, str2) -> concatenated_string
+    T_STR_LENGTH,     // (str) -> length_int
+    T_STR_SUBSTR,     // (str, start, len) -> substring
+    T_INT_TO_STR,     // (int) -> string representation
+    T_STR_COMPARE,    // (str1, str2) -> comparison result (-1, 0, 1)
+    
+    // NEW: String search operations
+    T_STR_FIND_CHAR,  // (str, char) -> index (-1 if not found)
+    T_STR_FIND_STR,   // (str, substr) -> index (-1 if not found)
+    T_STR_FIND_LAST_CHAR, // (str, char) -> last index (-1 if not found)
+    T_STR_CONTAINS,   // (str, substr) -> boolean (1/0)
+    T_STR_STARTS_WITH, // (str, prefix) -> boolean (1/0)
+    T_STR_ENDS_WITH,  // (str, suffix) -> boolean (1/0)
+    T_STR_COUNT_CHAR, // (str, char) -> count of occurrences
+    T_STR_REPLACE_CHAR // (str, old_char, new_char) -> new string
 };
 
 // ============================================================
-// Program buffers
+// Enhanced Program buffers with array support
 // ============================================================
 struct TProgram {
     static const int CODE_MAX = 8192;
@@ -1123,14 +1131,16 @@ struct TProgram {
 
     static const int LOC_MAX = 32;
     char  loc_name[LOC_MAX][32];
-    unsigned char loc_type[LOC_MAX]; // 0=int,1=char,2=string
+    unsigned char loc_type[LOC_MAX]; // 0=int,1=char,2=string,3=int_array
+    int   loc_array_size[LOC_MAX];   // NEW: for array declarations
     int   loc_count = 0;
 
-    int add_local(const char* name, unsigned char t){
+    int add_local(const char* name, unsigned char t, int array_size = 0){
         for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], name)==0) return i; }
         if(loc_count>=LOC_MAX) return -1;
         simple_strcpy(loc_name[loc_count], name);
         loc_type[loc_count]=t;
+        loc_array_size[loc_count] = array_size;
         return loc_count++;
     }
     int get_local(const char* name){
@@ -1138,6 +1148,7 @@ struct TProgram {
         return -1;
     }
     int get_local_type(int idx){ return (idx>=0 && idx<loc_count)? loc_type[idx] : 0; }
+    int get_array_size(int idx){ return (idx>=0 && idx<loc_count)? loc_array_size[idx] : 0; }
 
     void emit1(unsigned char op){ if(pc<CODE_MAX) code[pc++]=op; }
     void emit4(int v){ if(pc+4<=CODE_MAX){ code[pc++]=v&0xff; code[pc++]=(v>>8)&0xff; code[pc++]=(v>>16)&0xff; code[pc++]=(v>>24)&0xff; } }
@@ -1155,7 +1166,7 @@ struct TProgram {
 };
 
 // ============================================================
-// Tokenizer
+// Enhanced Tokenizer with array syntax
 // ============================================================
 enum TTokType { TT_EOF, TT_ID, TT_NUM, TT_STR, TT_CH, TT_KW, TT_OP, TT_PUNC };
 struct TTok { TTokType t; char v[64]; int ival; };
@@ -1183,7 +1194,12 @@ struct TLex {
     TTok ident(){
         TTok t; t.t=TT_ID; int i=0;
         while(tcc_is_alnum(src[pos])){ t.v[i++]=src[pos++]; if(i>=63) break; } t.v[i]=0;
-        const char* kw[]={"int","char","string","return","if","else","while","break","continue","cin","cout","endl","argc","argv",0};
+        // NEW: Added file I/O, array built-ins, and string functions
+        const char* kw[]={"int","char","string","return","if","else","while","break","continue",
+                         "cin","cout","endl","argc","argv","read_file","write_file","append_file",
+                         "array_size","array_resize","str_length","str_substr","int_to_str","str_compare",
+                         "str_find_char","str_find_str","str_find_last_char","str_contains",
+                         "str_starts_with","str_ends_with","str_count_char","str_replace_char",0};
         for(int k=0; kw[k]; ++k){ if(simple_strcmp(t.v,kw[k])==0){ t.t=TT_KW; break; } }
         return t;
     }
@@ -1205,7 +1221,7 @@ struct TLex {
         if(c=='<' && src[pos+1]=='<'){ t.v[0]='<'; t.v[1]='<'; t.v[2]=0; pos+=2; return t; }
         if(c=='>' && src[pos+1]=='>'){ t.v[0]='>'; t.v[1]='>'; t.v[2]=0; pos+=2; return t; }
         if((c=='='||c=='!'||c=='<'||c=='>') && src[pos+1]=='='){ t.v[0]=c; t.v[1]='='; t.v[2]=0; pos+=2; return t; }
-        pos++; if(c=='('||c==')'||c=='{'||c=='}'||c==';'||c==',' ) t.t=TT_PUNC; return t;
+        pos++; if(c=='('||c==')'||c=='{'||c=='}'||c==';'||c==','||c=='['||c==']') t.t=TT_PUNC; return t;
     }
 
     TTok next(){
@@ -1220,7 +1236,7 @@ struct TLex {
 };
 
 // ============================================================
-// Parser / Compiler
+// Enhanced Parser / Compiler with File I/O and Arrays
 // ============================================================
 struct TCompiler {
     TLex lx; TTok tk; TProgram pr;
@@ -1238,11 +1254,86 @@ struct TCompiler {
         if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); return; }
         if(tk.t==TT_KW && simple_strcmp(tk.v,"argc")==0){ pr.emit1(T_PUSH_ARGC); adv(); return; }
         if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); return; }
+        
+        // NEW: File I/O built-ins
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"read_file")==0){ 
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_READ_FILE); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"write_file")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_WRITE_FILE); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"append_file")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_APPEND_FILE); return; 
+        }
+        
+        // NEW: Array built-ins
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"array_size")==0){ 
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_ARRAY_SIZE); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"array_resize")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_ARRAY_RESIZE); return; 
+        }
+        // NEW: String built-ins
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_length")==0){ 
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_STR_LENGTH); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_substr")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(","); 
+            parse_expression(); expect(")"); pr.emit1(T_STR_SUBSTR); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"int_to_str")==0){ 
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_INT_TO_STR); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_compare")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_COMPARE); return; 
+        }
+        
+        // NEW: String search functions
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_char")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_CHAR); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_str")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_STR); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_last_char")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_LAST_CHAR); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_contains")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_CONTAINS); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_starts_with")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_STARTS_WITH); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_ends_with")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_ENDS_WITH); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_count_char")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_COUNT_CHAR); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_replace_char")==0){ 
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(","); 
+            parse_expression(); expect(")"); pr.emit1(T_STR_REPLACE_CHAR); return; 
+        }
+        
         if(tk.t==TT_PUNC && tk.v[0]=='('){ adv(); parse_expression(); expect(")"); return; }
+        
         if(tk.t==TT_ID){
             int idx = pr.get_local(tk.v);
             if(idx<0){ cout << "Unknown var "; cout << tk.v; cout << "\n"; }
-            pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); adv(); return;
+            char var_name[32]; simple_strcpy(var_name, tk.v);
+            adv();
+            
+            // NEW: Array indexing
+            if(tk.t==TT_PUNC && tk.v[0]=='['){
+                adv(); parse_expression(); expect("]");
+                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // load array pointer
+                // stack now has: [index, array_ptr]
+                pr.emit1(T_LOAD_ARRAY);
+                return;
+            }
+            
+            pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); 
+            return;
         }
     }
 
@@ -1263,7 +1354,11 @@ struct TCompiler {
         parse_term();
         while(tk.v[0]=='+' || tk.v[0]=='-'){
             char op=tk.v[0]; adv(); parse_term();
-            pr.emit1(op=='+'?T_ADD:T_SUB);
+            if(op=='+') {
+                pr.emit1(T_ADD); // This will be overridden for strings in VM
+            } else {
+                pr.emit1(T_SUB);
+            }
         }
     }
 
@@ -1288,16 +1383,40 @@ struct TCompiler {
         adv(); // past type keyword
         if(tk.t!=TT_ID){ cout << "Expected identifier\n"; return; }
         char nm[32]; simple_strcpy(nm, tk.v); adv();
-        int idx = pr.add_local(nm, tkind);
+        
+        int array_size = 0;
+        // NEW: Array declaration syntax: int arr[size]
+        if(tk.t==TT_PUNC && tk.v[0]=='['){
+            adv();
+            if(tk.t==TT_NUM){ 
+                array_size = tk.ival; 
+                adv(); 
+            } else {
+                cout << "Expected array size\n"; return;
+            }
+            expect("]");
+            tkind = 3; // mark as array type
+        }
+        
+        int idx = pr.add_local(nm, tkind, array_size);
+        
         if(accept("=")){ 
-            if(tkind==2){ // string
+            if(tkind==3){ // array initialization
+                cout << "Array initialization not supported yet\n";
+                parse_expression(); // consume the expression
+            } else if(tkind==2){ // string
                 if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); }
                 else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); }
                 else if(tk.t==TT_ID){ int j=pr.get_local(tk.v); adv(); pr.emit1(T_LOAD_LOCAL); pr.emit4(j); }
                 else { parse_expression(); }
+                pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
             } else {
                 parse_expression();
+                pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
             }
+        } else if(tkind==3){ // array without initialization - allocate
+            pr.emit1(T_PUSH_IMM); pr.emit4(array_size);
+            pr.emit1(T_ALLOC_ARRAY);
             pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
         }
         expect(";");
@@ -1311,11 +1430,21 @@ struct TCompiler {
                 else if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); pr.emit1(T_PRINT_STR); }
                 else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); pr.emit1(T_PRINT_STR); }
                 else if(tk.t==TT_ID){
+                    char var_name[32]; simple_strcpy(var_name, tk.v);
                     int idx = pr.get_local(tk.v); int ty = pr.get_local_type(idx); adv();
-                    pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);
-                    if(ty==2) pr.emit1(T_PRINT_STR);
-                    else if(ty==1) pr.emit1(T_PRINT_CHAR);
-                    else pr.emit1(T_PRINT_INT);
+                    
+                    // NEW: Handle array element printing
+                    if(tk.t==TT_PUNC && tk.v[0]=='['){
+                        adv(); parse_expression(); expect("]");
+                        pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // load array
+                        pr.emit1(T_LOAD_ARRAY); // load element
+                        pr.emit1(T_PRINT_INT); // assume int array for now
+                    } else {
+                        pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);
+                        if(ty==2) pr.emit1(T_PRINT_STR);
+                        else if(ty==1) pr.emit1(T_PRINT_CHAR);
+                        else pr.emit1(T_PRINT_INT);
+                    }
                 } else { parse_expression(); pr.emit1(T_PRINT_INT); }
                 if(tk.t==TT_PUNC && tk.v[0]==';'){ adv(); break; }
             }
@@ -1335,10 +1464,24 @@ struct TCompiler {
         }
 
         if(tk.t==TT_ID){
+            char var_name[32]; simple_strcpy(var_name, tk.v);
             int idx = pr.get_local(tk.v);
             if(idx<0){ cout << "Unknown var "; cout << tk.v; cout << "\n"; }
             int ty = pr.get_local_type(idx);
-            adv(); expect("=");
+            adv(); 
+            
+            // NEW: Array element assignment
+            if(tk.t==TT_PUNC && tk.v[0]=='['){
+                adv(); parse_expression(); expect("]"); expect("=");
+                parse_expression();
+                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // load array pointer
+                // stack now has: [value, index, array_ptr]
+                pr.emit1(T_STORE_ARRAY);
+                expect(";");
+                return;
+            }
+            
+            expect("=");
             if(ty==2){
                 if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); }
                 else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); }
@@ -1418,45 +1561,315 @@ struct TCompiler {
 };
 
 // ============================================================
-// VM
+// Enhanced VM with File I/O, Arrays, and String Concatenation
 // ============================================================
 struct TinyVM {
     static const int STK_MAX = 1024;
     int   stk[STK_MAX]; int sp=0;
-    int   locals[TProgram::LOC_MAX];   // NEW: dedicated locals storage
+    int   locals[TProgram::LOC_MAX];
     int   argc; const char** argv;
     TProgram* P;
     char str_in[256];
+    uint64_t ahci_base; int port; // for file I/O
+    
+    // NEW: String pool for dynamic string management
+    static const int STRING_POOL_SIZE = 8192;
+    char string_pool[STRING_POOL_SIZE];
+    int string_pool_top = 0;
+    
+    // NEW: Simple array management
+    struct Array {
+        int* data;
+        int size;
+        int capacity;
+    };
+    static const int MAX_ARRAYS = 64;
+    Array arrays[MAX_ARRAYS];
+    int array_count = 0;
 
     inline void push(int v){ if(sp<STK_MAX) stk[sp++]=v; }
     inline int  pop(){ return sp?stk[--sp]:0; }
 
-    int run(TProgram& prog, int ac, const char** av){
-        P=&prog; argc=ac; argv=av; sp=0;
-        for (int i=0;i<TProgram::LOC_MAX;i++) locals[i]=0;  // NEW: init locals
+    // NEW: String management functions
+    const char* alloc_string(int len) {
+        if(string_pool_top + len + 1 > STRING_POOL_SIZE) {
+            // Simple garbage collection - reset pool (naive approach)
+            string_pool_top = 0;
+        }
+        if(string_pool_top + len + 1 > STRING_POOL_SIZE) return nullptr;
+        char* result = &string_pool[string_pool_top];
+        string_pool_top += len + 1;
+        return result;
+    }
+
+    const char* concat_strings(const char* a, const char* b) {
+        if(!a) a = "";
+        if(!b) b = "";
+        int len_a = tcc_strlen(a);
+        int len_b = tcc_strlen(b);
+        const char* result = alloc_string(len_a + len_b);
+        if(!result) return "";
+        char* dest = (char*)result;
+        simple_memcpy(dest, a, len_a);
+        simple_memcpy(dest + len_a, b, len_b + 1);
+        return result;
+    }
+
+    const char* int_to_string_vm(int value) {
+        static char temp_buf[16];
+        int_to_string(value, temp_buf);
+        int len = tcc_strlen(temp_buf);
+        const char* result = alloc_string(len);
+        if(!result) return "";
+        simple_memcpy((char*)result, temp_buf, len + 1);
+        return result;
+    }
+
+    const char* substring(const char* str, int start, int len) {
+        if(!str) return "";
+        int str_len = tcc_strlen(str);
+        if(start < 0 || start >= str_len || len <= 0) return "";
+        if(start + len > str_len) len = str_len - start;
+        
+        const char* result = alloc_string(len);
+        if(!result) return "";
+        char* dest = (char*)result;
+        simple_memcpy(dest, str + start, len);
+        dest[len] = 0;
+        return result;
+    }
+
+    int string_compare(const char* a, const char* b) {
+        if(!a && !b) return 0;
+        if(!a) return -1;
+        if(!b) return 1;
+        return simple_strcmp(a, b);
+    }
+
+    // NEW: String search and manipulation functions
+    int find_char(const char* str, char c) {
+        if(!str) return -1;
+        for(int i = 0; str[i]; i++) {
+            if(str[i] == c) return i;
+        }
+        return -1;
+    }
+
+    int find_last_char(const char* str, char c) {
+        if(!str) return -1;
+        int last_pos = -1;
+        for(int i = 0; str[i]; i++) {
+            if(str[i] == c) last_pos = i;
+        }
+        return last_pos;
+    }
+
+    int find_string(const char* haystack, const char* needle) {
+        if(!haystack || !needle) return -1;
+        if(!needle[0]) return 0; // empty string found at position 0
+        
+        int hay_len = tcc_strlen(haystack);
+        int needle_len = tcc_strlen(needle);
+        if(needle_len > hay_len) return -1;
+        
+        for(int i = 0; i <= hay_len - needle_len; i++) {
+            int j;
+            for(j = 0; j < needle_len; j++) {
+                if(haystack[i + j] != needle[j]) break;
+            }
+            if(j == needle_len) return i; // found match
+        }
+        return -1;
+    }
+
+    int string_contains(const char* str, const char* substr) {
+        return find_string(str, substr) != -1 ? 1 : 0;
+    }
+
+    int string_starts_with(const char* str, const char* prefix) {
+        if(!str || !prefix) return 0;
+        if(!prefix[0]) return 1; // empty prefix
+        
+        int i = 0;
+        while(prefix[i] && str[i]) {
+            if(str[i] != prefix[i]) return 0;
+            i++;
+        }
+        return prefix[i] == 0 ? 1 : 0; // prefix fully matched
+    }
+
+    int string_ends_with(const char* str, const char* suffix) {
+        if(!str || !suffix) return 0;
+        if(!suffix[0]) return 1; // empty suffix
+        
+        int str_len = tcc_strlen(str);
+        int suffix_len = tcc_strlen(suffix);
+        if(suffix_len > str_len) return 0;
+        
+        int start_pos = str_len - suffix_len;
+        for(int i = 0; i < suffix_len; i++) {
+            if(str[start_pos + i] != suffix[i]) return 0;
+        }
+        return 1;
+    }
+
+    int count_char(const char* str, char c) {
+        if(!str) return 0;
+        int count = 0;
+        for(int i = 0; str[i]; i++) {
+            if(str[i] == c) count++;
+        }
+        return count;
+    }
+
+    const char* replace_char(const char* str, char old_char, char new_char) {
+        if(!str) return "";
+        int len = tcc_strlen(str);
+        const char* result = alloc_string(len);
+        if(!result) return "";
+        
+        char* dest = (char*)result;
+        for(int i = 0; i < len; i++) {
+            dest[i] = (str[i] == old_char) ? new_char : str[i];
+        }
+        dest[len] = 0;
+        return result;
+    }
+
+    // Check if values on stack are strings (heuristic based on pointer range)
+    bool is_string_ptr(int val) {
+        const char* ptr = (const char*)val;
+        // Check if it's in our literal pool or string pool
+        return (ptr >= P->lit && ptr < P->lit + P->lit_top) ||
+               (ptr >= string_pool && ptr < string_pool + string_pool_top);
+    }
+
+    // NEW: Array management functions
+    int alloc_array(int size) {
+        if(array_count >= MAX_ARRAYS) return 0;
+        Array& arr = arrays[array_count];
+        arr.size = size;
+        arr.capacity = size;
+        // Allocate array data (simplified - in real kernel you'd use proper allocator)
+        static int array_pool[MAX_ARRAYS * 256]; // Static pool for simplicity
+        static int pool_offset = 0;
+        if(pool_offset + size > MAX_ARRAYS * 256) return 0;
+        arr.data = &array_pool[pool_offset];
+        pool_offset += size;
+        for(int i = 0; i < size; i++) arr.data[i] = 0; // initialize to 0
+        return ++array_count; // return 1-based handle
+    }
+
+    Array* get_array(int handle) {
+        if(handle <= 0 || handle > array_count) return nullptr;
+        return &arrays[handle - 1];
+    }
+
+    int resize_array(int handle, int new_size) {
+        Array* arr = get_array(handle);
+        if(!arr || new_size <= 0) return 0;
+        
+        // For simplicity, create new array and copy data
+        int new_handle = alloc_array(new_size);
+        Array* new_arr = get_array(new_handle);
+        if(!new_arr) return 0;
+        
+        int copy_size = (arr->size < new_size) ? arr->size : new_size;
+        for(int i = 0; i < copy_size; i++) {
+            new_arr->data[i] = arr->data[i];
+        }
+        return new_handle;
+    }
+
+    int run(TProgram& prog, int ac, const char** av, uint64_t base, int p){
+        P=&prog; argc=ac; argv=av; sp=0; ahci_base=base; port=p;
+        for (int i=0;i<TProgram::LOC_MAX;i++) locals[i]=0;
+        array_count = 0; // reset arrays
+        string_pool_top = 0; // reset string pool
         int ip=0;
+        
+        // Initialize arrays declared in locals
+        for(int i = 0; i < P->loc_count; i++) {
+            if(P->loc_type[i] == 3) { // array type
+                int arr_handle = alloc_array(P->loc_array_size[i]);
+                locals[i] = arr_handle;
+            }
+        }
+        
         while(ip < P->pc){
             TOp op = (TOp)P->code[ip++];
             switch(op){
                 case T_NOP: break;
                 case T_PUSH_IMM: { int v= *(int*)&P->code[ip]; ip+=4; push(v); } break;
                 case T_PUSH_STR: { int p= *(int*)&P->code[ip]; ip+=4; push(p); } break;
-                case T_LOAD_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; push(locals[i]); } break;   // CHANGED
-                case T_STORE_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; locals[i]=pop(); } break;   // CHANGED
+                case T_LOAD_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; push(locals[i]); } break;
+                case T_STORE_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; locals[i]=pop(); } break;
                 case T_POP: { if(sp) --sp; } break;
 
-                case T_ADD: { int b=pop(), a=pop(); push(a+b);} break;
+                // Enhanced ADD operation - handles both integers and string concatenation
+                case T_ADD: { 
+                    int b=pop(), a=pop(); 
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        const char* result = concat_strings((const char*)a, (const char*)b);
+                        push((int)result);
+                    } else {
+                        push(a+b);
+                    }
+                } break;
                 case T_SUB: { int b=pop(), a=pop(); push(a-b);} break;
                 case T_MUL: { int b=pop(), a=pop(); push(a*b);} break;
                 case T_DIV: { int b=pop(), a=pop(); push(b? a/b:0);} break;
                 case T_NEG: { int a=pop(); push(-a);} break;
 
-                case T_EQ: { int b=pop(), a=pop(); push(a==b);} break;
-                case T_NE: { int b=pop(), a=pop(); push(a!=b);} break;
-                case T_LT: { int b=pop(), a=pop(); push(a<b);} break;
-                case T_LE: { int b=pop(), a=pop(); push(a<=b);} break;
-                case T_GT: { int b=pop(), a=pop(); push(a>b);} break;
-                case T_GE: { int b=pop(), a=pop(); push(a>=b);} break;
+                // Enhanced comparison operations - handle string comparisons
+                case T_EQ: { 
+                    int b=pop(), a=pop(); 
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) == 0 ? 1 : 0);
+                    } else {
+                        push(a==b);
+                    }
+                } break;
+                case T_NE: { 
+                    int b=pop(), a=pop(); 
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) != 0 ? 1 : 0);
+                    } else {
+                        push(a!=b);
+                    }
+                } break;
+                case T_LT: { 
+                    int b=pop(), a=pop(); 
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) < 0 ? 1 : 0);
+                    } else {
+                        push(a<b);
+                    }
+                } break;
+                case T_LE: { 
+                    int b=pop(), a=pop(); 
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) <= 0 ? 1 : 0);
+                    } else {
+                        push(a<=b);
+                    }
+                } break;
+                case T_GT: { 
+                    int b=pop(), a=pop(); 
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) > 0 ? 1 : 0);
+                    } else {
+                        push(a>b);
+                    }
+                } break;
+                case T_GE: { 
+                    int b=pop(), a=pop(); 
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) >= 0 ? 1 : 0);
+                    } else {
+                        push(a>=b);
+                    }
+                } break;
 
                 case T_JMP: { int t=*(int*)&P->code[ip]; ip=t; } break;
                 case T_JZ:  { int t=*(int*)&P->code[ip]; ip+=4; int v=pop(); if(v==0) ip=t; } break;
@@ -1474,6 +1887,177 @@ struct TinyVM {
                 case T_PUSH_ARGC: { push(argc); } break;
                 case T_PUSH_ARGV_PTR: { int idx=pop(); const char* p=(idx>=0 && idx<argc && argv)? argv[idx]:""; push((int)p); } break;
 
+                // NEW: File I/O operations
+                case T_READ_FILE: {
+                    const char* filename = (const char*)pop();
+                    static char file_buffer[4096];
+                    int n = fat32_read_file_to_buffer(ahci_base, port, filename, 
+                                                    (unsigned char*)file_buffer, sizeof(file_buffer)-1);
+                    if(n > 0) {
+                        file_buffer[n] = 0;
+                        push((int)file_buffer);
+                    } else {
+                        push((int)""); // return empty string on failure
+                    }
+                } break;
+
+                case T_WRITE_FILE: {
+                    const char* content = (const char*)pop();
+                    const char* filename = (const char*)pop();
+                    int len = tcc_strlen(content);
+                    int result = fat32_write_file(ahci_base, port, filename, 
+                                                (const unsigned char*)content, len);
+                    push(result >= 0 ? 1 : 0); // return success/failure
+                } break;
+
+                case T_APPEND_FILE: {
+                    const char* content = (const char*)pop();
+                    const char* filename = (const char*)pop();
+                    // Read existing content first
+                    static char existing_buffer[4096];
+                    int n = fat32_read_file_to_buffer(ahci_base, port, filename, 
+                                                    (unsigned char*)existing_buffer, sizeof(existing_buffer)-1);
+                    if(n < 0) n = 0;
+                    existing_buffer[n] = 0;
+                    
+                    // Append new content
+                    int content_len = tcc_strlen(content);
+                    if(n + content_len < sizeof(existing_buffer)) {
+                        simple_memcpy(&existing_buffer[n], content, content_len + 1);
+                        int result = fat32_write_file(ahci_base, port, filename, 
+                                                    (const unsigned char*)existing_buffer, n + content_len);
+                        push(result >= 0 ? 1 : 0);
+                    } else {
+                        push(0); // buffer too small
+                    }
+                } break;
+
+                // NEW: Array operations
+                case T_ALLOC_ARRAY: {
+                    int size = pop();
+                    int handle = alloc_array(size);
+                    push(handle);
+                } break;
+
+                case T_LOAD_ARRAY: {
+                    int index = pop();
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    if(arr && index >= 0 && index < arr->size) {
+                        push(arr->data[index]);
+                    } else {
+                        push(0); // out of bounds or invalid array
+                    }
+                } break;
+
+                case T_STORE_ARRAY: {
+                    int value = pop();
+                    int index = pop();
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    if(arr && index >= 0 && index < arr->size) {
+                        arr->data[index] = value;
+                    }
+                    // Note: no return value for store operation
+                } break;
+
+                case T_ARRAY_SIZE: {
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    push(arr ? arr->size : 0);
+                } break;
+
+                case T_ARRAY_RESIZE: {
+                    int new_size = pop();
+                    int handle = pop();
+                    int new_handle = resize_array(handle, new_size);
+                    push(new_handle);
+                } break;
+
+                // NEW: String operations
+                case T_STR_CONCAT: {
+                    const char* b = (const char*)pop();
+                    const char* a = (const char*)pop();
+                    const char* result = concat_strings(a, b);
+                    push((int)result);
+                } break;
+
+                case T_STR_LENGTH: {
+                    const char* str = (const char*)pop();
+                    push(str ? tcc_strlen(str) : 0);
+                } break;
+
+                case T_STR_SUBSTR: {
+                    int len = pop();
+                    int start = pop();
+                    const char* str = (const char*)pop();
+                    const char* result = substring(str, start, len);
+                    push((int)result);
+                } break;
+
+                case T_INT_TO_STR: {
+                    int value = pop();
+                    const char* result = int_to_string_vm(value);
+                    push((int)result);
+                } break;
+
+                case T_STR_COMPARE: {
+                    const char* b = (const char*)pop();
+                    const char* a = (const char*)pop();
+                    push(string_compare(a, b));
+                } break;
+
+                // NEW: String search operations
+                case T_STR_FIND_CHAR: {
+                    char c = (char)pop();
+                    const char* str = (const char*)pop();
+                    push(find_char(str, c));
+                } break;
+
+                case T_STR_FIND_STR: {
+                    const char* needle = (const char*)pop();
+                    const char* haystack = (const char*)pop();
+                    push(find_string(haystack, needle));
+                } break;
+
+                case T_STR_FIND_LAST_CHAR: {
+                    char c = (char)pop();
+                    const char* str = (const char*)pop();
+                    push(find_last_char(str, c));
+                } break;
+
+                case T_STR_CONTAINS: {
+                    const char* substr = (const char*)pop();
+                    const char* str = (const char*)pop();
+                    push(string_contains(str, substr));
+                } break;
+
+                case T_STR_STARTS_WITH: {
+                    const char* prefix = (const char*)pop();
+                    const char* str = (const char*)pop();
+                    push(string_starts_with(str, prefix));
+                } break;
+
+                case T_STR_ENDS_WITH: {
+                    const char* suffix = (const char*)pop();
+                    const char* str = (const char*)pop();
+                    push(string_ends_with(str, suffix));
+                } break;
+
+                case T_STR_COUNT_CHAR: {
+                    char c = (char)pop();
+                    const char* str = (const char*)pop();
+                    push(count_char(str, c));
+                } break;
+
+                case T_STR_REPLACE_CHAR: {
+                    char new_char = (char)pop();
+                    char old_char = (char)pop();
+                    const char* str = (const char*)pop();
+                    const char* result = replace_char(str, old_char, new_char);
+                    push((int)result);
+                } break;
+
                 case T_RET: { int rv=pop(); return rv; }
                 default: return -1;
             }
@@ -1483,37 +2067,71 @@ struct TinyVM {
 };
 
 // ============================================================
-// Object I/O (TVM1)
+// Enhanced Object I/O (TVM2 - updated version)
 // ============================================================
 struct TVMObject {
     static int save(uint64_t base, int port, const char* path, const TProgram& P){
-        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 32 ];
+        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 64 ];
         int off=0;
-        buf[off++]='T'; buf[off++]='V'; buf[off++]='M'; buf[off++]='1';
+        buf[off++]='T'; buf[off++]='V'; buf[off++]='M'; buf[off++]='2'; // Updated version
         *(int*)&buf[off]=P.pc; off+=4;
         *(int*)&buf[off]=P.lit_top; off+=4;
         *(int*)&buf[off]=P.loc_count; off+=4;
         simple_memcpy(&buf[off], P.code, P.pc); off+=P.pc;
         simple_memcpy(&buf[off], P.lit, P.lit_top); off+=P.lit_top;
+        
+        // NEW: Save local variable metadata (names, types, array sizes)
+        for(int i = 0; i < P.loc_count; i++) {
+            int name_len = tcc_strlen(P.loc_name[i]) + 1;
+            simple_memcpy(&buf[off], P.loc_name[i], name_len); off += name_len;
+            buf[off++] = P.loc_type[i];
+            *(int*)&buf[off] = P.loc_array_size[i]; off += 4;
+        }
+        
         return fat32_write_file(base, port, path, buf, off);
     }
+    
     static int load(uint64_t base, int port, const char* path, TProgram& P){
-        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 32 ];
+        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 64 ];
         int n = fat32_read_file_to_buffer(base, port, path, buf, sizeof(buf));
         if(n<16) return -1;
-        if(!(buf[0]=='T'&&buf[1]=='V'&&buf[2]=='M'&&buf[3]=='1')) return -2;
+        if(!(buf[0]=='T'&&buf[1]=='V'&&buf[2]=='M'&&(buf[3]=='1'||buf[3]=='2'))) return -2;
         int cp=*(int*)&buf[4], lp=*(int*)&buf[8], lc=*(int*)&buf[12];
         if(cp<0||cp>TProgram::CODE_MAX||lp<0||lp>TProgram::LIT_MAX||lc<0||lc>TProgram::LOC_MAX) return -3;
         P.pc=cp; P.lit_top=lp; P.loc_count=lc;
         int off=16;
         simple_memcpy(P.code, &buf[off], cp); off+=cp;
         simple_memcpy(P.lit, &buf[off], lp); off+=lp;
+        
+        // NEW: Load local variable metadata if TVM2 format
+        if(buf[3] == '2') {
+            for(int i = 0; i < lc; i++) {
+                int name_len = 0;
+                while(off + name_len < n && buf[off + name_len] != 0) name_len++;
+                if(name_len < 32) {
+                    simple_memcpy(P.loc_name[i], &buf[off], name_len + 1);
+                } else {
+                    P.loc_name[i][0] = 0; // truncate long names
+                }
+                off += name_len + 1;
+                P.loc_type[i] = buf[off++];
+                P.loc_array_size[i] = *(int*)&buf[off]; off += 4;
+            }
+        } else {
+            // TVM1 compatibility - clear metadata
+            for(int i = 0; i < lc; i++) {
+                P.loc_name[i][0] = 0;
+                P.loc_type[i] = 0;
+                P.loc_array_size[i] = 0;
+            }
+        }
+        
         return 0;
     }
 };
 
 // ============================================================
-// Public compile/run entry points for shell
+// Enhanced compile/run entry points
 // ============================================================
 static int tinyvm_compile_to_obj(uint64_t ahci_base, int port, const char* src_path, const char* obj_path){
     static char srcbuf[8192];
@@ -1530,13 +2148,13 @@ static int tinyvm_compile_to_obj(uint64_t ahci_base, int port, const char* src_p
 static int tinyvm_run_obj(uint64_t ahci_base, int port, const char* obj_path, int argc, const char** argv){
     TProgram P; int r = TVMObject::load(ahci_base, port, obj_path, P);
     if(r<0){ cout << "load fail\n"; return -1; }
-    TinyVM vm; int rv = vm.run(P, argc, argv);
+    TinyVM vm; int rv = vm.run(P, argc, argv, ahci_base, port);
     char b[16]; int_to_string(rv,b); cout << b;
     return rv;
 }
 
 // ============================================================
-// Shell glue
+// Enhanced Shell glue
 // ============================================================
 extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename){
     if (!filename) { cout << "Usage: compile <file.cpp>\n"; return; }
@@ -1562,11 +2180,9 @@ extern "C" void cmd_exec(const char* code_text){
     if(ok<0){ cout << "Compilation failed!\n"; return; }
     TinyVM vm; TProgram& P = C.pr;
     static const char* argvv[1] = { };
-    int rv = vm.run(P, 0, argvv);
+    int rv = vm.run(P, 0, argvv, 0, 0); // no file I/O in exec mode
     char b[16]; int_to_string(rv,b); cout << b;
 }
-
-
 
 
 
