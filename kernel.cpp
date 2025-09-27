@@ -1033,23 +1033,6 @@ static void int_to_string(int value, char* buffer) {
 // - Control: if/else, while, break, continue
 // - I/O: cin >> chains (int/char/string), cout << chains (int/char/string/argv(i)/endl)
 
-// tinycc_vm_kernel_mmio_enhanced.cpp
-// Enhanced tinycc-style compiler to bytecode + VM runner with Hardware Interface Discovery and Memory-Mapped I/O
-// NEW Features added:
-// - Hardware Interface Discovery: scan_hardware() returns array of detected devices
-// - Memory-Mapped I/O: mmio_read8/16/32/64(addr), mmio_write8/16/32/64(addr, value)
-// - Hardware device structure with vendor_id, device_id, base_address, size
-// - Safety checks for MMIO access within known device ranges
-//
-// Previous Features:
-// - File I/O: read_file(filename), write_file(filename, content), append_file(filename, content)
-// - Arrays: int arr[size], string arr[size], arr[index] = value, value = arr[index]
-// - Array built-ins: array_size(arr), array_resize(arr, new_size)
-// - String functions: str_length, str_substr, str_find_*, str_compare, etc.
-// - Types: int, char, string (string is pointer to char, token-based I/O)
-// - Control: if/else, while, break, continue
-// - I/O: cin >> chains (int/char/string), cout << chains (int/char/string/argv(i)/endl)
-
 #include "terminal_hooks.h"
 #include "terminal_io.h"
 #include "iostream_wrapper.h"
@@ -1288,7 +1271,8 @@ enum TOp : unsigned char {
     T_MMIO_WRITE16,     // (address, value) -> success
     T_MMIO_WRITE32,     // (address, value) -> success
     T_MMIO_WRITE64,     // (address, low32, high32) -> success
-    T_GET_HARDWARE_ARRAY // () -> hardware_device_array_handle
+    T_GET_HARDWARE_ARRAY, // () -> hardware_device_array_handle
+    T_DISPLAY_MEMORY_MAP  // () -> displays formatted memory map
 };
 
 // ============================================================
@@ -1390,7 +1374,7 @@ struct TLex {
                          "array_size","array_resize","str_length","str_substr","int_to_str","str_compare",
                          "str_find_char","str_find_str","str_find_last_char","str_contains",
                          "str_starts_with","str_ends_with","str_count_char","str_replace_char",
-                         "scan_hardware","get_device_info","get_hardware_array",
+                         "scan_hardware","get_device_info","get_hardware_array","display_memory_map",
                          "mmio_read8","mmio_read16","mmio_read32","mmio_read64",
                          "mmio_write8","mmio_write16","mmio_write32","mmio_write64",0};
         for(int k=0; kw[k]; ++k){ if(simple_strcmp(t.v,kw[k])==0){ t.t=TT_KW; break; } }
@@ -1518,6 +1502,9 @@ struct TCompiler {
         }
         if(tk.t==TT_KW && simple_strcmp(tk.v,"get_hardware_array")==0){ 
             adv(); expect("("); expect(")"); pr.emit1(T_GET_HARDWARE_ARRAY); return; 
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"display_memory_map")==0){ 
+            adv(); expect("("); expect(")"); pr.emit1(T_DISPLAY_MEMORY_MAP); return; 
         }
         
         // NEW: Memory-Mapped I/O Functions
@@ -2506,6 +2493,30 @@ struct TinyVM {
                     cout << "Hardware scan found "; 
                     char buf[16]; int_to_string(count, buf); cout << buf;
                     cout << " devices\n";
+                    
+                    // Display memory map
+                    cout << "\n=== Memory Map ===\n";
+                    for(int i = 0; i < count; i++) {
+                        const HardwareDevice& dev = hardware_registry[i];
+                        cout << "Device "; int_to_string(i, buf); cout << buf; cout << ": ";
+                        cout << dev.description << "\n";
+                        cout << "  Base: 0x"; 
+                        char hex64[17]; uint64_to_hex_string(dev.base_address, hex64); 
+                        cout << hex64;
+                        cout << " - 0x";
+                        uint64_to_hex_string(dev.base_address + dev.size - 1, hex64);
+                        cout << hex64;
+                        cout << " (Size: 0x";
+                        uint64_to_hex_string(dev.size, hex64);
+                        cout << hex64 << ")\n";
+                        
+                        cout << "  Vendor: 0x";
+                        char hex32[9]; uint32_to_hex_string(dev.vendor_id, hex32);
+                        cout << hex32;
+                        cout << " Device: 0x";
+                        uint32_to_hex_string(dev.device_id, hex32);
+                        cout << hex32 << "\n\n";
+                    }
                 } break;
 
                 case T_GET_DEVICE_INFO: {
@@ -2517,6 +2528,42 @@ struct TinyVM {
                 case T_GET_HARDWARE_ARRAY: {
                     int handle = create_hardware_array();
                     push(handle);
+                } break;
+
+                case T_DISPLAY_MEMORY_MAP: {
+                    cout << "\n=== System Memory Map ===\n";
+                    cout << "Address Range                    | Size     | Device Type | Description\n";
+                    cout << "--------------------------------|----------|-------------|------------------\n";
+                    
+                    for(int i = 0; i < hardware_count; i++) {
+                        const HardwareDevice& dev = hardware_registry[i];
+                        
+                        // Display start address
+                        char hex_start[17], hex_end[17], hex_size[17];
+                        uint64_to_hex_string(dev.base_address, hex_start);
+                        uint64_to_hex_string(dev.base_address + dev.size - 1, hex_end);
+                        uint64_to_hex_string(dev.size, hex_size);
+                        
+                        cout << "0x" << hex_start << " - 0x" << hex_end << " | 0x" << hex_size;
+                        
+                        // Device type
+                        cout << " | ";
+                        switch(dev.device_type) {
+                            case 1: cout << "Storage    "; break;
+                            case 2: cout << "Network    "; break; 
+                            case 3: cout << "Graphics   "; break;
+                            case 4: cout << "Audio      "; break;
+                            case 5: cout << "USB        "; break;
+                            default: cout << "Unknown    "; break;
+                        }
+                        
+                        cout << " | " << dev.description << "\n";
+                    }
+                    
+                    cout << "\nTotal devices: ";
+                    char buf[16]; int_to_string(hardware_count, buf);
+                    cout << buf << "\n";
+                    push(hardware_count); // Return device count
                 } break;
 
                 case T_MMIO_READ8: {
@@ -2698,6 +2745,40 @@ extern "C" void cmd_exec(const char* code_text){
     static const char* argvv[1] = { };
     int rv = vm.run(P, 0, argvv, 0, 0); // no file I/O in exec mode
     char b[16]; int_to_string(rv,b); cout << b;
+}
+
+// ============================================================
+// Hardware info display function for shell
+// ============================================================
+extern "C" void cmd_hardware(){
+    cout << "Scanning hardware...\n";
+    int count = scan_hardware();
+    cout << "Found "; 
+    char buf[16]; int_to_string(count, buf); cout << buf;
+    cout << " hardware devices:\n\n";
+    
+    for(int i = 0; i < count; i++){
+        const HardwareDevice& dev = hardware_registry[i];
+        
+        cout << "Device "; int_to_string(i, buf); cout << buf; cout << ":\n";
+        cout << "  Vendor ID: 0x"; 
+        char hex[9]; uint32_to_hex_string(dev.vendor_id, hex); cout << hex; cout << "\n";
+        cout << "  Device ID: 0x"; 
+        uint32_to_hex_string(dev.device_id, hex); cout << hex; cout << "\n";
+        cout << "  Base Addr: 0x"; 
+        char hex64[17]; uint64_to_hex_string(dev.base_address, hex64); cout << hex64; cout << "\n";
+        cout << "  Size: 0x"; 
+        uint64_to_hex_string(dev.size, hex64); cout << hex64; cout << "\n";
+        cout << "  Type: "; int_to_string(dev.device_type, buf); cout << buf;
+        cout << " ("; cout << dev.description; cout << ")\n\n";
+    }
+    
+    cout << "Hardware devices can now be accessed via:\n";
+    cout << "- scan_hardware() - returns device count\n";
+    cout << "- get_device_info(index) - returns device info array\n"; 
+    cout << "- get_hardware_array() - returns all devices array\n";
+    cout << "- mmio_read8/16/32/64(addr) - read from memory-mapped registers\n";
+    cout << "- mmio_write8/16/32/64(addr, value) - write to memory-mapped registers\n";
 }
 
 // --- COMMAND PROMPT (Rewritten for better argument parsing) ---
