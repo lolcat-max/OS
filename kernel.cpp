@@ -1114,9 +1114,6 @@ public:
         
         cout << "Program loaded (" << bytes_read << " bytes)\n";
         
-        // Show available functions from included libraries
-        list_available_functions();
-        
         // Execute the program
         return execute_program(program_source);
     }
@@ -1595,38 +1592,6 @@ extern "C" void kernel_main() {
         else if (strncmp(cmd, "run ", 4) == 0) {
             compiler.compile_and_run_file(cmd + 4);
         }
-        
-        // NEW: Load and run file from filesystem
-		else if (strncmp(cmd, "load ", 5) == 0) {
-			const char* filename = cmd + 5;
-			cout << "Loading and running: " << filename << "\n";
-			
-			// Read file content
-			static char code_buffer[8192];
-			int bytes_read = fat32_read_file(ahci_base, port, filename,
-													 (unsigned char*)code_buffer,
-													 sizeof(code_buffer) - 1);
-			
-			if (bytes_read > 0) {
-				code_buffer[bytes_read] = '\0';
-				cout << "File loaded (" << bytes_read << " bytes)\n";
-				
-				// Use the existing compile_and_run_file method with a temporary file
-				static char temp_filename[] = "temp_exec.cpp";
-				
-				int save_result = fat32_write_file(ahci_base, port, temp_filename, 
-												  code_buffer, bytes_read);
-				
-				if (save_result == 0) {
-					compiler.compile_and_run_file(temp_filename);
-					fat32_remove_file(ahci_base, port, temp_filename);
-				} else {
-					cout << "Error: Could not create temporary execution file\n";
-				}
-			} else {
-				cout << "Error: Could not load file " << filename << "\n";
-			}
-		}
         // NEW: Save code to file
         else if (strncmp(cmd, "save ", 5) == 0) {
             // Parse: save filename "code content"
@@ -1697,7 +1662,6 @@ extern "C" void kernel_main() {
             cout << "Available commands:\n";
             cout << "  list                    - Show available library functions\n";
             cout << "  run <file.cpp>          - Compile and run CPP file\n";
-            cout << "  load <file.cpp>         - Load and execute file directly\n";
             cout << "  notepad <file.cpp>      - Edit file with notepad\n";
             cout << "  save <file> \"content\"   - Save content to file\n";
             cout << "  ls                      - List files in filesystem\n";
