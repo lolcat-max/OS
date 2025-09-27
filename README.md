@@ -19,7 +19,8 @@ hardware features soon (scan_hardware works, read VGA works)...
 sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with your USB drive, the OS is programmed to select sata port 0 for all file operations recommended not to boot on drive 0, use USB or arbitrary drive to install)
 
 TODO: 
-1. inspect functionality of bytecodeVM 
+1. inspect functionality of bytecodeVM
+2. inspect array functionality 
 3. complete hardware IO datasets in bytecodeVM.
 4. fix notepad memory limit glitch
 5. setup USB keyboard HID
