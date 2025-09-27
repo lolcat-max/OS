@@ -4,8 +4,8 @@
 #include "types.h"
 
 // Terminal state 
-extern size_t terminal_row;
-extern size_t terminal_column;
+extern int terminal_row;
+extern int terminal_column;
 extern uint8_t terminal_color;
 extern uint16_t* terminal_buffer;
 extern bool cursor_visible;
@@ -27,7 +27,7 @@ void clear_screen();
 void draw_header();
 void terminal_initialize();
 void terminal_setcolor(uint8_t color);
-void terminal_putentryat(char c, uint8_t color, size_t x, size_t y);
+void terminal_putentryat(char c, uint8_t color, int x, int y);
 void terminal_putchar(char c);
 void update_cursor_state();
 void scroll_screen();

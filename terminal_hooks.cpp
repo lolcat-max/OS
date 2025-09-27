@@ -2,8 +2,8 @@
 #include "stdlib_hooks.h"
 
 // Terminal state variables
-size_t terminal_row;
-size_t terminal_column;
+int terminal_row;
+int terminal_column;
 uint8_t terminal_color;
 uint16_t* terminal_buffer;
 bool cursor_visible = true;
@@ -48,9 +48,9 @@ void disable_hardware_cursor() {
 }
 
 void terminal_clear_screen() {
-    for (size_t y = 0; y < VGA_HEIGHT; y++) {
-        for (size_t x = 0; x < VGA_WIDTH; x++) {
-            const size_t index = y * VGA_WIDTH + x;
+    for (int y = 0; y < VGA_HEIGHT; y++) {
+        for (int x = 0; x < VGA_WIDTH; x++) {
+            const int index = y * VGA_WIDTH + x;
             terminal_buffer[index] = make_vgaentry(' ', terminal_color);
         }
     }
@@ -76,9 +76,9 @@ void terminal_initialize() {
     terminal_column = 0;
     terminal_color = make_color(COLOR_LIGHT_GREY, COLOR_BLACK);
     terminal_buffer = reinterpret_cast<uint16_t*>(0xB8000);
-    for (size_t y = 0; y < VGA_HEIGHT; y++) {
-        for (size_t x = 0; x < VGA_WIDTH; x++) {
-            const size_t index = y * VGA_WIDTH + x;
+    for (int y = 0; y < VGA_HEIGHT; y++) {
+        for (int x = 0; x < VGA_WIDTH; x++) {
+            const int index = y * VGA_WIDTH + x;
             terminal_buffer[index] = make_vgaentry(' ', terminal_color);
         }
     }
@@ -91,23 +91,23 @@ void terminal_setcolor(uint8_t color) {
     terminal_color = color;
 }
 
-void terminal_putentryat(char c, uint8_t color, size_t x, size_t y) {
-    const size_t index = y * VGA_WIDTH + x;
+void terminal_putentryat(char c, uint8_t color, int x, int y) {
+    const int index = y * VGA_WIDTH + x;
     terminal_buffer[index] = make_vgaentry(c, color);
 }
 
 void scroll_screen() {
     // Move all rows up one line (except the first row which will be overwritten)
-    for (size_t y = 0; y < VGA_HEIGHT - 1; y++) {
-        for (size_t x = 0; x < VGA_WIDTH; x++) {
-            const size_t dest_index = y * VGA_WIDTH + x;
-            const size_t src_index = (y + 1) * VGA_WIDTH + x;
+    for (int y = 0; y < VGA_HEIGHT - 1; y++) {
+        for (int x = 0; x < VGA_WIDTH; x++) {
+            const int dest_index = y * VGA_WIDTH + x;
+            const int src_index = (y + 1) * VGA_WIDTH + x;
             terminal_buffer[dest_index] = terminal_buffer[src_index];
         }
     }
     // Clear the last row
-    for (size_t x = 0; x < VGA_WIDTH; x++) {
-        const size_t index = (VGA_HEIGHT - 1) * VGA_WIDTH + x;
+    for (int x = 0; x < VGA_WIDTH; x++) {
+        const int index = (VGA_HEIGHT - 1) * VGA_WIDTH + x;
         terminal_buffer[index] = make_vgaentry(' ', terminal_color);
     }
 }
@@ -152,8 +152,8 @@ void terminal_putchar(char c) {
 }
 
 void terminal_writestring(const char* data) {
-    size_t datalen = strlen(data);
-    for (size_t i = 0; i < datalen; i++)
+    int datalen = strlen(data);
+    for (int i = 0; i < datalen; i++)
         terminal_putchar(data[i]);
 }
 

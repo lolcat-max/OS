@@ -1,12 +1,12 @@
 #ifndef TYPES_H
 #define TYPES_H
 
-#include <cstddef>
+
 #include <cstdint>
 
 // VGA terminal constants
-static const size_t VGA_WIDTH = 80;
-static const size_t VGA_HEIGHT = 25;
+static const int VGA_WIDTH = 80;
+static const int VGA_HEIGHT = 25;
 #define SCREEN_BACKUP_SIZE (VGA_WIDTH * VGA_HEIGHT)
 
 // Terminal buffer constants
@@ -79,7 +79,6 @@ struct gdt_ptr {
 #define SCANCODE_DOWN  0x50
 #define SCANCODE_LEFT  0x4B
 #define SCANCODE_RIGHT 0x4D
-
 // String reference class for easier string comparison
 class StringRef {
 private:

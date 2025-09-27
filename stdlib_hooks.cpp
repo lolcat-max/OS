@@ -9,14 +9,6 @@ KernelHeap::MemoryBlock* KernelHeap::free_list = nullptr;
 // Global formatting state
 extern bool use_hex;
 
-// String operations
-bool string_compare(const char* s1, const char* s2) {
-    while (*s1 && (*s1 == *s2)) {
-        s1++;
-        s2++;
-    }
-    return *s1 == *s2;
-}
 
 size_t strlen(const char* str) {
     size_t len = 0;

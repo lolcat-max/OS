@@ -6,8 +6,6 @@ bool is_notepad_running();
 void notepad_handle_input(char key);
 void notepad_handle_special_key(int scancode);
 void start_notepad(const char* filename);
-void cmd_notepad(const char* filename);
-
 // --- INTERNAL NOTEPAD FUNCTIONS ---
 void notepad_clear_buffer();
 void notepad_draw_interface();

@@ -3,11 +3,11 @@
 #include "terminal_io.h"
 #include "iostream_wrapper.h"
 #include "interrupts.h"
-#include "kernel.h"
+#include "string_lib.h"
 
 
 // --- NOTEPAD CONSTANTS ---
-#define MAX_LINES 100
+#define MAX_LINES 40960
 #define MAX_VISIBLE_LINES 20
 #define MAX_LINE_LENGTH 79
 #define NOTEPAD_START_ROW 3
@@ -30,7 +30,7 @@ extern bool is_pong_running();
 extern uint64_t ahci_base;
 extern bool fat32_init(uint64_t ahci_base, int port);
 extern int fat32_write_file(uint64_t ahci_base, int port, const char* filename, const void* data, uint32_t size);
-extern int fat32_read_file_to_buffer(uint64_t ahci_base, int port, const char* filename, void* data_buffer, uint32_t buffer_size);
+extern int fat32_read_file(uint64_t ahci_base, int port, const char* filename, void* data_buffer, uint32_t buffer_size);
 
 // VGA text mode cursor and buffer functions
 static volatile uint16_t* vga_buffer = (volatile uint16_t*)0xB8000;
@@ -75,50 +75,9 @@ static void notepad_clear_line(int row, uint8_t color) {
     }
 }
 
-// --- UTILITY FUNCTIONS ---
-static inline int simple_strlen(const char* str) {
-    int len = 0;
-    while (str[len] != '\0') len++;
-    return len;
-}
 
-static inline void simple_strcpy(char* dest, const char* src) {
-    int i = 0;
-    while (src[i] != '\0') {
-        dest[i] = src[i];
-        i++;
-    }
-    dest[i] = '\0';
-}
 
-static inline void simple_strcat(char* dest, const char* src) {
-    char* ptr = dest + simple_strlen(dest);
-    while (*src != '\0') *ptr++ = *src++;
-    *ptr = '\0';
-}
 
-static void int_to_string(int num, char* str) {
-    if (num == 0) {
-        str[0] = '0';
-        str[1] = '\0';
-        return;
-    }
-    int i = 0;
-    bool is_neg = num < 0;
-    if (is_neg) num = -num;
-    while (num > 0) {
-        str[i++] = '0' + (num % 10);
-        num /= 10;
-    }
-    if (is_neg) str[i++] = '-';
-    str[i] = '\0';
-    // Reverse the string
-    for (int j = 0; j < i / 2; j++) {
-        char temp = str[j];
-        str[j] = str[i - 1 - j];
-        str[i - 1 - j] = temp;
-    }
-}
 void notepad_save_and_exit(const char* filename_arg) {
     char final_filename[256];
     if (filename_arg && filename_arg[0] != '\0') {
@@ -165,7 +124,7 @@ void notepad_save_and_exit(const char* filename_arg) {
 void notepad_load_file(const char* filename) {
     notepad_clear_buffer();
     char load_buffer[MAX_LINES * (MAX_LINE_LENGTH + 1)];
-    int bytes_read = fat32_read_file_to_buffer(ahci_base, 0, filename, load_buffer, sizeof(load_buffer) - 1);
+    int bytes_read = fat32_read_file(ahci_base, 0, filename, load_buffer, sizeof(load_buffer) - 1);
     if (bytes_read >= 0) {
         load_buffer[bytes_read] = '\0';
         simple_strcpy(current_filename, filename);

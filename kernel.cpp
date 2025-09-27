@@ -125,7 +125,6 @@ extern "C" void cmd_exec(const char* code_text);
 
 void usb_keyboard_self_test();
 
-void cmd_notepad(unsigned long long, int, char const*);
 
 
 
@@ -192,10 +191,9 @@ bool write_data_to_clusters(uint64_t ahci_base, int port, uint32_t start_cluster
 
 // File Operations
 void fat32_list_files(uint64_t ahci_base, int port);
-void fat32_read_file(uint64_t ahci_base, int port, const char* filename);
 int fat32_add_file(uint64_t ahci_base, int port, const char* filename, const void* data, uint32_t size);
 int fat32_remove_file(uint64_t ahci_base, int port, const char* filename);
-int fat32_read_file_to_buffer(uint64_t ahci_base, int port, const char* filename, void* data_buffer, uint32_t buffer_size);
+int fat32_read_file(uint64_t ahci_base, int port, const char* filename, void* data_buffer, uint32_t buffer_size);
 int fat32_write_file(uint64_t ahci_base, int port, const char* filename, const void* data, uint32_t size);
 
 // Commands
@@ -461,7 +459,7 @@ int fat32_copy_file(uint64_t ahci_base, int port, const char* src_name, const ch
     char* file_buffer = new char[file_size];
     if (!file_buffer) return -4; // Memory allocation failed
 
-    int bytes_read = fat32_read_file_to_buffer(ahci_base, port, src_name, file_buffer, file_size + 1);
+    int bytes_read = fat32_read_file(ahci_base, port, src_name, file_buffer, file_size + 1);
     if (bytes_read < 0) {
         delete[] file_buffer;
         return -1; // Read error
@@ -783,7 +781,7 @@ int fat32_remove_file(uint64_t ahci_base, int port, const char* filename) {
 }
 
 
-int fat32_read_file_to_buffer(uint64_t ahci_base, int port, const char* filename, void* data_buffer, uint32_t buffer_size) {
+int fat32_read_file(uint64_t ahci_base, int port, const char* filename, void* data_buffer, uint32_t buffer_size) {
     uint8_t dir_sector_buffer[SECTOR_SIZE];
     uint64_t lba = cluster_to_lba(current_directory_cluster);
     char target[11];
@@ -977,7 +975,7 @@ void cmd_cat(uint64_t ahci_base, int port, const char* filename) {
     // Use a static buffer to avoid heap allocation in the kernel if possible
     static char file_buffer[4096]; 
 
-    int bytes_read = fat32_read_file_to_buffer(ahci_base, port, filename, file_buffer, sizeof(file_buffer));
+    int bytes_read = fat32_read_file(ahci_base, port, filename, file_buffer, sizeof(file_buffer));
 
     if (bytes_read < 0) {
         cout << "Error: File not found or could not be read.\n";
@@ -1016,1892 +1014,547 @@ static void int_to_string(int value, char* buffer) {
     
     buffer[j] = '\0';
 }
-// tinycc_vm_kernel_mmio_enhanced.cpp
-// Enhanced tinycc-style compiler to bytecode + VM runner with Hardware Interface Discovery and Memory-Mapped I/O
-// NEW Features added:
-// - Hardware Interface Discovery: scan_hardware() returns array of detected devices
-// - Memory-Mapped I/O: mmio_read8/16/32/64(addr), mmio_write8/16/32/64(addr, value)
-// - Hardware device structure with vendor_id, device_id, base_address, size
-// - Safety checks for MMIO access within known device ranges
-//
-// Previous Features:
-// - File I/O: read_file(filename), write_file(filename, content), append_file(filename, content)
-// - Arrays: int arr[size], string arr[size], arr[index] = value, value = arr[index]
-// - Array built-ins: array_size(arr), array_resize(arr, new_size)
-// - String functions: str_length, str_substr, str_find_*, str_compare, etc.
-// - Types: int, char, string (string is pointer to char, token-based I/O)
-// - Control: if/else, while, break, continue
-// - I/O: cin >> chains (int/char/string), cout << chains (int/char/string/argv(i)/endl)
 
-#include "terminal_hooks.h"
-#include "terminal_io.h"
-#include "iostream_wrapper.h"
-#include "interrupts.h"
-#include "hardware_specs.h"
-#include "stdlib_hooks.h"
-#include "pci.h"
-#include "sata.h"
-#include "test.h"
-#include "test2.h"
-#include "disk.h"
-#include "dma_memory.h"
-#include "identify.h"
-#include "notepad.h"
-#include "xhci.h"
+//=============================================================================
+// REAL-TIME COMPILER WITH NATIVE CPP INCLUDES AS LIBRARIES
+// Include CPP files directly in kernel.cpp to make functions available
+// to the self-hosted compiler automatically
+//=============================================================================
+#include "libs.h"
+//=============================================================================
+// AUTOMATIC FUNCTION REGISTRATION SYSTEM
+//=============================================================================
 
-// Forward declarations consumed by the command shell
-extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename);
-extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename);
-extern "C" void cmd_exec(const char* code_text);
+struct LibraryFunction {
+    const char* name;
+    void* function_ptr;
+    const char* signature;
+    const char* description;
+    const char* library;
+};
 
-// Provided by the command shell tokenizer
-char* parts[32];
-int   part_count;
+// Macro to register functions easily
+#define REGISTER_FUNCTION(func, sig, desc, lib) \
+    {#func, (void*)func, sig, desc, lib}
 
-// ---- tiny helpers ----
-static inline int tcc_is_digit(char c){ return c>='0' && c<='9'; }
-static inline int tcc_is_alpha(char c){ return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_'; }
-static inline int tcc_is_alnum(char c){ return tcc_is_alpha(c)||tcc_is_digit(c); }
-static inline int tcc_strlen(const char* s){ int n=0; while(s && s[n]) ++n; return n; }
-
-// Helper functions for hex conversion and PCI access
-static void uint32_to_hex_string(uint32_t value, char* buffer) {
-    const char hex_chars[] = "0123456789ABCDEF";
-    for(int i = 7; i >= 0; i--) {
-        buffer[7-i] = hex_chars[(value >> (i*4)) & 0xF];
-    }
-    buffer[8] = 0;
-}
-
-static void uint64_to_hex_string(uint64_t value, char* buffer) {
-    const char hex_chars[] = "0123456789ABCDEF";
-    for(int i = 15; i >= 0; i--) {
-        buffer[15-i] = hex_chars[(value >> (i*4)) & 0xF];
-    }
-    buffer[16] = 0;
-}
-
-// Simple PCI configuration space access
-static uint32_t pci_config_read_dword(uint16_t bus, uint8_t device, uint8_t function, uint8_t offset) {
-    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | ((uint32_t)device << 11) | 
-                      ((uint32_t)function << 8) | (offset & 0xFC);
+// Global function registry - auto-populated from includes
+static const LibraryFunction library_functions[] = {
+    // Core kernel functions
+    REGISTER_FUNCTION(memory_map_data, "string[]()", "Get hardware device list", "kernel"),
+    REGISTER_FUNCTION(fat32_read_file, "int(char*,void*,int)", "Read file", "filesystem"),
+    REGISTER_FUNCTION(fat32_write_file, "int(char*,void*,int)", "Write file", "filesystem"),
+    REGISTER_FUNCTION(fat32_list_files, "void()", "List files", "filesystem"),
+    REGISTER_FUNCTION(mmio_read8, "int(long)", "Read 8-bit MMIO", "hardware"),
+    REGISTER_FUNCTION(mmio_read16, "int(long)", "Read 16-bit MMIO", "hardware"),
+    REGISTER_FUNCTION(mmio_read32, "int(long)", "Read 32-bit MMIO", "hardware"),
+    REGISTER_FUNCTION(mmio_write8, "int(long,int)", "Write 8-bit MMIO", "hardware"),
+    REGISTER_FUNCTION(mmio_write16, "int(long,int)", "Write 16-bit MMIO", "hardware"),
+    REGISTER_FUNCTION(mmio_write32, "int(long,int)", "Write 32-bit MMIO", "hardware"),
+    REGISTER_FUNCTION(print_hex, "void(char*,int)", "Print hex value", "display"),
+    REGISTER_FUNCTION(terminal_clear, "void()", "Clear screen", "display"),
     
-    // Write address to CONFIG_ADDRESS (0xCF8)
-    asm volatile("outl %0, %w1" : : "a"(address), "Nd"(0xCF8) : "memory");
+    // Math library functions (from math_lib.cpp)
+    REGISTER_FUNCTION(fibonacci, "int(int)", "Calculate Fibonacci number", "math"),
+    REGISTER_FUNCTION(factorial, "int(int)", "Calculate factorial", "math"),
+    REGISTER_FUNCTION(power, "int(int,int)", "Calculate power", "math"),
+    REGISTER_FUNCTION(gcd, "int(int,int)", "Greatest common divisor", "math"),
+    REGISTER_FUNCTION(sqrt_approx, "int(int)", "Approximate square root", "math"),
+    REGISTER_FUNCTION(is_prime, "int(int)", "Check if prime", "math"),
     
-    // Read data from CONFIG_DATA (0xCFC)
-    uint32_t result;
-    asm volatile("inl %w1, %0" : "=a"(result) : "Nd"(0xCFC) : "memory");
+    // Crypto library functions (from crypto_lib.cpp)
+    REGISTER_FUNCTION(simple_hash, "int(char*)", "Simple hash function", "crypto"),
+    REGISTER_FUNCTION(xor_encrypt, "void(char*,int)", "XOR encryption", "crypto"),
+    REGISTER_FUNCTION(caesar_cipher, "char*(char*,int)", "Caesar cipher", "crypto"),
+    REGISTER_FUNCTION(checksum, "int(void*,int)", "Calculate checksum", "crypto"),
+  
+    
+    {nullptr, nullptr, nullptr, nullptr, nullptr} // Sentinel
+};
+
+//=============================================================================
+// REAL-TIME COMPILER ENGINE
+//=============================================================================
+
+class RTCompiler {
+private:
+    uint64_t ahci_base;
+    int port;
+    
+    // Variable storage for runtime execution
+    struct Variable {
+        char name[64];
+        int int_value;
+        char string_value[256];
+        bool is_string;
+        bool is_array;
+        int array_size;
+        int* array_data;
+    };
+    
+    Variable variables[128];
+    int variable_count = 0;
+    
+public:
+    RTCompiler(uint64_t ahci, int disk_port) : ahci_base(ahci), port(disk_port) {}
+    
+    // Compile and run a program file that can use all included library functions
+    int compile_and_run_file(const char* program_file) {
+        cout << "=== Real-Time Compilation: " << program_file << " ===\n";
+        
+        // Read program file
+        static char program_source[16384];
+        int bytes_read = fat32_read_file(ahci_base, port, program_file,
+                                                  (unsigned char*)program_source,
+                                                  sizeof(program_source) - 1);
+        if (bytes_read <= 0) {
+            cout << "Error: Could not read " << program_file << "\n";;
+            return -1;
+        }
+        program_source[bytes_read] = '\0';
+        
+        cout << "Program loaded (" << bytes_read << " bytes)\n";
+        
+        // Show available functions from included libraries
+        list_available_functions();
+        
+        // Execute the program
+        return execute_program(program_source);
+    }
+    
+    void list_available_functions() {
+        cout << "=== Available Library Functions ===\n";
+        
+        const char* current_lib = nullptr;
+        for (int i = 0; library_functions[i].name; i++) {
+            const LibraryFunction& func = library_functions[i];
+            
+            // Print library header when we encounter a new library
+            if (!current_lib || strcmp(current_lib, func.library) != 0) {
+                current_lib = func.library;
+				cout << "Press enter to continue...\n";
+				char pass[1];
+				cin >> pass;
+                cout << "\n" << func.library << " Library:\n";
+
+            }
+            
+            cout << "  " << func.name <<  " " << func.signature << " - " << func.description << "\n";;
+        }
+        cout << "\n";;
+    }
+    
+private:
+    int execute_program(const char* source) {
+        // Find main function or execute statements directly
+        const char* main_func = strstr(source, "int main(");
+        if (main_func) {
+            const char* brace = strchr(main_func, '{');
+            if (brace) {
+                execute_block(brace + 1);
+            }
+        } else {
+            execute_statements(source);
+        }
+        return 0;
+    }
+    
+    void execute_statements(const char* source) {
+        const char* line = source;
+        
+        while (*line) {
+            char statement[512];
+            int i = 0;
+            
+            // Extract statement
+            while (*line && *line != '\n' && *line != ';' && i < 511) {
+                statement[i++] = *line++;
+            }
+            statement[i] = '\0';
+            
+            if (*line == '\n' || *line == ';') line++;
+            
+            // Skip empty lines and comments
+            char* trimmed = statement;
+            while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+            if (*trimmed == '\0' || strncmp(trimmed, "//", 2) == 0) continue;
+            
+            execute_statement(trimmed);
+        }
+    }
+    
+    void execute_block(const char* block_start) {
+        const char* line = block_start;
+        int brace_count = 0;
+        
+        while (*line && brace_count >= 0) {
+            char statement[512];
+            int i = 0;
+            
+            while (*line && *line != '\n' && *line != ';' && i < 511) {
+                if (*line == '{') brace_count++;
+                else if (*line == '}') brace_count--;
+                
+                if (brace_count < 0) break;
+                
+                statement[i++] = *line++;
+            }
+            
+            if (*line == '\n' || *line == ';') line++;
+            statement[i] = '\0';
+            
+            char* trimmed = statement;
+            while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+            if (*trimmed == '\0' || *trimmed == '}') continue;
+            
+            execute_statement(trimmed);
+        }
+    }
+    
+    void execute_statement(const char* stmt) {
+        // Variable declarations
+        if (strncmp(stmt, "int ", 4) == 0) {
+            execute_int_declaration(stmt + 4);
+        }
+        else if (strncmp(stmt, "string ", 7) == 0) {
+            execute_string_declaration(stmt + 7);
+        }
+        // Function calls - this is where the magic happens
+        else if (strchr(stmt, '(') && strchr(stmt, ')')) {
+            execute_function_call(stmt);
+        }
+        // Assignments
+        else if (strchr(stmt, '=') && !strstr(stmt, "==")) {
+            execute_assignment(stmt);
+        }
+        else if (strlen(stmt) > 0) {
+            cout << "Unknown statement: " << stmt << "\n";;
+        }
+    }
+    
+    void execute_function_call(const char* call) {
+        char func_name[64];
+        int i = 0;
+        
+        // Extract function name
+        while (call[i] && call[i] != '(' && i < 63) {
+            func_name[i] = call[i];
+            i++;
+        }
+        func_name[i] = '\0';
+        
+        // Find the function in our registry
+        const LibraryFunction* func = find_function(func_name);
+        if (!func) {
+            cout << "Error: Unknown function " << func_name << "\n";;
+            return;
+        }
+        
+        cout << "Calling: " << func_name << " (from " << func->library << " library)\n";
+        
+        // Execute the function based on its signature and library
+        execute_library_function_call(func, call);
+    }
+    
+    const LibraryFunction* find_function(const char* name) {
+        for (int i = 0; library_functions[i].name; i++) {
+            if (strcmp(library_functions[i].name, name) == 0) {
+                return &library_functions[i];
+            }
+        }
+        return nullptr;
+    }
+    
+    void execute_library_function_call(const LibraryFunction* func, const char* call) {
+        // Parse arguments from the function call
+        const char* args = strchr(call, '(');
+        if (!args) return;
+        args++; // Skip '('
+        
+        // Execute based on function name and signature
+        if (strcmp(func->name, "fibonacci") == 0) {
+            int n = parse_int_argument(args);
+            int result = fibonacci(n);
+            cout << "fibonacci(" << n << ") = " << result << "\n";;
+        }
+        else if (strcmp(func->name, "factorial") == 0) {
+            int n = parse_int_argument(args);
+            int result = factorial(n);
+            cout << "factorial(" << n << ") = " << result << "\n";;
+        }
+        else if (strcmp(func->name, "power") == 0) {
+            int base, exp;
+            parse_two_int_arguments(args, &base, &exp);
+            int result = power(base, exp);
+            cout << "power(" << base << ", " << exp << ") = " << result << "\n";;
+        }
+        else if (strcmp(func->name, "gcd") == 0) {
+            int a, b;
+            parse_two_int_arguments(args, &a, &b);
+            int result = gcd(a, b);
+            cout << "gcd(" << a << ", " << b << ") = " << result << "\n";;
+        }
+        else if (strcmp(func->name, "simple_hash") == 0) {
+            char* str = parse_string_argument(args);
+            int result = simple_hash(str);
+            cout << "simple_hash(\"" << str << "\") = 0x" << std::hex << result << "\n";;
+        }
+       
+        else if (strcmp(func->name, "memory_map_data") == 0) {
+            populate_memory_map_data();
+            cout << "Hardware devices discovered:\n";
+            for (int i = 0; i < memory_map_device_count; i++) {
+                cout << memory_map_data[i] << "\n";;
+            }
+        }
+        else if (strncmp(func->name, "mmio_read", 9) == 0) {
+            uint32_t addr = parse_hex_or_int_argument(args);
+            
+            if (strcmp(func->name, "mmio_read8") == 0) {
+                uint8_t val = mmio_read8(addr);
+                cout << "mmio_read8(0x" << std::hex << addr << ") = 0x" << std::hex << (int)val << "\n";;
+            }
+            else if (strcmp(func->name, "mmio_read16") == 0) {
+                uint16_t val = mmio_read16(addr);
+                cout << "mmio_read16(0x" << std::hex << addr << ") = 0x" << std::hex << (int)val << "\n";;
+            }
+            else if (strcmp(func->name, "mmio_read32") == 0) {
+                uint32_t val = mmio_read32(addr);
+                cout << "mmio_read32(0x" << std::hex << addr << ") = 0x" << std::hex << val << "\n";;
+            }
+        }
+        else if (strcmp(func->name, "terminal_clear") == 0) {
+            terminal_clear_screen();
+        }
+        else if (strcmp(func->name, "fat32_list_files") == 0) {
+            fat32_list_files(ahci_base, port);
+        }
+        else if (strcmp(func->name, "print_hex") == 0) {
+            char* label;
+            int value;
+            parse_string_and_int_arguments(args, &label, &value);
+            print_hex(label, value);
+        }
+
+        else {
+            cout << "Function " << func->name << " execution not yet implemented\n";
+            cout << "But it's available and callable from: " << func->library << " library\n";
+        }
+    }
+    
+    // Argument parsing helpers
+    int parse_int_argument(const char* args) {
+        while (*args == ' ') args++;
+        return parse_number(args);
+    }
+    
+    uint64_t parse_hex_or_int_argument(const char* args) {
+        while (*args == ' ') args++;
+        return parse_number(args);
+    }
+    
+    char* parse_string_argument(const char* args) {
+        while (*args == ' ') args++;
+        if (*args == '"') {
+            args++; // Skip opening quote
+            static char string_buf[256];
+            int i = 0;
+            while (*args && *args != '"' && i < 255) {
+                string_buf[i++] = *args++;
+            }
+            string_buf[i] = '\0';
+            return string_buf;
+        }
+        return nullptr;
+    }
+    
+    void parse_two_int_arguments(const char* args, int* a, int* b) {
+        *a = parse_int_argument(args);
+        const char* comma = strchr(args, ',');
+        if (comma) {
+            *b = parse_int_argument(comma + 1);
+        }
+    }
+    
+    void parse_three_int_arguments(const char* args, int* a, int* b, int* c) {
+        *a = parse_int_argument(args);
+        const char* comma1 = strchr(args, ',');
+        if (comma1) {
+            *b = parse_int_argument(comma1 + 1);
+            const char* comma2 = strchr(comma1 + 1, ',');
+            if (comma2) {
+                *c = parse_int_argument(comma2 + 1);
+            }
+        }
+    }
+    
+    void parse_string_and_int_arguments(const char* args, char** str, int* val) {
+        *str = parse_string_argument(args);
+        const char* comma = strchr(args, ',');
+        if (comma) {
+            *val = parse_int_argument(comma + 1);
+        }
+    }
+    
+    // Custom string to number parser to replace strtoull (not available in kernel)
+static uint64_t kernel_parse_number(const char* str) {
+    while (*str == ' ') str++; // Skip whitespace
+    
+    uint64_t result = 0;
+    int base = 10;
+    
+    // Check for hex prefix
+    if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+        base = 16;
+        str += 2; // Skip "0x"
+    }
+    
+    while (*str) {
+        char c = *str;
+        int digit_value = -1;
+        
+        if (c >= '0' && c <= '9') {
+            digit_value = c - '0';
+        } else if (base == 16) {
+            if (c >= 'a' && c <= 'f') {
+                digit_value = c - 'a' + 10;
+            } else if (c >= 'A' && c <= 'F') {
+                digit_value = c - 'A' + 10;
+            }
+        }
+        
+        if (digit_value == -1 || digit_value >= base) {
+            break; // Invalid character or end of number
+        }
+        
+        result = result * base + digit_value;
+        str++;
+    }
     
     return result;
 }
 
-// ============================================================
-// Hardware Interface Discovery Structures
-// ============================================================
-struct HardwareDevice {
-    uint32_t vendor_id;
-    uint32_t device_id;
-    uint64_t base_address;
-    uint64_t size;
-    uint32_t device_type;  // 0=Unknown, 1=Storage, 2=Network, 3=Graphics, 4=Audio, 5=USB
-    char description[64];
-};
-
-// Global hardware registry
-static const int MAX_HARDWARE_DEVICES = 32;
-static HardwareDevice hardware_registry[MAX_HARDWARE_DEVICES];
-static int hardware_count = 0;
-
-// Hardware discovery functions
-static void discover_pci_devices() {
-    // Scan PCI configuration space for devices
-    for (uint16_t bus = 0; bus < 256; bus++) {
-        for (uint8_t device = 0; device < 32; device++) {
-            for (uint8_t function = 0; function < 8; function++) {
-                uint32_t vendor_device = pci_config_read_dword(bus, device, function, 0);
-                if ((vendor_device & 0xFFFF) == 0xFFFF) continue; // No device
-                
-                if (hardware_count >= MAX_HARDWARE_DEVICES) return;
-                
-                HardwareDevice& dev = hardware_registry[hardware_count];
-                dev.vendor_id = vendor_device & 0xFFFF;
-                dev.device_id = (vendor_device >> 16) & 0xFFFF;
-                
-                // Read BAR0 for base address
-                uint32_t bar0 = pci_config_read_dword(bus, device, function, 0x10);
-                if (bar0 & 0x1) {
-                    // I/O port
-                    dev.base_address = bar0 & 0xFFFFFFFC;
-                    dev.size = 0x100; // Assume 256 bytes for I/O ports
-                } else {
-                    // Memory mapped
-                    dev.base_address = bar0 & 0xFFFFFFF0;
-                    if ((bar0 & 0x6) == 0x4) {
-                        // 64-bit BAR
-                        uint32_t bar1 = pci_config_read_dword(bus, device, function, 0x14);
-                        dev.base_address |= ((uint64_t)bar1 << 32);
-                    }
-                    dev.size = 0x1000; // Assume 4KB for memory mapped
-                }
-                
-                // Determine device type based on class code
-                uint32_t class_code = pci_config_read_dword(bus, device, function, 0x08);
-                uint8_t base_class = (class_code >> 24) & 0xFF;
-                
-                switch (base_class) {
-                    case 0x01: dev.device_type = 1; simple_strcpy(dev.description, "Storage Controller"); break;
-                    case 0x02: dev.device_type = 2; simple_strcpy(dev.description, "Network Controller"); break;
-                    case 0x03: dev.device_type = 3; simple_strcpy(dev.description, "Display Controller"); break;
-                    case 0x04: dev.device_type = 4; simple_strcpy(dev.description, "Multimedia Controller"); break;
-                    case 0x0C: 
-                        if (((class_code >> 16) & 0xFF) == 0x03) {
-                            dev.device_type = 5; 
-                            simple_strcpy(dev.description, "USB Controller");
-                        } else {
-                            dev.device_type = 0; 
-                            simple_strcpy(dev.description, "Serial Bus Controller");
-                        }
-                        break;
-                    default: dev.device_type = 0; simple_strcpy(dev.description, "Unknown Device"); break;
-                }
-                
-                hardware_count++;
-                
-                if (function == 0 && !(pci_config_read_dword(bus, device, function, 0x0C) & 0x800000)) {
-                    break; // Single function device
-                }
-            }
-        }
-    }
+// Replace the parse_number function in RTCompiler
+uint64_t parse_number(const char* str) {
+    return kernel_parse_number(str);
 }
-
-static void discover_memory_regions() {
-    // Add known memory regions
-    if (hardware_count < MAX_HARDWARE_DEVICES) {
-        HardwareDevice& dev = hardware_registry[hardware_count];
-        dev.vendor_id = 0x0000;
-        dev.device_id = 0x0001;
-        dev.base_address = 0xB8000; // VGA text mode buffer
-        dev.size = 0x8000;
-        dev.device_type = 3;
-        simple_strcpy(dev.description, "VGA Text Buffer");
-        hardware_count++;
-    }
     
-    if (hardware_count < MAX_HARDWARE_DEVICES) {
-        HardwareDevice& dev = hardware_registry[hardware_count];
-        dev.vendor_id = 0x0000;
-        dev.device_id = 0x0002;
-        dev.base_address = 0xA0000; // VGA graphics buffer
-        dev.size = 0x20000;
-        dev.device_type = 3;
-        simple_strcpy(dev.description, "VGA Graphics Buffer");
-        hardware_count++;
-    }
-}
-
-static int scan_hardware() {
-    hardware_count = 0;
-    discover_pci_devices();
-    discover_memory_regions();
-    return hardware_count;
-}
-
-// Safety check for MMIO access
-static bool is_safe_mmio_address(uint64_t addr, uint64_t size) {
-    // Check if address falls within any known device range
-    for (int i = 0; i < hardware_count; i++) {
-        const HardwareDevice& dev = hardware_registry[i];
-        if (addr >= dev.base_address && 
-            addr + size <= dev.base_address + dev.size) {
-            return true;
-        }
-    }
-    
-    // Allow access to standard VGA and system areas even if not enumerated
-    if (addr >= 0xA0000 && addr < 0x100000) return true; // VGA/BIOS area
-    if (addr >= 0xB8000 && addr < 0xC0000) return true; // VGA text buffer
-    if (addr >= 0x3C0 && addr < 0x3E0) return true;     // VGA registers
-    if (addr >= 0x60 && addr < 0x70) return true;       // Keyboard controller
-    
-    return false;
-}
-
-// ============================================================
-// Enhanced Bytecode ISA with Hardware Discovery and MMIO
-// ============================================================
-enum TOp : unsigned char {
-    // stack/data
-    T_NOP=0, T_PUSH_IMM, T_PUSH_STR, T_LOAD_LOCAL, T_STORE_LOCAL, T_POP,
-
-    // arithmetic / unary
-    T_ADD, T_SUB, T_MUL, T_DIV, T_NEG,
-
-    // comparisons
-    T_EQ, T_NE, T_LT, T_LE, T_GT, T_GE,
-
-    // control flow
-    T_JMP, T_JZ, T_JNZ, T_RET,
-
-    // I/O and args
-    T_PRINT_INT, T_PRINT_CHAR, T_PRINT_STR, T_PRINT_ENDL, T_PRINT_INT_ARRAY, T_PRINT_STRING_ARRAY,
-    T_READ_INT, T_READ_CHAR, T_READ_STR,
-    T_PUSH_ARGC, T_PUSH_ARGV_PTR,
-
-    // File I/O operations
-    T_READ_FILE, T_WRITE_FILE, T_APPEND_FILE,
-
-    // Array operations
-    T_ALLOC_ARRAY, T_LOAD_ARRAY, T_STORE_ARRAY, T_ARRAY_SIZE, T_ARRAY_RESIZE,
-
-    // String operations
-    T_STR_CONCAT, T_STR_LENGTH, T_STR_SUBSTR, T_INT_TO_STR, T_STR_COMPARE,
-    T_STR_FIND_CHAR, T_STR_FIND_STR, T_STR_FIND_LAST_CHAR, T_STR_CONTAINS,
-    T_STR_STARTS_WITH, T_STR_ENDS_WITH, T_STR_COUNT_CHAR, T_STR_REPLACE_CHAR,
-    
-    // NEW: Hardware Discovery and Memory-Mapped I/O
-    T_SCAN_HARDWARE,    // () -> device_count
-    T_GET_DEVICE_INFO,  // (device_index) -> device_array_handle
-    T_MMIO_READ8,       // (address) -> uint8_value
-    T_MMIO_READ16,      // (address) -> uint16_value  
-    T_MMIO_READ32,      // (address) -> uint32_value
-    T_MMIO_READ64,      // (address) -> uint64_value (split into two 32-bit values)
-    T_MMIO_WRITE8,      // (address, value) -> success
-    T_MMIO_WRITE16,     // (address, value) -> success
-    T_MMIO_WRITE32,     // (address, value) -> success
-    T_MMIO_WRITE64,     // (address, low32, high32) -> success
-    T_GET_HARDWARE_ARRAY, // () -> hardware_device_array_handle
-    T_DISPLAY_MEMORY_MAP  // () -> displays formatted memory map
-};
-
-// ============================================================
-// Enhanced Program buffers with hardware support
-// ============================================================
-struct TProgram {
-    static const int CODE_MAX = 8192;
-    unsigned char code[CODE_MAX];
-    int pc = 0;
-
-    static const int LIT_MAX = 4096;
-    char lit[LIT_MAX];
-    int lit_top = 0;
-
-    static const int LOC_MAX = 32;
-    char  loc_name[LOC_MAX][32];
-    unsigned char loc_type[LOC_MAX]; // 0=int,1=char,2=string,3=int_array,4=string_array,5=device_array
-    int   loc_array_size[LOC_MAX];
-    int   loc_count = 0;
-
-    int add_local(const char* name, unsigned char t, int array_size = 0){
-        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], name)==0) return i; }
-        if(loc_count>=LOC_MAX) return -1;
-        simple_strcpy(loc_name[loc_count], name);
-        loc_type[loc_count]=t;
-        loc_array_size[loc_count] = array_size;
-        return loc_count++;
-    }
-    int get_local(const char* name){
-        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], name)==0) return i; }
-        return -1;
-    }
-    int get_local_type(int idx){ return (idx>=0 && idx<loc_count)? loc_type[idx] : 0; }
-    int get_array_size(int idx){ return (idx>=0 && idx<loc_count)? loc_array_size[idx] : 0; }
-
-    void emit1(unsigned char op){ if(pc<CODE_MAX) code[pc++]=op; }
-    void emit4(int v){ if(pc+4<=CODE_MAX){ code[pc++]=v&0xff; code[pc++]=(v>>8)&0xff; code[pc++]=(v>>16)&0xff; code[pc++]=(v>>24)&0xff; } }
-    int  mark(){ return pc; }
-    void patch4(int at, int v){ if(at+4<=CODE_MAX){ code[at+0]=v&0xff; code[at+1]=(v>>8)&0xff; code[at+2]=(v>>16)&0xff; code[at+3]=(v>>24)&0xff; } }
-
-    const char* add_lit(const char* s){
-        int n = tcc_strlen(s)+1;
-        if(lit_top+n > LIT_MAX) return "";
-        char* p = &lit[lit_top];
-        simple_memcpy(p, s, n);
-        lit_top += n;
-        return p;
-    }
-};
-
-// ============================================================
-// Enhanced Tokenizer with hardware and MMIO keywords
-// ============================================================
-enum TTokType { TT_EOF, TT_ID, TT_NUM, TT_STR, TT_CH, TT_KW, TT_OP, TT_PUNC };
-struct TTok { TTokType t; char v[64]; int ival; };
-
-struct TLex {
-    const char* src; int pos; int line;
-    void init(const char* s){ src=s; pos=0; line=1; }
-
-    void skipws(){
-        for(;;){
-            char c=src[pos];
-            if(c==' '||c=='\t'||c=='\r'||c=='\n'){ if(c=='\n') line++; pos++; continue; }
-            if(c=='/' && src[pos+1]=='/'){ pos+=2; while(src[pos] && src[pos]!='\n') pos++; continue; }
-            if(c=='/' && src[pos+1]=='*'){ pos+=2; while(src[pos] && !(src[pos]=='*'&&src[pos+1]=='/')) pos++; if(src[pos]) pos+=2; continue; }
-            break;
-        }
-    }
-
-    TTok number(){
-        TTok t; t.t=TT_NUM; t.ival=0; int i=0;
-        // Support hex numbers (0x prefix)
-        if(src[pos] == '0' && (src[pos+1] == 'x' || src[pos+1] == 'X')) {
-            pos += 2;
-            t.v[i++] = '0'; t.v[i++] = 'x';
-            while(i < 63 && ((src[pos] >= '0' && src[pos] <= '9') || 
-                           (src[pos] >= 'a' && src[pos] <= 'f') ||
-                           (src[pos] >= 'A' && src[pos] <= 'F'))) {
-                char c = src[pos];
-                t.v[i++] = c;
-                if(c >= '0' && c <= '9') t.ival = t.ival * 16 + (c - '0');
-                else if(c >= 'a' && c <= 'f') t.ival = t.ival * 16 + (c - 'a' + 10);
-                else if(c >= 'A' && c <= 'F') t.ival = t.ival * 16 + (c - 'A' + 10);
-                pos++;
-            }
-        } else {
-            while(tcc_is_digit(src[pos])){ t.v[i++]=src[pos]; t.ival = t.ival*10 + (src[pos]-'0'); pos++; if(i>=63) break; }
-        }
-        t.v[i]=0; return t;
-    }
-
-    TTok ident(){
-        TTok t; t.t=TT_ID; int i=0;
-        while(tcc_is_alnum(src[pos])){ t.v[i++]=src[pos++]; if(i>=63) break; } t.v[i]=0;
-        // Enhanced keywords with hardware and MMIO functions
-        const char* kw[]={"int","char","string","return","if","else","while","break","continue",
-                         "cin","cout","endl","argc","argv","read_file","write_file","append_file",
-                         "array_size","array_resize","str_length","str_substr","int_to_str","str_compare",
-                         "str_find_char","str_find_str","str_find_last_char","str_contains",
-                         "str_starts_with","str_ends_with","str_count_char","str_replace_char",
-                         "scan_hardware","get_device_info","get_hardware_array","display_memory_map",
-                         "mmio_read8","mmio_read16","mmio_read32","mmio_read64",
-                         "mmio_write8","mmio_write16","mmio_write32","mmio_write64",0};
-        for(int k=0; kw[k]; ++k){ if(simple_strcmp(t.v,kw[k])==0){ t.t=TT_KW; break; } }
-        return t;
-    }
-
-    TTok string(){
-        TTok t; t.t=TT_STR; int i=0; pos++;
-        while(src[pos] && src[pos]!='"'){ if(i<63) t.v[i++]=src[pos]; pos++; }
-        t.v[i]=0; if(src[pos]=='"') pos++; return t;
-    }
-
-    TTok chlit(){
-        TTok t; t.t=TT_CH; t.v[0]=0; int v=0; pos++; // skip '
-        if(src[pos] && src[pos+1]=='\''){ v = (unsigned char)src[pos]; pos+=2; }
-        t.ival = v; return t;
-    }
-
-    TTok op_or_punc(){
-        TTok t; t.t=TT_OP; t.v[0]=src[pos]; t.v[1]=0; char c=src[pos];
-        if(c=='<' && src[pos+1]=='<'){ t.v[0]='<'; t.v[1]='<'; t.v[2]=0; pos+=2; return t; }
-        if(c=='>' && src[pos+1]=='>'){ t.v[0]='>'; t.v[1]='>'; t.v[2]=0; pos+=2; return t; }
-        if((c=='='||c=='!'||c=='<'||c=='>') && src[pos+1]=='='){ t.v[0]=c; t.v[1]='='; t.v[2]=0; pos+=2; return t; }
-        pos++; if(c=='('||c==')'||c=='{'||c=='}'||c==';'||c==','||c=='['||c==']') t.t=TT_PUNC; return t;
-    }
-
-    TTok next(){
-        skipws();
-        if(src[pos]==0){ TTok t; t.t=TT_EOF; t.v[0]=0; return t; }
-        if(src[pos]=='"') return string();
-        if(src[pos]=='\'') return chlit();
-        if(tcc_is_digit(src[pos]) || (src[pos]=='0' && (src[pos+1]=='x'||src[pos+1]=='X'))) return number();
-        if(tcc_is_alpha(src[pos])) return ident();
-        return op_or_punc();
-    }
-};
-
-// ============================================================
-// Enhanced Parser / Compiler with Hardware and MMIO support
-// ============================================================
-struct TCompiler {
-    TLex lx; TTok tk; TProgram pr;
-
-    int brk_pos[32]; int brk_cnt=0;
-    int cont_pos[32]; int cont_cnt=0;
-
-    void adv(){ tk = lx.next(); }
-    int  accept(const char* s){ if(simple_strcmp(tk.v,s)==0){ adv(); return 1; } return 0; }
-    void expect(const char* s){ if(!accept(s)) { cout << "Parse error near: "; cout << tk.v; cout << "\n"; } }
-
-    void parse_primary(){
-        if(tk.t==TT_NUM){ pr.emit1(T_PUSH_IMM); pr.emit4(tk.ival); adv(); return; }
-        if(tk.t==TT_CH){ pr.emit1(T_PUSH_IMM); pr.emit4(tk.ival); adv(); return; }
-        if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); return; }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"argc")==0){ pr.emit1(T_PUSH_ARGC); adv(); return; }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); return; }
-        
-        // File I/O built-ins
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"read_file")==0){ 
-            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_READ_FILE); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"write_file")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_WRITE_FILE); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"append_file")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_APPEND_FILE); return; 
-        }
-        
-        // Array built-ins
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"array_size")==0){ 
-            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_ARRAY_SIZE); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"array_resize")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_ARRAY_RESIZE); return; 
-        }
-        
-        // String built-ins
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_length")==0){ 
-            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_STR_LENGTH); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_substr")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(","); 
-            parse_expression(); expect(")"); pr.emit1(T_STR_SUBSTR); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"int_to_str")==0){ 
-            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_INT_TO_STR); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_compare")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_COMPARE); return; 
-        }
-        
-        // String search functions
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_char")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_CHAR); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_str")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_STR); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_last_char")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_LAST_CHAR); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_contains")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_CONTAINS); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_starts_with")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_STARTS_WITH); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_ends_with")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_ENDS_WITH); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_count_char")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_COUNT_CHAR); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_replace_char")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(","); 
-            parse_expression(); expect(")"); pr.emit1(T_STR_REPLACE_CHAR); return; 
-        }
-        
-        // NEW: Hardware Discovery Functions
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"scan_hardware")==0){ 
-            adv(); expect("("); expect(")"); pr.emit1(T_SCAN_HARDWARE); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"get_device_info")==0){ 
-            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_GET_DEVICE_INFO); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"get_hardware_array")==0){ 
-            adv(); expect("("); expect(")"); pr.emit1(T_GET_HARDWARE_ARRAY); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"display_memory_map")==0){ 
-            adv(); expect("("); expect(")"); pr.emit1(T_DISPLAY_MEMORY_MAP); return; 
-        }
-        
-        // NEW: Memory-Mapped I/O Functions
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read8")==0){ 
-            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ8); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read16")==0){ 
-            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ16); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read32")==0){ 
-            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ32); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read64")==0){ 
-            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ64); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write8")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE8); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write16")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE16); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write32")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE32); return; 
-        }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write64")==0){ 
-            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(","); 
-            parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE64); return; 
-        }
-        
-        if(tk.t==TT_PUNC && tk.v[0]=='('){ adv(); parse_expression(); expect(")"); return; }
-        
-        if(tk.t==TT_ID){
-            int idx = pr.get_local(tk.v);
-            if(idx<0){ cout << "Unknown var "; cout << tk.v; cout << "\n"; }
-            char var_name[32]; simple_strcpy(var_name, tk.v);
-            adv();
-            
-            // Array indexing
-            if(tk.t==TT_PUNC && tk.v[0]=='['){
-                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // push handle
-                adv(); // past '['
-                parse_expression(); // push index
-                expect("]");
-                pr.emit1(T_LOAD_ARRAY);
-                return;
-            }
-            
-            pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); 
-            return;
-        }
-    }
-
-    void parse_unary(){
-        if(accept("-")){ parse_unary(); pr.emit1(T_NEG); return; }
-        parse_primary();
-    }
-
-    void parse_term(){
-        parse_unary();
-        while(tk.v[0]=='*' || tk.v[0]=='/'){
-            char op=tk.v[0]; adv(); parse_unary();
-            pr.emit1(op=='*'?T_MUL:T_DIV);
-        }
-    }
-
-    void parse_arith(){
-        parse_term();
-        while(tk.v[0]=='+' || tk.v[0]=='-'){
-            char op=tk.v[0]; adv(); parse_term();
-            if(op=='+') {
-                pr.emit1(T_ADD); // This will be overridden for strings in VM
-            } else {
-                pr.emit1(T_SUB);
-            }
-        }
-    }
-
-    void parse_cmp(){
-        parse_arith();
-        while(tk.t==TT_OP && (simple_strcmp(tk.v,"==")==0 || simple_strcmp(tk.v,"!=")==0 ||
-               simple_strcmp(tk.v,"<")==0 || simple_strcmp(tk.v,"<=")==0 ||
-               simple_strcmp(tk.v,">")==0 || simple_strcmp(tk.v,">=")==0)){
-            char opv[3]; simple_strcpy(opv, tk.v); adv(); parse_arith();
-            if(simple_strcmp(opv,"==")==0) pr.emit1(T_EQ);
-            else if(simple_strcmp(opv,"!=")==0) pr.emit1(T_NE);
-            else if(simple_strcmp(opv,"<")==0)  pr.emit1(T_LT);
-            else if(simple_strcmp(opv,"<=")==0) pr.emit1(T_LE);
-            else if(simple_strcmp(opv,">")==0)  pr.emit1(T_GT);
-            else pr.emit1(T_GE);
-        }
-    }
-
-    void parse_expression(){ parse_cmp(); }
-
-    void parse_decl(unsigned char tkind){
-        adv(); // past type keyword
-        if(tk.t!=TT_ID){ cout << "Expected identifier\n"; return; }
-        char nm[32]; simple_strcpy(nm, tk.v); adv();
-        
-        int array_size = 0;
-        // Array declaration syntax: int arr[size] or string arr[size]
-        if(tk.t==TT_PUNC && tk.v[0]=='['){
-            adv();
-            if(tk.t==TT_NUM){ 
-                array_size = tk.ival; 
-                adv(); 
-            } else {
-                cout << "Expected array size\n"; return;
-            }
-            expect("]");
-            
-            if (tkind == 0) tkind = 3; // int -> int_array
-            else if (tkind == 2) tkind = 4; // string -> string_array
-        }
-        
-        int idx = pr.add_local(nm, tkind, array_size);
-
-        // If it's an array, allocate it now, before parsing initializer
-        if (tkind == 3 || tkind == 4) {
-            pr.emit1(T_PUSH_IMM); pr.emit4(array_size);
-            pr.emit1(T_ALLOC_ARRAY);
-            pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
-        }
-        
-        if(accept("=")){ 
-            if(tkind==3 || tkind==4){ // Array initialization
-                expect("{");
-                int i = 0;
-                do {
-                    if (tk.t == TT_PUNC && tk.v[0] == '}') break; // empty list or trailing comma
-                    if (i >= array_size) {
-                        cout << "Too many initializers for array\n";
-                        while(!accept("}")) { if(tk.t==TT_EOF) break; adv(); }
-                        goto end_init;
-                    }
-
-                    pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);      // 1. Push handle
-                    pr.emit1(T_PUSH_IMM); pr.emit4(i);          // 2. Push index
-                    parse_expression();                         // 3. Push value
-                    pr.emit1(T_STORE_ARRAY);                    // 4. Store
-                    i++;
-                } while(accept(","));
-                expect("}");
-                end_init:;
-            } else if(tkind==2){ // string
-                if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); }
-                else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); }
-                else if(tk.t==TT_ID){ int j=pr.get_local(tk.v); adv(); pr.emit1(T_LOAD_LOCAL); pr.emit4(j); }
-                else { parse_expression(); }
-                pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
-            } else {
-                parse_expression();
-                pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
-            }
-        }
-        expect(";");
-    }
-
-    void parse_assign_or_coutcin(){
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"cout")==0){ adv();
-            for(;;){
-                expect("<<");
-                if(tk.t==TT_KW && simple_strcmp(tk.v,"endl")==0){ adv(); pr.emit1(T_PRINT_ENDL); }
-                else if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); pr.emit1(T_PRINT_STR); }
-                else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); pr.emit1(T_PRINT_STR); }
-                else if(tk.t==TT_ID){
-                    char var_name[32]; simple_strcpy(var_name, tk.v);
-                    int idx = pr.get_local(tk.v); int ty = pr.get_local_type(idx); adv();
-                    
-                    // Handle array element printing vs whole array printing
-                    if(tk.t==TT_PUNC && tk.v[0]=='['){
-                        pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // load array
-                        adv(); // past '['
-                        parse_expression(); // push index
-                        expect("]");
-                        pr.emit1(T_LOAD_ARRAY); // load element
-                        if (ty == 3) pr.emit1(T_PRINT_INT);       // int array element
-                        else if (ty == 4) pr.emit1(T_PRINT_STR);  // string array element
-                        else if (ty == 5) pr.emit1(T_PRINT_INT);  // device array element
-                    } else {
-                        pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);
-                        if(ty==4) pr.emit1(T_PRINT_STRING_ARRAY); // Print whole string array
-                        else if(ty==3) pr.emit1(T_PRINT_INT_ARRAY); // Print whole int array
-                        else if(ty==2) pr.emit1(T_PRINT_STR);
-                        else if(ty==1) pr.emit1(T_PRINT_CHAR);
-                        else pr.emit1(T_PRINT_INT);
-                    }
-                } else { parse_expression(); pr.emit1(T_PRINT_INT); }
-                if(tk.t==TT_PUNC && tk.v[0]==';'){ adv(); break; }
-            }
-            return;
-        }
-		if (tk.t==TT_KW && simple_strcmp(tk.v,"cin")==0) { 
-			adv();
-			for (;;) {
-				expect(">>");
-				if (tk.t != TT_ID) { 
-					cout << "cin expects identifier\n"; 
-					return; 
-				}
-				int idx = pr.get_local(tk.v);
-				int ty  = pr.get_local_type(idx);
-				adv(); // past identifier
-
-				// Read into scalar variable based on its type
-				if (ty == 2)       pr.emit1(T_READ_STR);   // string
-				else if (ty == 1)  pr.emit1(T_READ_CHAR);  // char
-				else               pr.emit1(T_READ_INT);   // int (default)
-
-				pr.emit1(T_STORE_LOCAL);
-				pr.emit4(idx);
-
-				// End the chain only at a semicolon; otherwise continue parsing >>
-				if (tk.t == TT_PUNC && tk.v[0] == ';') {
-					adv(); 
-					break; 
-				}
-			}
-			return;
-		}
-
-        if(tk.t==TT_ID){
-            int idx = pr.get_local(tk.v);
-            if(idx<0){ cout << "Unknown var "; cout << tk.v; cout << "\n"; }
-            int ty = pr.get_local_type(idx);
-            adv(); 
-            
-            // Array element assignment
-            if(tk.t==TT_PUNC && tk.v[0]=='['){
-                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);  // 1. Push handle
-                adv(); // past '['
-                parse_expression();                     // 2. Push index
-                expect("]");
-                expect("=");
-                parse_expression();                     // 3. Push value
-                pr.emit1(T_STORE_ARRAY);                // 4. Store
-                expect(";");
-                return;
-            }
-            
-            expect("=");
-            if(ty==2){
-                if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); }
-                else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); }
-                else if(tk.t==TT_ID){ int j=pr.get_local(tk.v); adv(); pr.emit1(T_LOAD_LOCAL); pr.emit4(j); }
-                else { parse_expression(); }
-            } else {
-                parse_expression();
-            }
-            pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
-            expect(";");
-            return;
-        }
-
-        // Expression statement
-        parse_expression();
-        pr.emit1(T_POP); // Pop unused result
-        expect(";");
-    }
-
-    void parse_if(){
-        adv(); expect("("); parse_expression(); expect(")");
-        pr.emit1(T_JZ); int jz_at = pr.mark(); pr.emit4(0);
-        parse_block();
-        int has_else = (tk.t==TT_KW && simple_strcmp(tk.v,"else")==0);
-        if(has_else){
-            pr.emit1(T_JMP); int j_at = pr.mark(); pr.emit4(0);
-            int here = pr.pc; pr.patch4(jz_at, here);
-            adv(); // else
-            parse_block();
-            int end = pr.pc; pr.patch4(j_at, end);
-        } else {
-            int here = pr.pc; pr.patch4(jz_at, here);
-        }
-    }
-
-    void parse_while(){
-        adv(); expect("("); int cond_ip = pr.pc; parse_expression(); expect(")");
-        pr.emit1(T_JZ); int jz_at = pr.mark(); pr.emit4(0);
-        int brk_base=brk_cnt, cont_base=cont_cnt;
-        parse_block();
-        for(int i=cont_base;i<cont_cnt;i++){ pr.patch4(cont_pos[i], cond_ip); }
-        cont_cnt = cont_base;
-        pr.emit1(T_JMP); pr.emit4(cond_ip);
-        int end_ip = pr.pc; pr.patch4(jz_at, end_ip);
-        for(int i=brk_base;i<brk_cnt;i++){ pr.patch4(brk_pos[i], end_ip); }
-        brk_cnt = brk_base;
-    }
-
-    void parse_block(){
-        if(accept("{")){
-            while(!(tk.t==TT_PUNC && tk.v[0]=='}') && tk.t!=TT_EOF) parse_stmt();
-            expect("}");
-        } else {
-            parse_stmt();
-        }
-    }
-
-    void parse_stmt(){
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"int")==0){ parse_decl(0); return; }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"char")==0){ parse_decl(1); return; }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"string")==0){ parse_decl(2); return; }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"return")==0){ adv(); parse_expression(); pr.emit1(T_RET); expect(";"); return; }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"if")==0){ parse_if(); return; }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"while")==0){ parse_while(); return; }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"break")==0){ adv(); expect(";"); pr.emit1(T_JMP); int at=pr.mark(); pr.emit4(0); brk_pos[brk_cnt++]=at; return; }
-        if(tk.t==TT_KW && simple_strcmp(tk.v,"continue")==0){ adv(); expect(";"); pr.emit1(T_JMP); int at=pr.mark(); pr.emit4(0); cont_pos[cont_cnt++]=at; return; }
-        parse_assign_or_coutcin();
-    }
-
-    int compile(const char* source){
-        lx.init(source); adv();
-        if(!(tk.t==TT_KW && simple_strcmp(tk.v,"int")==0)) { cout<<"Expected 'int' at start\n"; return -1; }
-        adv();
-        if(!(tk.t==TT_ID && simple_strcmp(tk.v,"main")==0)){ cout<<"Expected main\n"; return -1; }
-        adv(); expect("("); expect(")"); parse_block();
-        pr.emit1(T_PUSH_IMM); pr.emit4(0); pr.emit1(T_RET);
-        return pr.pc;
-    }
-};
-
-// ============================================================
-// Enhanced VM with Hardware Discovery and Memory-Mapped I/O
-// ============================================================
-struct TinyVM {
-    static const int STK_MAX = 1024;
-    int   stk[STK_MAX]; int sp=0;
-    int   locals[TProgram::LOC_MAX];
-    int   argc; const char** argv;
-    TProgram* P;
-    char str_in[256];
-    uint64_t ahci_base; int port; // for file I/O
-    
-    // String pool for dynamic string management
-    static const int STRING_POOL_SIZE = 8192;
-    char string_pool[STRING_POOL_SIZE];
-    int string_pool_top = 0;
-    
-    // Simple array management
-    struct Array {
-        int* data;
-        int size;
-        int capacity;
-    };
-    static const int MAX_ARRAYS = 64;
-    Array arrays[MAX_ARRAYS];
-    int array_count = 0;
-    
-    // Special array handle for hardware devices
-    int hardware_array_handle = 0;
-
-    inline void push(int v){ if(sp<STK_MAX) stk[sp++]=v; }
-    inline int  pop(){ return sp?stk[--sp]:0; }
-
-    // Memory-Mapped I/O functions
-    uint8_t mmio_read_8(uint64_t addr) {
-        if (!is_safe_mmio_address(addr, 1)) {
-            cout << "MMIO: Unsafe read8 at 0x"; 
-            char hex[17]; uint64_to_hex_string(addr, hex); 
-            cout << hex << "\n";
-            return 0xFF;
-        }
-        return *(volatile uint8_t*)addr;
-    }
-
-    uint16_t mmio_read_16(uint64_t addr) {
-        if (!is_safe_mmio_address(addr, 2)) {
-            cout << "MMIO: Unsafe read16 at 0x"; 
-            char hex[17]; uint64_to_hex_string(addr, hex); 
-            cout << hex << "\n";
-            return 0xFFFF;
-        }
-        return *(volatile uint16_t*)addr;
-    }
-
-    uint32_t mmio_read_32(uint64_t addr) {
-        if (!is_safe_mmio_address(addr, 4)) {
-            cout << "MMIO: Unsafe read32 at 0x"; 
-            char hex[17]; uint64_to_hex_string(addr, hex); 
-            cout << hex << "\n";
-            return 0xFFFFFFFF;
-        }
-        return *(volatile uint32_t*)addr;
-    }
-
-    uint64_t mmio_read_64(uint64_t addr) {
-        if (!is_safe_mmio_address(addr, 8)) {
-            cout << "MMIO: Unsafe read64 at 0x"; 
-            char hex[17]; uint64_to_hex_string(addr, hex); 
-            cout << hex << "\n";
-            return 0xFFFFFFFFFFFFFFFFULL;
-        }
-        return *(volatile uint64_t*)addr;
-    }
-
-    bool mmio_write_8(uint64_t addr, uint8_t value) {
-        if (!is_safe_mmio_address(addr, 1)) {
-            cout << "MMIO: Unsafe write8 at 0x"; 
-            char hex[17]; uint64_to_hex_string(addr, hex); 
-            cout << hex << "\n";
-            return false;
-        }
-        *(volatile uint8_t*)addr = value;
-        return true;
-    }
-
-    bool mmio_write_16(uint64_t addr, uint16_t value) {
-        if (!is_safe_mmio_address(addr, 2)) {
-            cout << "MMIO: Unsafe write16 at 0x"; 
-            char hex[17]; uint64_to_hex_string(addr, hex); 
-            cout << hex << "\n";
-            return false;
-        }
-        *(volatile uint16_t*)addr = value;
-        return true;
-    }
-
-    bool mmio_write_32(uint64_t addr, uint32_t value) {
-        if (!is_safe_mmio_address(addr, 4)) {
-            cout << "MMIO: Unsafe write32 at 0x"; 
-            char hex[17]; uint64_to_hex_string(addr, hex); 
-            cout << hex << "\n";
-            return false;
-        }
-        *(volatile uint32_t*)addr = value;
-        return true;
-    }
-
-    bool mmio_write_64(uint64_t addr, uint64_t value) {
-        if (!is_safe_mmio_address(addr, 8)) {
-            cout << "MMIO: Unsafe write64 at 0x"; 
-            char hex[17]; uint64_to_hex_string(addr, hex); 
-            cout << hex << "\n";
-            return false;
-        }
-        *(volatile uint64_t*)addr = value;
-        return true;
-    }
-
-    // String management functions
-    const char* alloc_string(int len) {
-        if(string_pool_top + len + 1 > STRING_POOL_SIZE) {
-            string_pool_top = 0; // Simple reset
-        }
-        if(string_pool_top + len + 1 > STRING_POOL_SIZE) return nullptr;
-        char* result = &string_pool[string_pool_top];
-        string_pool_top += len + 1;
-        return result;
-    }
-
-    const char* concat_strings(const char* a, const char* b) {
-        if(!a) a = "";
-        if(!b) b = "";
-        int len_a = tcc_strlen(a);
-        int len_b = tcc_strlen(b);
-        const char* result = alloc_string(len_a + len_b);
-        if(!result) return "";
-        char* dest = (char*)result;
-        simple_memcpy(dest, a, len_a);
-        simple_memcpy(dest + len_a, b, len_b + 1);
-        return result;
-    }
-
-    const char* int_to_string_vm(int value) {
-        static char temp_buf[16];
-        int_to_string(value, temp_buf);
-        int len = tcc_strlen(temp_buf);
-        const char* result = alloc_string(len);
-        if(!result) return "";
-        simple_memcpy((char*)result, temp_buf, len + 1);
-        return result;
-    }
-
-    const char* substring(const char* str, int start, int len) {
-        if(!str) return "";
-        int str_len = tcc_strlen(str);
-        if(start < 0 || start >= str_len || len <= 0) return "";
-        if(start + len > str_len) len = str_len - start;
-        
-        const char* result = alloc_string(len);
-        if(!result) return "";
-        char* dest = (char*)result;
-        simple_memcpy(dest, str + start, len);
-        dest[len] = 0;
-        return result;
-    }
-
-    int string_compare(const char* a, const char* b) {
-        if(!a && !b) return 0;
-        if(!a) return -1;
-        if(!b) return 1;
-        return simple_strcmp(a, b);
-    }
-
-    // String search and manipulation functions (abbreviated for space)
-    int find_char(const char* str, char c) {
-        if(!str) return -1;
-        for(int i = 0; str[i]; i++) {
-            if(str[i] == c) return i;
-        }
-        return -1;
-    }
-
-    int find_last_char(const char* str, char c) {
-        if(!str) return -1;
-        int last_pos = -1;
-        for(int i = 0; str[i]; i++) {
-            if(str[i] == c) last_pos = i;
-        }
-        return last_pos;
-    }
-
-    int find_string(const char* haystack, const char* needle) {
-        if(!haystack || !needle) return -1;
-        if(!needle[0]) return 0;
-        
-        int hay_len = tcc_strlen(haystack);
-        int needle_len = tcc_strlen(needle);
-        if(needle_len > hay_len) return -1;
-        
-        for(int i = 0; i <= hay_len - needle_len; i++) {
-            int j;
-            for(j = 0; j < needle_len; j++) {
-                if(haystack[i + j] != needle[j]) break;
-            }
-            if(j == needle_len) return i;
-        }
-        return -1;
-    }
-
-    int string_contains(const char* str, const char* substr) {
-        return find_string(str, substr) != -1 ? 1 : 0;
-    }
-
-    int string_starts_with(const char* str, const char* prefix) {
-        if(!str || !prefix) return 0;
-        if(!prefix[0]) return 1;
-        
+    // Variable management (simplified implementations)
+    void execute_int_declaration(const char* decl) {
+        char var_name[64];
         int i = 0;
-        while(prefix[i] && str[i]) {
-            if(str[i] != prefix[i]) return 0;
+        
+        while (decl[i] && decl[i] != ' ' && decl[i] != '=' && i < 63) {
+            var_name[i] = decl[i];
             i++;
         }
-        return prefix[i] == 0 ? 1 : 0;
-    }
-
-    int string_ends_with(const char* str, const char* suffix) {
-        if(!str || !suffix) return 0;
-        if(!suffix[0]) return 1;
+        var_name[i] = '\0';
         
-        int str_len = tcc_strlen(str);
-        int suffix_len = tcc_strlen(suffix);
-        if(suffix_len > str_len) return 0;
-        
-        int start_pos = str_len - suffix_len;
-        for(int i = 0; i < suffix_len; i++) {
-            if(str[start_pos + i] != suffix[i]) return 0;
-        }
-        return 1;
-    }
-
-    int count_char(const char* str, char c) {
-        if(!str) return 0;
-        int count = 0;
-        for(int i = 0; str[i]; i++) {
-            if(str[i] == c) count++;
-        }
-        return count;
-    }
-
-    const char* replace_char(const char* str, char old_char, char new_char) {
-        if(!str) return "";
-        int len = tcc_strlen(str);
-        const char* result = alloc_string(len);
-        if(!result) return "";
-        
-        char* dest = (char*)result;
-        for(int i = 0; i < len; i++) {
-            dest[i] = (str[i] == old_char) ? new_char : str[i];
-        }
-        dest[len] = 0;
-        return result;
-    }
-
-    // Check if values on stack are strings
-    bool is_string_ptr(int val) {
-        const char* ptr = (const char*)val;
-        return (ptr >= P->lit && ptr < P->lit + P->lit_top) ||
-               (ptr >= string_pool && ptr < string_pool + string_pool_top);
-    }
-
-    // Array management functions
-    int alloc_array(int size) {
-        if(array_count >= MAX_ARRAYS) return 0;
-        Array& arr = arrays[array_count];
-        arr.size = size;
-        arr.capacity = size;
-        static int array_pool[MAX_ARRAYS * 256];
-        static int pool_offset = 0;
-        if(pool_offset + size > MAX_ARRAYS * 256) return 0;
-        arr.data = &array_pool[pool_offset];
-        pool_offset += size;
-        for(int i = 0; i < size; i++) arr.data[i] = 0;
-        return ++array_count;
-    }
-
-    Array* get_array(int handle) {
-        if(handle <= 0 || handle > array_count) return nullptr;
-        return &arrays[handle - 1];
-    }
-
-    int resize_array(int handle, int new_size) {
-        Array* arr = get_array(handle);
-        if(!arr || new_size <= 0) return 0;
-        
-        int new_handle = alloc_array(new_size);
-        Array* new_arr = get_array(new_handle);
-        if(!new_arr) return 0;
-        
-        int copy_size = (arr->size < new_size) ? arr->size : new_size;
-        for(int i = 0; i < copy_size; i++) {
-            new_arr->data[i] = arr->data[i];
-        }
-        return new_handle;
-    }
-
-    // NEW: Create hardware device info array
-    int create_device_info_array(int device_index) {
-        if(device_index < 0 || device_index >= hardware_count) return 0;
-        
-        const HardwareDevice& dev = hardware_registry[device_index];
-        
-        // Create array with device info: [vendor_id, device_id, base_addr_low, base_addr_high, size_low, size_high, device_type]
-        int handle = alloc_array(7);
-        Array* arr = get_array(handle);
-        if(!arr) return 0;
-        
-        arr->data[0] = dev.vendor_id;
-        arr->data[1] = dev.device_id;
-        arr->data[2] = (uint32_t)(dev.base_address & 0xFFFFFFFF);      // low 32 bits
-        arr->data[3] = (uint32_t)((dev.base_address >> 32) & 0xFFFFFFFF); // high 32 bits
-        arr->data[4] = (uint32_t)(dev.size & 0xFFFFFFFF);              // size low 32 bits
-        arr->data[5] = (uint32_t)((dev.size >> 32) & 0xFFFFFFFF);      // size high 32 bits
-        arr->data[6] = dev.device_type;
-        
-        return handle;
-    }
-
-    // NEW: Create array containing all hardware devices
-    int create_hardware_array() {
-        if(hardware_array_handle > 0) return hardware_array_handle; // Return existing handle
-        
-        hardware_array_handle = alloc_array(hardware_count * 7); // 7 fields per device
-        Array* arr = get_array(hardware_array_handle);
-        if(!arr) return 0;
-        
-        for(int i = 0; i < hardware_count; i++) {
-            const HardwareDevice& dev = hardware_registry[i];
-            int base = i * 7;
-            arr->data[base + 0] = dev.vendor_id;
-            arr->data[base + 1] = dev.device_id;
-            arr->data[base + 2] = (uint32_t)(dev.base_address & 0xFFFFFFFF);
-            arr->data[base + 3] = (uint32_t)((dev.base_address >> 32) & 0xFFFFFFFF);
-            arr->data[base + 4] = (uint32_t)(dev.size & 0xFFFFFFFF);
-            arr->data[base + 5] = (uint32_t)((dev.size >> 32) & 0xFFFFFFFF);
-            arr->data[base + 6] = dev.device_type;
+        int value = 0;
+        const char* equals = strchr(decl, '=');
+        if (equals) {
+            equals++;
+            while (*equals == ' ') equals++;
+            value = parse_number(equals);
         }
         
-        return hardware_array_handle;
+        set_variable(var_name, value, false);
+        cout << "int " << var_name << " = " << value << "\n";;
     }
-
-    int run(TProgram& prog, int ac, const char** av, uint64_t base, int p){
-        P=&prog; argc=ac; argv=av; sp=0; ahci_base=base; port=p;
-        for (int i=0;i<TProgram::LOC_MAX;i++) locals[i]=0;
-        array_count = 0;
-        hardware_array_handle = 0;
-        string_pool_top = 0;
-        int ip=0;
+    
+    void execute_string_declaration(const char* decl) {
+        char var_name[64];
+        int i = 0;
         
-        // Initialize arrays declared in locals
-        for(int i = 0; i < P->loc_count; i++) {
-            if(P->loc_type[i] == 3 || P->loc_type[i] == 4) {
-                int arr_handle = alloc_array(P->loc_array_size[i]);
-                locals[i] = arr_handle;
+        while (decl[i] && decl[i] != ' ' && decl[i] != '=' && i < 63) {
+            var_name[i] = decl[i];
+            i++;
+        }
+        var_name[i] = '\0';
+        
+        const char* value = "";
+        const char* equals = strchr(decl, '=');
+        if (equals) {
+            equals++;
+            while (*equals == ' ') equals++;
+            if (*equals == '"') {
+                equals++; // Skip opening quote
+                static char string_buf[256];
+                int j = 0;
+                while (*equals && *equals != '"' && j < 255) {
+                    string_buf[j++] = *equals++;
+                }
+                string_buf[j] = '\0';
+                value = string_buf;
             }
         }
         
-        while(ip < P->pc){
-            TOp op = (TOp)P->code[ip++];
-            switch(op){
-                case T_NOP: break;
-                case T_PUSH_IMM: { int v= *(int*)&P->code[ip]; ip+=4; push(v); } break;
-                case T_PUSH_STR: { int p= *(int*)&P->code[ip]; ip+=4; push(p); } break;
-                case T_LOAD_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; push(locals[i]); } break;
-                case T_STORE_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; locals[i]=pop(); } break;
-                case T_POP: { if(sp) --sp; } break;
-
-                // Enhanced ADD operation - handles both integers and string concatenation
-                case T_ADD: { 
-                    int b=pop(), a=pop(); 
-                    if(is_string_ptr(a) || is_string_ptr(b)) {
-                        const char* result = concat_strings((const char*)a, (const char*)b);
-                        push((int)result);
-                    } else {
-                        push(a+b);
-                    }
-                } break;
-                case T_SUB: { int b=pop(), a=pop(); push(a-b);} break;
-                case T_MUL: { int b=pop(), a=pop(); push(a*b);} break;
-                case T_DIV: { int b=pop(), a=pop(); push(b? a/b:0);} break;
-                case T_NEG: { int a=pop(); push(-a);} break;
-
-                // Enhanced comparison operations - handle string comparisons
-                case T_EQ: { 
-                    int b=pop(), a=pop(); 
-                    if(is_string_ptr(a) || is_string_ptr(b)) {
-                        push(string_compare((const char*)a, (const char*)b) == 0 ? 1 : 0);
-                    } else {
-                        push(a==b);
-                    }
-                } break;
-                case T_NE: { 
-                    int b=pop(), a=pop(); 
-                    if(is_string_ptr(a) || is_string_ptr(b)) {
-                        push(string_compare((const char*)a, (const char*)b) != 0 ? 1 : 0);
-                    } else {
-                        push(a!=b);
-                    }
-                } break;
-                case T_LT: { 
-                    int b=pop(), a=pop(); 
-                    if(is_string_ptr(a) || is_string_ptr(b)) {
-                        push(string_compare((const char*)a, (const char*)b) < 0 ? 1 : 0);
-                    } else {
-                        push(a<b);
-                    }
-                } break;
-                case T_LE: { 
-                    int b=pop(), a=pop(); 
-                    if(is_string_ptr(a) || is_string_ptr(b)) {
-                        push(string_compare((const char*)a, (const char*)b) <= 0 ? 1 : 0);
-                    } else {
-                        push(a<=b);
-                    }
-                } break;
-                case T_GT: { 
-                    int b=pop(), a=pop(); 
-                    if(is_string_ptr(a) || is_string_ptr(b)) {
-                        push(string_compare((const char*)a, (const char*)b) > 0 ? 1 : 0);
-                    } else {
-                        push(a>b);
-                    }
-                } break;
-                case T_GE: { 
-                    int b=pop(), a=pop(); 
-                    if(is_string_ptr(a) || is_string_ptr(b)) {
-                        push(string_compare((const char*)a, (const char*)b) >= 0 ? 1 : 0);
-                    } else {
-                        push(a>=b);
-                    }
-                } break;
-
-                case T_JMP: { int t=*(int*)&P->code[ip]; ip=t; } break;
-                case T_JZ:  { int t=*(int*)&P->code[ip]; ip+=4; int v=pop(); if(v==0) ip=t; } break;
-                case T_JNZ: { int t=*(int*)&P->code[ip]; ip+=4; int v=pop(); if(v!=0) ip=t; } break;
-
-                case T_PRINT_INT: { int v=pop(); char b[16]; int_to_string(v,b); cout << b; } break;
-                case T_PRINT_CHAR:{ int v=pop(); char b[2]; b[0]=(char)(v&0xff); b[1]=0; cout << b; } break;
-                case T_PRINT_STR: { const char* p=(const char*)pop(); if(p) cout << p; } break;
-                case T_PRINT_ENDL:{ cout << "\n"; } break;
-                
-                case T_PRINT_INT_ARRAY: {
-                    int handle = pop();
-                    Array* arr = get_array(handle);
-                    if (arr) {
-                        cout << "[";
-                        for (int i = 0; i < arr->size; i++) {
-                            char b[16];
-                            int_to_string(arr->data[i], b);
-                            cout << b;
-                            if (i < arr->size - 1) cout << ", ";
-                        }
-                        cout << "]";
-                    } else {
-                        cout << "(null array)";
-                    }
-                } break;
-
-                case T_PRINT_STRING_ARRAY: {
-                    int handle = pop();
-                    Array* arr = get_array(handle);
-                    if (arr) {
-                        cout << "[";
-                        for (int i = 0; i < arr->size; i++) {
-                            const char* p = (const char*)arr->data[i];
-                            cout << "\"";
-                            if (p) cout << p;
-                            cout << "\"";
-                            if (i < arr->size - 1) cout << ", ";
-                        }
-                        cout << "]";
-                    } else {
-                        cout << "(null array)";
-                    }
-                } break;
-
-                case T_READ_INT: { char t[32]; cin >> t; push(simple_atoi(t)); } break;
-                case T_READ_CHAR:{ char t[4]; cin >> t; push((unsigned char)t[0]); } break;
-                case T_READ_STR: { cin >> str_in; push((int)str_in); } break;
-
-                case T_PUSH_ARGC: { push(argc); } break;
-                case T_PUSH_ARGV_PTR: { int idx=pop(); const char* p=(idx>=0 && idx<argc && argv)? argv[idx]:""; push((int)p); } break;
-
-                // File I/O operations
-                case T_READ_FILE: {
-                    const char* filename = (const char*)pop();
-                    static char file_buffer[4096];
-                    int n = fat32_read_file_to_buffer(ahci_base, port, filename, 
-                                                    (unsigned char*)file_buffer, sizeof(file_buffer)-1);
-                    if(n > 0) {
-                        file_buffer[n] = 0;
-                        push((int)file_buffer);
-                    } else {
-                        push((int)"");
-                    }
-                } break;
-
-                case T_WRITE_FILE: {
-					const char* content = (const char*)pop();
-					const char* filename = (const char*)pop();
-                    int len = tcc_strlen(content);
-                    int result = fat32_write_file(ahci_base, port, filename, 
-                                                (const unsigned char*)content, len);
-                    push(result >= 0 ? 1 : 0);
-                } break;
-
-                case T_APPEND_FILE: {
-                    const char* content = (const char*)pop();
-                    const char* filename = (const char*)pop();
-                    static char existing_buffer[4096];
-                    int n = fat32_read_file_to_buffer(ahci_base, port, filename, 
-                                                    (unsigned char*)existing_buffer, sizeof(existing_buffer)-1);
-                    if(n < 0) n = 0;
-                    existing_buffer[n] = 0;
-                    
-                    int content_len = tcc_strlen(content);
-                    if(n + content_len < sizeof(existing_buffer)) {
-                        simple_memcpy(&existing_buffer[n], content, content_len + 1);
-                        int result = fat32_write_file(ahci_base, port, filename, 
-                                                    (const unsigned char*)existing_buffer, n + content_len);
-                        push(result >= 0 ? 1 : 0);
-                    } else {
-                        push(0);
-                    }
-                } break;
-
-                // Array operations
-                case T_ALLOC_ARRAY: {
-                    int size = pop();
-                    int handle = alloc_array(size);
-                    push(handle);
-                } break;
-
-                case T_LOAD_ARRAY: {
-                    int index = pop();
-                    int handle = pop();
-                    Array* arr = get_array(handle);
-                    if(arr && index >= 0 && index < arr->size) {
-                        push(arr->data[index]);
-                    } else {
-                        push(0);
-                    }
-                } break;
-
-                case T_STORE_ARRAY: {
-                    int value = pop();
-                    int index = pop();
-                    int handle = pop();
-                    Array* arr = get_array(handle);
-                    if(arr && index >= 0 && index < arr->size) {
-                        arr->data[index] = value;
-                    }
-                } break;
-
-                case T_ARRAY_SIZE: {
-                    int handle = pop();
-                    Array* arr = get_array(handle);
-                    push(arr ? arr->size : 0);
-                } break;
-
-                case T_ARRAY_RESIZE: {
-                    int new_size = pop();
-                    int handle = pop();
-                    int new_handle = resize_array(handle, new_size);
-                    push(new_handle);
-                } break;
-
-                // String operations
-                case T_STR_CONCAT: {
-                    const char* b = (const char*)pop();
-                    const char* a = (const char*)pop();
-                    const char* result = concat_strings(a, b);
-                    push((int)result);
-                } break;
-
-                case T_STR_LENGTH: {
-                    const char* str = (const char*)pop();
-                    push(str ? tcc_strlen(str) : 0);
-                } break;
-
-                case T_STR_SUBSTR: {
-                    int len = pop();
-                    int start = pop();
-                    const char* str = (const char*)pop();
-                    const char* result = substring(str, start, len);
-                    push((int)result);
-                } break;
-
-                case T_INT_TO_STR: {
-                    int value = pop();
-                    const char* result = int_to_string_vm(value);
-                    push((int)result);
-                } break;
-
-                case T_STR_COMPARE: {
-                    const char* b = (const char*)pop();
-                    const char* a = (const char*)pop();
-                    push(string_compare(a, b));
-                } break;
-
-                // String search operations
-                case T_STR_FIND_CHAR: {
-                    char c = (char)pop();
-                    const char* str = (const char*)pop();
-                    push(find_char(str, c));
-                } break;
-
-                case T_STR_FIND_STR: {
-                    const char* needle = (const char*)pop();
-                    const char* haystack = (const char*)pop();
-                    push(find_string(haystack, needle));
-                } break;
-
-                case T_STR_FIND_LAST_CHAR: {
-                    char c = (char)pop();
-                    const char* str = (const char*)pop();
-                    push(find_last_char(str, c));
-                } break;
-
-                case T_STR_CONTAINS: {
-                    const char* substr = (const char*)pop();
-                    const char* str = (const char*)pop();
-                    push(string_contains(str, substr));
-                } break;
-
-                case T_STR_STARTS_WITH: {
-                    const char* prefix = (const char*)pop();
-                    const char* str = (const char*)pop();
-                    push(string_starts_with(str, prefix));
-                } break;
-
-                case T_STR_ENDS_WITH: {
-                    const char* suffix = (const char*)pop();
-                    const char* str = (const char*)pop();
-                    push(string_ends_with(str, suffix));
-                } break;
-
-                case T_STR_COUNT_CHAR: {
-                    char c = (char)pop();
-                    const char* str = (const char*)pop();
-                    push(count_char(str, c));
-                } break;
-
-                case T_STR_REPLACE_CHAR: {
-                    char new_char = (char)pop();
-                    char old_char = (char)pop();
-                    const char* str = (const char*)pop();
-                    const char* result = replace_char(str, old_char, new_char);
-                    push((int)result);
-                } break;
-
-                // NEW: Hardware Discovery and MMIO Operations
-                case T_SCAN_HARDWARE: {
-                    int count = scan_hardware();
-                    push(count);
-                    cout << "Hardware scan found "; 
-                    char buf[16]; int_to_string(count, buf); cout << buf;
-                    cout << " devices\n";
-                    
-                    // Display memory map
-                    cout << "\n=== Memory Map ===\n";
-                    for(int i = 0; i < count; i++) {
-                        const HardwareDevice& dev = hardware_registry[i];
-                        cout << "Device "; int_to_string(i, buf); cout << buf; cout << ": ";
-                        cout << dev.description << "\n";
-                        cout << "  Base: 0x"; 
-                        char hex64[17]; uint64_to_hex_string(dev.base_address, hex64); 
-                        cout << hex64;
-                        cout << " - 0x";
-                        uint64_to_hex_string(dev.base_address + dev.size - 1, hex64);
-                        cout << hex64;
-                        cout << " (Size: 0x";
-                        uint64_to_hex_string(dev.size, hex64);
-                        cout << hex64 << ")\n";
-                        
-                        cout << "  Vendor: 0x";
-                        char hex32[9]; uint32_to_hex_string(dev.vendor_id, hex32);
-                        cout << hex32;
-                        cout << " Device: 0x";
-                        uint32_to_hex_string(dev.device_id, hex32);
-                        cout << hex32 << "\n\n";
-                    }
-                } break;
-
-                case T_GET_DEVICE_INFO: {
-                    int device_index = pop();
-                    int handle = create_device_info_array(device_index);
-                    push(handle);
-                } break;
-
-                case T_GET_HARDWARE_ARRAY: {
-                    int handle = create_hardware_array();
-                    push(handle);
-                } break;
-
-                case T_DISPLAY_MEMORY_MAP: {
-                    cout << "\n=== System Memory Map ===\n";
-                    cout << "Address Range                    | Size     | Device Type | Description\n";
-                    cout << "--------------------------------|----------|-------------|------------------\n";
-                    
-                    for(int i = 0; i < hardware_count; i++) {
-                        const HardwareDevice& dev = hardware_registry[i];
-                        
-                        // Display start address
-                        char hex_start[17], hex_end[17], hex_size[17];
-                        uint64_to_hex_string(dev.base_address, hex_start);
-                        uint64_to_hex_string(dev.base_address + dev.size - 1, hex_end);
-                        uint64_to_hex_string(dev.size, hex_size);
-                        
-                        cout << "0x" << hex_start << " - 0x" << hex_end << " | 0x" << hex_size;
-                        
-                        // Device type
-                        cout << " | ";
-                        switch(dev.device_type) {
-                            case 1: cout << "Storage    "; break;
-                            case 2: cout << "Network    "; break; 
-                            case 3: cout << "Graphics   "; break;
-                            case 4: cout << "Audio      "; break;
-                            case 5: cout << "USB        "; break;
-                            default: cout << "Unknown    "; break;
-                        }
-                        
-                        cout << " | " << dev.description << "\n";
-                    }
-                    
-                    cout << "\nTotal devices: ";
-                    char buf[16]; int_to_string(hardware_count, buf);
-                    cout << buf << "\n";
-                    push(hardware_count); // Return device count
-                } break;
-
-                case T_MMIO_READ8: {
-                    uint64_t addr = (uint64_t)pop();
-                    uint8_t value = mmio_read_8(addr);
-                    push((int)value);
-                } break;
-
-                case T_MMIO_READ16: {
-                    uint64_t addr = (uint64_t)pop();
-                    uint16_t value = mmio_read_16(addr);
-                    push((int)value);
-                } break;
-
-                case T_MMIO_READ32: {
-                    uint64_t addr = (uint64_t)pop();
-                    uint32_t value = mmio_read_32(addr);
-                    push((int)value);
-                } break;
-
-                case T_MMIO_READ64: {
-                    uint64_t addr = (uint64_t)pop();
-                    uint64_t value = mmio_read_64(addr);
-                    push((int)(value >> 32));    // high 32 bits first
-                    push((int)(value & 0xFFFFFFFF)); // low 32 bits second
-                } break;
-
-                case T_MMIO_WRITE8: {
-                    uint8_t value = (uint8_t)pop();
-                    uint64_t addr = (uint64_t)pop();
-                    bool success = mmio_write_8(addr, value);
-                    push(success ? 1 : 0);
-                } break;
-
-                case T_MMIO_WRITE16: {
-                    uint16_t value = (uint16_t)pop();
-                    uint64_t addr = (uint64_t)pop();
-                    bool success = mmio_write_16(addr, value);
-                    push(success ? 1 : 0);
-                } break;
-
-                case T_MMIO_WRITE32: {
-                    uint32_t value = (uint32_t)pop();
-                    uint64_t addr = (uint64_t)pop();
-                    bool success = mmio_write_32(addr, value);
-                    push(success ? 1 : 0);
-                } break;
-
-                case T_MMIO_WRITE64: {
-                    uint32_t high32 = (uint32_t)pop();
-                    uint32_t low32 = (uint32_t)pop();
-                    uint64_t addr = (uint64_t)pop();
-                    uint64_t value = ((uint64_t)high32 << 32) | low32;
-                    bool success = mmio_write_64(addr, value);
-                    push(success ? 1 : 0);
-                } break;
-
-                case T_RET: { int rv=pop(); return rv; }
-                default: return -1;
+        set_string_variable(var_name, value);
+        cout << "string " << var_name << " = \"" << value << "\"\n";
+    }
+    
+    void execute_assignment(const char* assign) {
+        const char* equals = strchr(assign, '=');
+        if (!equals) return;
+        
+        char var_name[64];
+        int i = 0;
+        const char* p = assign;
+        
+        while (p < equals && *p != ' ' && i < 63) {
+            var_name[i++] = *p++;
+        }
+        var_name[i] = '\0';
+        
+        equals++;
+        while (*equals == ' ') equals++;
+        
+        int value = parse_number(equals);
+        set_variable(var_name, value, false);
+        
+        cout << var_name << " = " << value << "\n";
+    }
+    
+    void set_variable(const char* name, int value, bool is_string) {
+        Variable* var = find_variable(name);
+        if (!var) {
+            if (variable_count >= 128) return;
+            var = &variables[variable_count++];
+            strcpy(var->name, name);
+        }
+        
+        var->int_value = value;
+        var->is_string = is_string;
+    }
+    
+    void set_string_variable(const char* name, const char* value) {
+        Variable* var = find_variable(name);
+        if (!var) {
+            if (variable_count >= 128) return;
+            var = &variables[variable_count++];
+            strcpy(var->name, name);
+        }
+        
+        strcpy(var->string_value, value);
+        var->is_string = true;
+    }
+    
+    Variable* find_variable(const char* name) {
+        for (int i = 0; i < variable_count; i++) {
+            if (strcmp(variables[i].name, name) == 0) {
+                return &variables[i];
             }
         }
-        return 0;
+        return nullptr;
     }
 };
 
-// ============================================================
-// Enhanced Object I/O (TVM3 - with hardware support)
-// ============================================================
-struct TVMObject {
-    static int save(uint64_t base, int port, const char* path, const TProgram& P){
-        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 128 ];
-        int off=0;
-        buf[off++]='T'; buf[off++]='V'; buf[off++]='M'; buf[off++]='3'; // Version 3 with hardware support
-        *(int*)&buf[off]=P.pc; off+=4;
-        *(int*)&buf[off]=P.lit_top; off+=4;
-        *(int*)&buf[off]=P.loc_count; off+=4;
-        simple_memcpy(&buf[off], P.code, P.pc); off+=P.pc;
-        simple_memcpy(&buf[off], P.lit, P.lit_top); off+=P.lit_top;
-        
-        // Save local variable metadata (names, types, array sizes)
-        for(int i = 0; i < P.loc_count; i++) {
-            int name_len = tcc_strlen(P.loc_name[i]) + 1;
-            simple_memcpy(&buf[off], P.loc_name[i], name_len); off += name_len;
-            buf[off++] = P.loc_type[i];
-            *(int*)&buf[off] = P.loc_array_size[i]; off += 4;
-        }
-        
-        return fat32_write_file(base, port, path, buf, off);
-    }
-    
-    static int load(uint64_t base, int port, const char* path, TProgram& P){
-        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 128 ];
-        int n = fat32_read_file_to_buffer(base, port, path, buf, sizeof(buf));
-        if(n<16) return -1;
-        if(!(buf[0]=='T'&&buf[1]=='V'&&buf[2]=='M'&&(buf[3]=='1'||buf[3]=='2'||buf[3]=='3'))) return -2;
-        int cp=*(int*)&buf[4], lp=*(int*)&buf[8], lc=*(int*)&buf[12];
-        if(cp<0||cp>TProgram::CODE_MAX||lp<0||lp>TProgram::LIT_MAX||lc<0||lc>TProgram::LOC_MAX) return -3;
-        P.pc=cp; P.lit_top=lp; P.loc_count=lc;
-        int off=16;
-        simple_memcpy(P.code, &buf[off], cp); off+=cp;
-        simple_memcpy(P.lit, &buf[off], lp); off+=lp;
-        
-        // Load local variable metadata if TVM2/TVM3 format
-        if(buf[3] >= '2') {
-            for(int i = 0; i < lc; i++) {
-                int name_len = 0;
-                while(off + name_len < n && buf[off + name_len] != 0) name_len++;
-                if(name_len < 32) {
-                    simple_memcpy(P.loc_name[i], &buf[off], name_len + 1);
-                } else {
-                    P.loc_name[i][0] = 0;
-                }
-                off += name_len + 1;
-                P.loc_type[i] = buf[off++];
-                P.loc_array_size[i] = *(int*)&buf[off]; off += 4;
-            }
-        } else {
-            // TVM1 compatibility
-            for(int i = 0; i < lc; i++) {
-                P.loc_name[i][0] = 0;
-                P.loc_type[i] = 0;
-                P.loc_array_size[i] = 0;
-            }
-        }
-        
-        return 0;
-    }
-};
-
-// ============================================================
-// Enhanced compile/run entry points
-// ============================================================
-static int tinyvm_compile_to_obj(uint64_t ahci_base, int port, const char* src_path, const char* obj_path){
-    static char srcbuf[8192];
-    int n = fat32_read_file_to_buffer(ahci_base, port, src_path, (unsigned char*)srcbuf, sizeof(srcbuf)-1);
-    if(n<=0){ cout << "read fail\n"; return -1; }
-    srcbuf[n]=0;
-    TCompiler C; int ok = C.compile(srcbuf);
-    if(ok<0){ cout << "Compilation failed!\n"; return -2; }
-    int w = TVMObject::save(ahci_base, port, obj_path, C.pr);
-    if(w<0){ cout << "write fail\n"; return -3; }
-    return 0;
-}
-
-static int tinyvm_run_obj(uint64_t ahci_base, int port, const char* obj_path, int argc, const char** argv){
-    TProgram P; int r = TVMObject::load(ahci_base, port, obj_path, P);
-    if(r<0){ cout << "load fail\n"; return -1; }
-    TinyVM vm; int rv = vm.run(P, argc, argv, ahci_base, port);
-    char b[16]; int_to_string(rv,b); cout << b;
-    return rv;
-}
-
-// ============================================================
-// Enhanced Shell glue with hardware discovery info
-// ============================================================
-extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename){
-    if (!filename) { cout << "Usage: compile <file.cpp>\n"; return; }
-    static char obj[64]; int i=0; while(filename[i] && i<60){ obj[i]=filename[i]; i++; }
-    while(i>0 && obj[i-1] != '.') i--; obj[i]=0; simple_strcpy(&obj[i], "obj");
-    cout << "Compiling "; cout << filename; cout << "...\n";
-    int r = tinyvm_compile_to_obj(ahci_base, port, filename, obj);
-    if(r==0) { cout << "OK -> "; cout << obj; cout << "\n"; } else { cout << "Compilation failed!\n"; }
-}
-
-extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename){
-    if (!filename) { cout << "Usage: run <file.obj> [args...]\n"; return; }
-    static const char* argvv[16];
-    int argc=0;
-    for(int i=2;i<part_count && argc<16;i++){ argvv[argc++] = parts[i]; }
-    cout << "Executing "; cout << filename; cout << "...\n";
-    tinyvm_run_obj(ahci_base, port, filename, argc, argvv);
-}
-
-extern "C" void cmd_exec(const char* code_text){
-    if(!code_text){ cout<<"No code\n"; return; }
-    TCompiler C; int ok = C.compile(code_text);
-    if(ok<0){ cout << "Compilation failed!\n"; return; }
-    TinyVM vm; TProgram& P = C.pr;
-    static const char* argvv[1] = { };
-    int rv = vm.run(P, 0, argvv, 0, 0); // no file I/O in exec mode
-    char b[16]; int_to_string(rv,b); cout << b;
-}
-
-// ============================================================
-// Hardware info display function for shell
-// ============================================================
-extern "C" void cmd_hardware(){
-    cout << "Scanning hardware...\n";
-    int count = scan_hardware();
-    cout << "Found "; 
-    char buf[16]; int_to_string(count, buf); cout << buf;
-    cout << " hardware devices:\n\n";
-    
-    for(int i = 0; i < count; i++){
-        const HardwareDevice& dev = hardware_registry[i];
-        
-        cout << "Device "; int_to_string(i, buf); cout << buf; cout << ":\n";
-        cout << "  Vendor ID: 0x"; 
-        char hex[9]; uint32_to_hex_string(dev.vendor_id, hex); cout << hex; cout << "\n";
-        cout << "  Device ID: 0x"; 
-        uint32_to_hex_string(dev.device_id, hex); cout << hex; cout << "\n";
-        cout << "  Base Addr: 0x"; 
-        char hex64[17]; uint64_to_hex_string(dev.base_address, hex64); cout << hex64; cout << "\n";
-        cout << "  Size: 0x"; 
-        uint64_to_hex_string(dev.size, hex64); cout << hex64; cout << "\n";
-        cout << "  Type: "; int_to_string(dev.device_type, buf); cout << buf;
-        cout << " ("; cout << dev.description; cout << ")\n\n";
-    }
-    
-    cout << "Hardware devices can now be accessed via:\n";
-    cout << "- scan_hardware() - returns device count\n";
-    cout << "- get_device_info(index) - returns device info array\n"; 
-    cout << "- get_hardware_array() - returns all devices array\n";
-    cout << "- mmio_read8/16/32/64(addr) - read from memory-mapped registers\n";
-    cout << "- mmio_write8/16/32/64(addr, value) - write to memory-mapped registers\n";
-}
-
-// --- COMMAND PROMPT (Rewritten for better argument parsing) ---
-void command_prompt() {
-    char line[MAX_COMMAND_LENGTH + 1];
-    ahci_base = disk_init(); 
-    int port = 0; 
-    bool fat32_initialized = false;
-
-    cout << "Kernel Command Prompt. Type 'help' for commands.\n\n";
-
-    while (true) {
-        cout << "> ";
-        cin >> line; // Use getline to read the whole line
-
-        // --- Argument Parser ---
-        char* parts[10] = {nullptr}; // Increased parts for more args
-        int part_count = 0;
-        char* next_part = line;
-        
-        while (part_count < 10 && next_part && *next_part != '\0') {
-            // Skip leading spaces
-            while (*next_part == ' ') next_part++;
-            if (*next_part == '\0') break;
-
-            parts[part_count++] = next_part;
-            char* space = simple_strchr(next_part, ' ');
-            if (space) {
-                *space = '\0';
-                next_part = space + 1;
-            } else {
-                next_part = nullptr;
-            }
-        }
-        
-        char* cmd = parts[0];
-        char* arg1 = parts[1];
-        char* arg2 = parts[2];
-
-        if (!cmd || *cmd == '\0') continue;
-
-        // --- Command Handling ---
-        if (stricmp(cmd, "help") == 0) cmd_help();
-		// inside commandprompt() command handling:
-		else if (stricmp(cmd, "compile") == 0) {
-			cmd_compile(ahci_base, port, arg1);
-		}
-		
-		else if (stricmp(cmd, "run") == 0) {
-			cmd_run(ahci_base, port, arg1);
-		}
-		else if (stricmp(cmd, "exec") == 0) {
-			// For exec, we need to handle the rest of the line as code
-			char* code_start = line;
-			while (*code_start && *code_start != ' ') code_start++; // Skip "exec"
-			while (*code_start == ' ') code_start++; // Skip spaces
-			if (*code_start != '\0') {
-				cmd_exec(code_start);
-			} else {
-				cout << "Usage: exec <code>\n";
-			}
-		}
-        else if (stricmp(cmd, "clear") == 0) terminal_clear_screen();
-        else if (stricmp(cmd, "formatfs") == 0) cmd_formatfs(ahci_base, port);
-        else if (stricmp(cmd, "mount") == 0) {
-            if (fat32_init(ahci_base, port)) { 
-                fat32_initialized = true; 
-                cout << "FAT32 mounted.\n"; 
-            } else { 
-                cout << "Failed to mount. Is disk formatted?\n"; 
-            }
-        }
-        else if (stricmp(cmd, "unmount") == 0) { 
-            fat32_initialized = false; 
-            cout << "Filesystem unmounted.\n"; 
-        }
-        else {
-            if (!fat32_initialized) {
-                 cout << "Filesystem not mounted. Use 'mount' first.\n";
-            } else {
-                if (stricmp(cmd, "ls") == 0) fat32_list_files(ahci_base, port);
-                else if (stricmp(cmd, "rm") == 0) { 
-                    if(arg1) fat32_remove_file(ahci_base, port, arg1); 
-                    else cout << "Usage: rm <filename>\n"; 
-                }
-				else if (stricmp(cmd, "kbtest") == 0) {
-					xhci_init();
-					usb_keyboard_self_test();
-				}
-                else if (stricmp(cmd, "pong") == 0) {
-                  start_pong_game();
-                }
-                else if (stricmp(cmd, "chkdsk") == 0) {
-                  cmd_chkdsk(ahci_base, port);
-                }
-                else if (stricmp(cmd, "notepad") == 0) { // RENAME command
-                    if(arg1) {
-                      cmd_notepad(arg1);  // arg1 can be nullptr for new file
-                    } else cout << "Usage: notepad <file_name>\n";
-                }
-                else if (stricmp(cmd, "cat") == 0) {
-                    cmd_cat(ahci_base, port, arg1);
-                }
-                else if (stricmp(cmd, "mv") == 0) { // RENAME command
-                    if(arg1 && arg2) {
-                        if (fat32_rename_file(ahci_base, port, arg1, arg2) == 0) cout << "File renamed.\n";
-                        else cout << "Error renaming file.\n";
-                    } else cout << "Usage: mv <old_name> <new_name>\n";
-                }
-                else if (stricmp(cmd, "cp") == 0) { // COPY command
-                    if(arg1 && arg2) {
-                        if (fat32_copy_file(ahci_base, port, arg1, arg2) == 0) cout << "File copied.\n";
-                        else cout << "Error copying file.\n";
-                    } else cout << "Usage: cp <source> <destination>\n";
-                }
-                else { cout << "Unknown command: '" << cmd << "'\n"; }
-            }
-        }
-    }
-}
+//=============================================================================
+// KERNEL INTEGRATION
+//=============================================================================
 
 
-// --- KERNEL ENTRY POINT ---
+
+// --- ENHANCED KERNEL ENTRY POINT WITH NOTEPAD AND FILE OPERATIONS ---
 extern "C" void kernel_main() {
     terminal_initialize(); 
     init_terminal_io(); 
@@ -2915,5 +1568,145 @@ extern "C" void kernel_main() {
     
     cout << "FAT32 Filesystem Support Ready.\n\n";
     
-    command_prompt();
+    uint64_t ahci_base = disk_init();
+    int port = 0;
+
+    // Initialize filesystem
+    bool fat32_initialized = false;
+    if (fat32_init(ahci_base, port)) {
+        fat32_initialized = true;
+        cout << "FAT32 filesystem mounted.\n";
+    }
+
+    RTCompiler compiler(ahci_base, port);
+    cout << "=== Real-Time CPP Compiler with Native Libraries ===\n";
+    
+    char cmd[256];
+    while (true) {
+        cout << "rtcpp> ";
+        cin >> cmd;
+        
+        if (strcmp(cmd, "exit") == 0) {
+            break;
+        }
+        else if (strcmp(cmd, "list") == 0) {
+            compiler.list_available_functions();
+        }
+        else if (strncmp(cmd, "run ", 4) == 0) {
+            compiler.compile_and_run_file(cmd + 4);
+        }
+        
+        // NEW: Load and run file from filesystem
+		else if (strncmp(cmd, "load ", 5) == 0) {
+			const char* filename = cmd + 5;
+			cout << "Loading and running: " << filename << "\n";
+			
+			// Read file content
+			static char code_buffer[8192];
+			int bytes_read = fat32_read_file(ahci_base, port, filename,
+													 (unsigned char*)code_buffer,
+													 sizeof(code_buffer) - 1);
+			
+			if (bytes_read > 0) {
+				code_buffer[bytes_read] = '\0';
+				cout << "File loaded (" << bytes_read << " bytes)\n";
+				
+				// Use the existing compile_and_run_file method with a temporary file
+				static char temp_filename[] = "temp_exec.cpp";
+				
+				int save_result = fat32_write_file(ahci_base, port, temp_filename, 
+												  code_buffer, bytes_read);
+				
+				if (save_result == 0) {
+					compiler.compile_and_run_file(temp_filename);
+					fat32_remove_file(ahci_base, port, temp_filename);
+				} else {
+					cout << "Error: Could not create temporary execution file\n";
+				}
+			} else {
+				cout << "Error: Could not load file " << filename << "\n";
+			}
+		}
+        // NEW: Save code to file
+        else if (strncmp(cmd, "save ", 5) == 0) {
+            // Parse: save filename "code content"
+            const char* args = cmd + 5;
+            
+            // Find filename (up to first space)
+            char filename[64];
+            int i = 0;
+            while (args[i] && args[i] != ' ' && i < 63) {
+                filename[i] = args[i];
+                i++;
+            }
+            filename[i] = '\0';
+            
+            // Find quoted content
+            const char* content_start = strchr(args, '"');
+            if (content_start) {
+                content_start++; // Skip opening quote
+                const char* content_end = strrchr(content_start, '"');
+                
+                if (content_end && content_end > content_start) {
+                    int content_length = content_end - content_start;
+                    
+                    // Save to file
+                    int result = fat32_write_file(ahci_base, port, filename, 
+                                                content_start, content_length);
+                    
+                    if (result == 0) {
+                        cout << "File saved: " << filename << " (" << content_length << " bytes)\n";
+                    } else {
+                        cout << "Error saving file\n";
+                    }
+                } else {
+                    cout << "Error: Missing closing quote\n";
+                }
+            } else {
+                cout << "Usage: save filename \"code content\"\n";
+            }
+        }
+        // NEW: List files in filesystem
+        else if (strcmp(cmd, "ls") == 0) {
+            if (fat32_initialized) {
+                fat32_list_files(ahci_base, port);
+            } else {
+                cout << "Filesystem not mounted\n";
+            }
+        }
+        // NEW: Display file content
+        else if (strncmp(cmd, "cat ", 4) == 0) {
+            const char* filename = cmd + 4;
+            
+            static char view_buffer[4096];
+            int bytes_read = fat32_read_file(ahci_base, port, filename,
+                                                     (unsigned char*)view_buffer,
+                                                     sizeof(view_buffer) - 1);
+            
+            if (bytes_read > 0) {
+                view_buffer[bytes_read] = '\0';
+                cout << "=== " << filename << " ===\n";
+                cout << view_buffer << "\n";
+                cout << "=== End of " << filename << " ===\n";
+            } else {
+                cout << "Error: Could not read file " << filename << "\n";
+            }
+        }
+        // NEW: Help command
+        else if (strcmp(cmd, "help") == 0) {
+            cout << "Available commands:\n";
+            cout << "  list                    - Show available library functions\n";
+            cout << "  run <file.cpp>          - Compile and run CPP file\n";
+            cout << "  load <file.cpp>         - Load and execute file directly\n";
+            cout << "  notepad <file.cpp>      - Edit file with notepad\n";
+            cout << "  save <file> \"content\"   - Save content to file\n";
+            cout << "  ls                      - List files in filesystem\n";
+            cout << "  cat <file>              - Display file content\n";
+            cout << "  help                    - Show this help\n";
+            cout << "  exit                    - Exit compiler\n";
+        }
+        else if (strlen(cmd) > 0) {
+            cout << "Unknown command. Type 'help' for available commands.\n";
+        }
+    }
 }
