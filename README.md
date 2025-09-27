@@ -14,11 +14,12 @@ Keywords:
 "mmio_read8","mmio_read16","mmio_read32","mmio_read64",
 "mmio_write8","mmio_write16","mmio_write32","mmio_write64"
 
-hardware features soon...
+hardware features soon (scan_hardware works)...
 
 sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with your USB drive, the OS is programmed to select sata port 0 for all file operations recommended not to boot on drive 0, use USB or arbitrary drive to install)
 
 TODO: 
 1. inspect functionality of bytecodeVM 
 3. inspect hardware IO in bytecodeVM.
-4. setup USB keyboard HID
+4. fix notepad memory limit glitch
+5. setup USB keyboard HID
