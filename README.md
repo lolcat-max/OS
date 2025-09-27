@@ -20,7 +20,6 @@ sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with 
 
 TODO: 
 1. inspect functionality of bytecodeVM
-2. inspect array functionality 
 3. complete hardware IO in bytecodeVM.
 4. fix notepad memory limit glitch
 5. setup USB keyboard HID
