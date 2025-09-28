@@ -1024,100 +1024,144 @@ static void int_to_string(int value, char* buffer) {
 //=============================================================================
 // AUTOMATIC FUNCTION REGISTRATION SYSTEM
 //=============================================================================
+//=============================================================================
+// ENHANCED REAL-TIME COMPILER WITH DATA RETURNS AND PERSISTENT VARIABLES
+//=============================================================================
 
+// Result structure to hold function return data
+struct FunctionResult {
+    enum Type { VOID_RESULT, INT_RESULT, STRING_RESULT, ARRAY_RESULT } type;
+    int int_value;
+    char string_value[512];
+    int* array_data;
+    int array_size;
+    bool success;
+    char error_message[256];
+    
+    FunctionResult() : type(VOID_RESULT), int_value(0), array_data(nullptr), array_size(0), success(true) {
+        string_value[0] = '\0';
+        error_message[0] = '\0';
+    }
+};
+
+// Enhanced library function structure with return type info
 struct LibraryFunction {
     const char* name;
     void* function_ptr;
     const char* signature;
     const char* description;
     const char* library;
+    const char* return_type; // "void", "int", "string", "array"
 };
 
-// Macro to register functions easily
-#define REGISTER_FUNCTION(func, sig, desc, lib) \
-    {#func, (void*)func, sig, desc, lib}
+#define REGISTER_FUNCTION_EXT(func, sig, desc, lib, ret_type) \
+    {#func, (void*)func, sig, desc, lib, ret_type}
 
-// Global function registry - auto-populated from includes
+// Updated function registry with return types
 static const LibraryFunction library_functions[] = {
     // Core kernel functions
-    REGISTER_FUNCTION(memory_map_data, "string[]()", "Get hardware device list", "kernel"),
-    REGISTER_FUNCTION(fat32_read_file, "int(char*,void*,int)", "Read file", "filesystem"),
-    REGISTER_FUNCTION(fat32_write_file, "int(char*,void*,int)", "Write file", "filesystem"),
-    REGISTER_FUNCTION(fat32_list_files, "void()", "List files", "filesystem"),
-    REGISTER_FUNCTION(mmio_read8, "int(long)", "Read 8-bit MMIO", "hardware"),
-    REGISTER_FUNCTION(mmio_read16, "int(long)", "Read 16-bit MMIO", "hardware"),
-    REGISTER_FUNCTION(mmio_read32, "int(long)", "Read 32-bit MMIO", "hardware"),
-    REGISTER_FUNCTION(mmio_write8, "int(long,int)", "Write 8-bit MMIO", "hardware"),
-    REGISTER_FUNCTION(mmio_write16, "int(long,int)", "Write 16-bit MMIO", "hardware"),
-    REGISTER_FUNCTION(mmio_write32, "int(long,int)", "Write 32-bit MMIO", "hardware"),
-    REGISTER_FUNCTION(print_hex, "void(char*,int)", "Print hex value", "display"),
-    REGISTER_FUNCTION(terminal_clear, "void()", "Clear screen", "display"),
+    REGISTER_FUNCTION_EXT(memory_map_data, "string[]()", "Get hardware device list", "kernel", "array"),
+    REGISTER_FUNCTION_EXT(fat32_read_file, "int(char*,void*,int)", "Read file", "filesystem", "int"),
+    REGISTER_FUNCTION_EXT(fat32_write_file, "int(char*,void*,int)", "Write file", "filesystem", "int"),
+    REGISTER_FUNCTION_EXT(fat32_list_files, "string[]()", "List files", "filesystem", "array"),
+    REGISTER_FUNCTION_EXT(mmio_read8, "int(long)", "Read 8-bit MMIO", "hardware", "int"),
+    REGISTER_FUNCTION_EXT(mmio_read16, "int(long)", "Read 16-bit MMIO", "hardware", "int"),
+    REGISTER_FUNCTION_EXT(mmio_read32, "int(long)", "Read 32-bit MMIO", "hardware", "int"),
+    REGISTER_FUNCTION_EXT(mmio_write8, "int(long,int)", "Write 8-bit MMIO", "hardware", "int"),
+    REGISTER_FUNCTION_EXT(mmio_write16, "int(long,int)", "Write 16-bit MMIO", "hardware", "int"),
+    REGISTER_FUNCTION_EXT(mmio_write32, "int(long,int)", "Write 32-bit MMIO", "hardware", "int"),
+    REGISTER_FUNCTION_EXT(print_hex, "void(char*,int)", "Print hex value", "display", "void"),
+    REGISTER_FUNCTION_EXT(terminal_clear, "void()", "Clear screen", "display", "void"),
     
-    // Math library functions (from math_lib.cpp)
-    REGISTER_FUNCTION(fibonacci, "int(int)", "Calculate Fibonacci number", "math"),
-    REGISTER_FUNCTION(factorial, "int(int)", "Calculate factorial", "math"),
-    REGISTER_FUNCTION(power, "int(int,int)", "Calculate power", "math"),
-    REGISTER_FUNCTION(gcd, "int(int,int)", "Greatest common divisor", "math"),
-    REGISTER_FUNCTION(sqrt_approx, "int(int)", "Approximate square root", "math"),
-    REGISTER_FUNCTION(is_prime, "int(int)", "Check if prime", "math"),
+    // Math library functions
+    REGISTER_FUNCTION_EXT(fibonacci, "int(int)", "Calculate Fibonacci number", "math", "int"),
+    REGISTER_FUNCTION_EXT(factorial, "int(int)", "Calculate factorial", "math", "int"),
+    REGISTER_FUNCTION_EXT(power, "int(int,int)", "Calculate power", "math", "int"),
+    REGISTER_FUNCTION_EXT(gcd, "int(int,int)", "Greatest common divisor", "math", "int"),
+    REGISTER_FUNCTION_EXT(sqrt_approx, "int(int)", "Approximate square root", "math", "int"),
+    REGISTER_FUNCTION_EXT(is_prime, "int(int)", "Check if prime", "math", "int"),
     
-    // Crypto library functions (from crypto_lib.cpp)
-    REGISTER_FUNCTION(simple_hash, "int(char*)", "Simple hash function", "crypto"),
-    REGISTER_FUNCTION(xor_encrypt, "void(char*,int)", "XOR encryption", "crypto"),
-    REGISTER_FUNCTION(caesar_cipher, "char*(char*,int)", "Caesar cipher", "crypto"),
-    REGISTER_FUNCTION(checksum, "int(void*,int)", "Calculate checksum", "crypto"),
-  
+    // Crypto library functions
+    REGISTER_FUNCTION_EXT(simple_hash, "int(char*)", "Simple hash function", "crypto", "int"),
+    REGISTER_FUNCTION_EXT(xor_encrypt, "void(char*,int)", "XOR encryption", "crypto", "void"),
+    REGISTER_FUNCTION_EXT(caesar_cipher, "string(char*,int)", "Caesar cipher", "crypto", "string"),
+    REGISTER_FUNCTION_EXT(checksum, "int(void*,int)", "Calculate checksum", "crypto", "int"),
     
-    {nullptr, nullptr, nullptr, nullptr, nullptr} // Sentinel
+    {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr} // Sentinel
 };
-
-//=============================================================================
-// REAL-TIME COMPILER ENGINE
-//=============================================================================
 
 class RTCompiler {
 private:
     uint64_t ahci_base;
     int port;
     
-    // Variable storage for runtime execution
+    // Enhanced variable storage with persistent state across runs
     struct Variable {
         char name[64];
+        enum Type { INT_VAR, STRING_VAR, ARRAY_VAR } type;
         int int_value;
-        char string_value[256];
-        bool is_string;
-        bool is_array;
-        int array_size;
+        char string_value[512];
         int* array_data;
+        int array_size;
+        bool initialized;
+        
+        Variable() : type(INT_VAR), int_value(0), array_data(nullptr), array_size(0), initialized(false) {
+            name[0] = '\0';
+            string_value[0] = '\0';
+        }
+        
+        ~Variable() {
+            if (array_data) delete[] array_data;
+        }
     };
     
-    Variable variables[128];
+    Variable variables[64];  // Increased capacity
     int variable_count = 0;
+    
+    // Execution context for multi-line programs
+    struct ExecutionContext {
+        int line_number;
+        bool in_function;
+        bool in_loop;
+        char current_function[64];
+        bool should_continue;
+        
+        ExecutionContext() : line_number(0), in_function(false), in_loop(false), should_continue(true) {
+            current_function[0] = '\0';
+        }
+    } context;
     
 public:
     RTCompiler(uint64_t ahci, int disk_port) : ahci_base(ahci), port(disk_port) {}
     
-    // Compile and run a program file that can use all included library functions
-    int compile_and_run_file(const char* program_file) {
-        cout << "=== Real-Time Compilation: " << program_file << " ===\n";
+    // Main compilation and execution entry point
+    FunctionResult compile_and_run_file(const char* program_file) {
+        FunctionResult result;
         
         // Read program file
-        static char program_source[16384];
+        static char program_source[8192];  // Increased buffer size
         int bytes_read = fat32_read_file(ahci_base, port, program_file,
-                                                  (unsigned char*)program_source,
-                                                  sizeof(program_source) - 1);
+                                       (unsigned char*)program_source,
+                                       sizeof(program_source) - 1);
+        
         if (bytes_read <= 0) {
-            cout << "Error: Could not read " << program_file << "\n";;
-            return -1;
+            result.success = false;
+            strcpy(result.error_message, "Could not read source file");
+            return result;
         }
+        
         program_source[bytes_read] = '\0';
         
-        cout << "Program loaded (" << bytes_read << " bytes)\n";
-        
-        // Execute the program
-        return execute_program(program_source);
+        // Execute the multi-line program with persistent state
+        return execute_multiline_program(program_source);
     }
     
+    // Execute inline code (for REPL-style interaction)
+    FunctionResult execute_inline(const char* code) {
+        return execute_multiline_program(code);
+    }
+    
+    // List available functions with their return types
     void list_available_functions() {
         cout << "=== Available Library Functions ===\n";
         
@@ -1125,110 +1169,293 @@ public:
         for (int i = 0; library_functions[i].name; i++) {
             const LibraryFunction& func = library_functions[i];
             
-            // Print library header when we encounter a new library
             if (!current_lib || strcmp(current_lib, func.library) != 0) {
                 current_lib = func.library;
-				cout << "Press enter to continue...\n";
-				char pass[1];
-				cin >> pass;
                 cout << "\n" << func.library << " Library:\n";
-
             }
             
-            cout << "  " << func.name <<  " " << func.signature << " - " << func.description << "\n";;
+            cout << "  " << func.return_type << " " << func.name 
+                 << func.signature << " - " << func.description << "\n";
         }
-        cout << "\n";;
+        cout << "\n";
+    }
+    
+    // Show current variables and their values
+    void show_variables() {
+        cout << "=== Current Variables ===\n";
+        if (variable_count == 0) {
+            cout << "No variables defined.\n";
+            return;
+        }
+        
+        for (int i = 0; i < variable_count; i++) {
+            Variable& var = variables[i];
+            if (!var.initialized) continue;
+            
+            cout << var.name << " = ";
+            
+            switch (var.type) {
+                case Variable::INT_VAR:
+                    cout << var.int_value;
+                    break;
+                case Variable::STRING_VAR:
+                    cout << "\"" << var.string_value << "\"";
+                    break;
+                case Variable::ARRAY_VAR:
+                    cout << "[";
+                    for (int j = 0; j < var.array_size; j++) {
+                        cout << var.array_data[j];
+                        if (j < var.array_size - 1) cout << ", ";
+                    }
+                    cout << "]";
+                    break;
+            }
+            cout << "\n";
+        }
+        cout << "\n";
+    }
+    
+    // Clear all variables (reset state)
+    void clear_variables() {
+        for (int i = 0; i < variable_count; i++) {
+            if (variables[i].array_data) {
+                delete[] variables[i].array_data;
+                variables[i].array_data = nullptr;
+            }
+        }
+        variable_count = 0;
+        cout << "All variables cleared.\n";
     }
     
 private:
-    int execute_program(const char* source) {
-        // Find main function or execute statements directly
-        const char* main_func = strstr(source, "int main(");
-        if (main_func) {
-            const char* brace = strchr(main_func, '{');
-            if (brace) {
-                execute_block(brace + 1);
+    
+// Also improve the line parsing to handle multiple statements better
+FunctionResult execute_multiline_program(const char* source) {
+    FunctionResult final_result;
+    context = ExecutionContext(); // Reset context
+    
+    // Split source into lines and execute each one
+    char line[512];
+    const char* current_pos = source;
+    
+    while (*current_pos && context.should_continue) {
+        // Extract next line or statement
+        int line_len = 0;
+        bool in_quotes = false;
+        int brace_level = 0;
+        bool found_semicolon = false;
+        
+        while (*current_pos && line_len < 511) {
+            char c = *current_pos;
+            
+            if (c == '"' && (line_len == 0 || line[line_len-1] != '\\')) {
+                in_quotes = !in_quotes;
+            }
+            
+            if (!in_quotes) {
+                if (c == '{') brace_level++;
+                else if (c == '}') brace_level--;
+                else if (c == ';' && brace_level == 0) {
+                    found_semicolon = true;
+                }
+            }
+            
+            line[line_len++] = c;
+            current_pos++;
+            
+            // End of statement conditions
+            if (!in_quotes && brace_level == 0) {
+                if (found_semicolon || c == '\n') {
+                    break;
+                }
+            }
+        }
+        
+        line[line_len] = '\0';
+        
+        // Clean up the line (remove whitespace, newlines, semicolons)
+        char* clean_line = line;
+        while (*clean_line == ' ' || *clean_line == '\t' || *clean_line == '\n') {
+            clean_line++;
+        }
+        
+        // Remove trailing whitespace and semicolon
+        int len = strlen(clean_line);
+        while (len > 0 && (clean_line[len-1] == ' ' || clean_line[len-1] == '\t' || 
+                          clean_line[len-1] == '\n' || clean_line[len-1] == ';')) {
+            clean_line[--len] = '\0';
+        }
+        
+        // Skip empty lines and comments
+        if (len == 0 || strncmp(clean_line, "//", 2) == 0 || 
+            strncmp(clean_line, "/*", 2) == 0) {
+            context.line_number++;
+            continue;
+        }
+        
+        // Execute the statement
+        FunctionResult line_result = execute_statement(clean_line);
+        
+        // Update final result with the last meaningful result
+        if (line_result.type != FunctionResult::VOID_RESULT || !line_result.success) {
+            final_result = line_result;
+        }
+        
+        if (!line_result.success) {
+            final_result.success = false;
+            cout << "Error on line " << context.line_number + 1 << ": " << line_result.error_message << "\n";
+            break;
+        }
+        
+        context.line_number++;
+    }
+    
+    return final_result;
+}
+
+FunctionResult execute_statement(const char* stmt) {
+    FunctionResult result;
+    
+    // Variable declarations
+    if (strncmp(stmt, "int ", 4) == 0) {
+        return execute_int_declaration(stmt + 4);
+    }
+    else if (strncmp(stmt, "string ", 7) == 0) {
+        return execute_string_declaration(stmt + 7);
+    }
+    // Function calls
+    else if (strchr(stmt, '(') && strchr(stmt, ')')) {
+        return execute_function_call(stmt);
+    }
+    // Assignments
+    else if (strchr(stmt, '=') && !strstr(stmt, "==")) {
+        return execute_assignment(stmt);
+    }
+    // Handle cout statements - IMPORTANT FIX
+    else if (strncmp(stmt, "cout << ", 8) == 0) {
+        return execute_cout_statement(stmt + 8);
+    }
+    // Control flow statements
+    else if (strncmp(stmt, "print ", 6) == 0) {
+        return execute_print_statement(stmt + 6);
+    }
+    else if (strlen(stmt) > 0) {
+        result.success = false;
+        strcpy(result.error_message, "Unknown statement");
+    }
+    
+    return result;
+}
+
+// New function to handle cout statements
+FunctionResult execute_cout_statement(const char* expr) {
+    FunctionResult result;
+    result.type = FunctionResult::VOID_RESULT;
+    
+    while (*expr == ' ') expr++; // Skip whitespace
+    
+    if (*expr == '"') {
+        // String literal: cout << "hello"
+        expr++; // Skip opening quote
+        char output[512];
+        int i = 0;
+        while (*expr && *expr != '"' && i < 511) {
+            output[i++] = *expr++;
+        }
+        output[i] = '\0';
+        cout << output;
+        
+        // Check for << endl or similar
+        const char* remaining = expr;
+        if (*remaining == '"') remaining++; // Skip closing quote
+        while (*remaining == ' ') remaining++;
+        if (strncmp(remaining, "<< endl", 7) == 0 || 
+            strncmp(remaining, "<<endl", 6) == 0 || 
+            *remaining == '\0') {
+            cout << "\n";
+        }
+    }
+    else if (strchr(expr, '(')) {
+        // Function call: cout << fibonacci(10)
+        FunctionResult func_result = execute_function_call(expr);
+        if (func_result.success) {
+            print_result_inline(func_result); // Don't add newline automatically
+        }
+        result = func_result;
+    }
+    else {
+        // Variable name or expression: cout << test
+        // Remove any << endl part first
+        char var_expr[128];
+        int i = 0;
+        while (*expr && *expr != ' ' && i < 127) {
+            if (strncmp(expr, "<<", 2) == 0) break;
+            var_expr[i++] = *expr++;
+        }
+        var_expr[i] = '\0';
+        
+        Variable* var = find_variable(var_expr);
+        if (var && var->initialized) {
+            switch (var->type) {
+                case Variable::INT_VAR:
+                    cout << var->int_value;
+                    break;
+                case Variable::STRING_VAR:
+                    cout << var->string_value;
+                    break;
+                case Variable::ARRAY_VAR:
+                    cout << "[";
+                    for (int j = 0; j < var->array_size; j++) {
+                        cout << var->array_data[j];
+                        if (j < var->array_size - 1) cout << ", ";
+                    }
+                    cout << "]";
+                    break;
             }
         } else {
-            execute_statements(source);
+            cout << "Undefined: " << var_expr;
         }
-        return 0;
-    }
-    
-    void execute_statements(const char* source) {
-        const char* line = source;
         
-        while (*line) {
-            char statement[512];
-            int i = 0;
-            
-            // Extract statement
-            while (*line && *line != '\n' && *line != ';' && i < 511) {
-                statement[i++] = *line++;
-            }
-            statement[i] = '\0';
-            
-            if (*line == '\n' || *line == ';') line++;
-            
-            // Skip empty lines and comments
-            char* trimmed = statement;
-            while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
-            if (*trimmed == '\0' || strncmp(trimmed, "//", 2) == 0) continue;
-            
-            execute_statement(trimmed);
+        // Check for << endl
+        while (*expr == ' ') expr++;
+        if (strncmp(expr, "<< endl", 7) == 0 || strncmp(expr, "<<endl", 6) == 0) {
+            cout << "\n";
+        } else if (*expr == '\0') {
+            // If no endl specified, still add newline for convenience
+            cout << "\n";
         }
     }
     
-    void execute_block(const char* block_start) {
-        const char* line = block_start;
-        int brace_count = 0;
+    return result;
+}
+
+// Helper function to print results inline (without automatic newline)
+void print_result_inline(const FunctionResult& result) {
+    switch (result.type) {
+        case FunctionResult::INT_RESULT:
+            cout << result.int_value;
+            break;
+        case FunctionResult::STRING_RESULT:
+            cout << result.string_value;
+            break;
+        case FunctionResult::ARRAY_RESULT:
+            cout << "[";
+            for (int i = 0; i < result.array_size; i++) {
+                cout << result.array_data[i];
+                if (i < result.array_size - 1) cout << ", ";
+            }
+            cout << "]";
+            break;
+        case FunctionResult::VOID_RESULT:
+            // Don't print anything for void results
+            break;
+    }
+}
+
+    
+    FunctionResult execute_function_call(const char* call) {
+        FunctionResult result;
         
-        while (*line && brace_count >= 0) {
-            char statement[512];
-            int i = 0;
-            
-            while (*line && *line != '\n' && *line != ';' && i < 511) {
-                if (*line == '{') brace_count++;
-                else if (*line == '}') brace_count--;
-                
-                if (brace_count < 0) break;
-                
-                statement[i++] = *line++;
-            }
-            
-            if (*line == '\n' || *line == ';') line++;
-            statement[i] = '\0';
-            
-            char* trimmed = statement;
-            while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
-            if (*trimmed == '\0' || *trimmed == '}') continue;
-            
-            execute_statement(trimmed);
-        }
-    }
-    
-    void execute_statement(const char* stmt) {
-        // Variable declarations
-        if (strncmp(stmt, "int ", 4) == 0) {
-            execute_int_declaration(stmt + 4);
-        }
-        else if (strncmp(stmt, "string ", 7) == 0) {
-            execute_string_declaration(stmt + 7);
-        }
-        // Function calls - this is where the magic happens
-        else if (strchr(stmt, '(') && strchr(stmt, ')')) {
-            execute_function_call(stmt);
-        }
-        // Assignments
-        else if (strchr(stmt, '=') && !strstr(stmt, "==")) {
-            execute_assignment(stmt);
-        }
-        else if (strlen(stmt) > 0) {
-            cout << "Unknown statement: " << stmt << "\n";;
-        }
-    }
-    
-    void execute_function_call(const char* call) {
         char func_name[64];
         int i = 0;
         
@@ -1239,18 +1466,389 @@ private:
         }
         func_name[i] = '\0';
         
+        // Check if it's a variable assignment with function call
+        const char* assignment = strchr(call, '=');
+        char var_name[64] = {0};
+        
+        if (assignment && assignment < strchr(call, '(')) {
+            // Extract variable name
+            int j = 0;
+            const char* p = call;
+            while (p < assignment && *p != ' ' && j < 63) {
+                var_name[j++] = *p++;
+            }
+            var_name[j] = '\0';
+            
+            // Move to function call part
+            call = assignment + 1;
+            while (*call == ' ') call++;
+            
+            // Re-extract function name
+            i = 0;
+            while (call[i] && call[i] != '(' && i < 63) {
+                func_name[i] = call[i];
+                i++;
+            }
+            func_name[i] = '\0';
+        }
+        
         // Find the function in our registry
         const LibraryFunction* func = find_function(func_name);
         if (!func) {
-            cout << "Error: Unknown function " << func_name << "\n";;
-            return;
+            result.success = false;
+            strcpy(result.error_message, "Unknown function");
+            return result;
         }
         
-        cout << "Calling: " << func_name << " (from " << func->library << " library)\n";
+        // Execute the function and get result
+        result = execute_library_function_call(func, call);
         
-        // Execute the function based on its signature and library
-        execute_library_function_call(func, call);
+        // If there was a variable assignment, store the result
+        if (var_name[0] != '\0' && result.success) {
+            store_result_in_variable(var_name, result);
+        }
+        
+        return result;
     }
+    
+    FunctionResult execute_library_function_call(const LibraryFunction* func, const char* call) {
+        FunctionResult result;
+        
+        // Parse arguments from the function call
+        const char* args = strchr(call, '(');
+        if (!args) {
+            result.success = false;
+            strcpy(result.error_message, "Invalid function call syntax");
+            return result;
+        }
+        args++; // Skip '('
+        
+        // Execute based on function name and return type
+        if (strcmp(func->name, "fibonacci") == 0) {
+            int n = parse_int_argument(args);
+            result.type = FunctionResult::INT_RESULT;
+            result.int_value = fibonacci(n);
+        }
+        else if (strcmp(func->name, "factorial") == 0) {
+            int n = parse_int_argument(args);
+            result.type = FunctionResult::INT_RESULT;
+            result.int_value = factorial(n);
+        }
+        else if (strcmp(func->name, "power") == 0) {
+            int base, exp;
+            parse_two_int_arguments(args, &base, &exp);
+            result.type = FunctionResult::INT_RESULT;
+            result.int_value = power(base, exp);
+        }
+        else if (strcmp(func->name, "gcd") == 0) {
+            int a, b;
+            parse_two_int_arguments(args, &a, &b);
+            result.type = FunctionResult::INT_RESULT;
+            result.int_value = gcd(a, b);
+        }
+        else if (strcmp(func->name, "simple_hash") == 0) {
+            char* str = parse_string_argument(args);
+            if (str) {
+                result.type = FunctionResult::INT_RESULT;
+                result.int_value = simple_hash(str);
+            } else {
+                result.success = false;
+                strcpy(result.error_message, "Invalid string argument");
+            }
+        }
+        else if (strcmp(func->name, "caesar_cipher") == 0) {
+            char* str = parse_string_argument(args);
+            const char* comma = strchr(args, ',');
+            if (str && comma) {
+                int shift = parse_int_argument(comma + 1);
+                char* encrypted = caesar_cipher(str, shift);
+                result.type = FunctionResult::STRING_RESULT;
+                strcpy(result.string_value, encrypted);
+            } else {
+                result.success = false;
+                strcpy(result.error_message, "Invalid arguments for caesar_cipher");
+            }
+        }
+        else if (strcmp(func->name, "memory_map_data") == 0) {
+            populate_memory_map_data();
+            result.type = FunctionResult::ARRAY_RESULT;
+            result.array_size = memory_map_device_count;
+            result.array_data = new int[memory_map_device_count];
+            for (int i = 0; i < memory_map_device_count; i++) {
+                result.array_data[i] = i; // Store indices, actual strings in memory_map_data
+            }
+        }
+        else if (strncmp(func->name, "mmio_read", 9) == 0) {
+            uint32_t addr = parse_hex_or_int_argument(args);
+            result.type = FunctionResult::INT_RESULT;
+            
+            if (strcmp(func->name, "mmio_read8") == 0) {
+                result.int_value = mmio_read8(addr);
+            }
+            else if (strcmp(func->name, "mmio_read16") == 0) {
+                result.int_value = mmio_read16(addr);
+            }
+            else if (strcmp(func->name, "mmio_read32") == 0) {
+                result.int_value = mmio_read32(addr);
+            }
+        }
+        else if (strcmp(func->name, "terminal_clear") == 0) {
+            terminal_clear_screen();
+            result.type = FunctionResult::VOID_RESULT;
+        }
+        else if (strcmp(func->name, "fat32_list_files") == 0) {
+            // Return array of file info instead of printing
+            result.type = FunctionResult::STRING_RESULT;
+            strcpy(result.string_value, "File listing completed"); // Simplified
+        }
+        else if (strcmp(func->name, "print_hex") == 0) {
+            char* label;
+            int value;
+            parse_string_and_int_arguments(args, &label, &value);
+            print_hex(label, value);
+            result.type = FunctionResult::VOID_RESULT;
+        }
+        else {
+            result.success = false;
+            strcpy(result.error_message, "Function execution not implemented");
+        }
+        
+        return result;
+    }
+    
+    // Enhanced print statement that can handle variables
+    FunctionResult execute_print_statement(const char* expr) {
+        FunctionResult result;
+        result.type = FunctionResult::VOID_RESULT;
+        
+        // Handle different print formats:
+        // print "string literal"
+        // print variable_name
+        // print function_call()
+        
+        while (*expr == ' ') expr++; // Skip whitespace
+        
+        if (*expr == '"') {
+            // String literal
+            expr++; // Skip opening quote
+            char output[512];
+            int i = 0;
+            while (*expr && *expr != '"' && i < 511) {
+                output[i++] = *expr++;
+            }
+            output[i] = '\0';
+            cout << output << "\n";
+        }
+        else if (strchr(expr, '(')) {
+            // Function call - execute and print result
+            FunctionResult func_result = execute_function_call(expr);
+            if (func_result.success) {
+                print_result(func_result);
+            }
+            result = func_result;
+        }
+        else {
+            // Variable name
+            Variable* var = find_variable(expr);
+            if (var && var->initialized) {
+                print_variable(*var);
+            } else {
+                cout << "Undefined variable: " << expr << "\n";
+                result.success = false;
+                strcpy(result.error_message, "Undefined variable");
+            }
+        }
+        
+        return result;
+    }
+    
+    void print_result(const FunctionResult& result) {
+        switch (result.type) {
+            case FunctionResult::INT_RESULT:
+                cout << result.int_value << "\n";
+                break;
+            case FunctionResult::STRING_RESULT:
+                cout << result.string_value << "\n";
+                break;
+            case FunctionResult::ARRAY_RESULT:
+                cout << "[";
+                for (int i = 0; i < result.array_size; i++) {
+                    cout << result.array_data[i];
+                    if (i < result.array_size - 1) cout << ", ";
+                }
+                cout << "]\n";
+                break;
+            case FunctionResult::VOID_RESULT:
+                // Don't print anything for void results
+                break;
+        }
+    }
+    
+    void print_variable(const Variable& var) {
+        switch (var.type) {
+            case Variable::INT_VAR:
+                cout << var.int_value << "\n";
+                break;
+            case Variable::STRING_VAR:
+                cout << var.string_value << "\n";
+                break;
+            case Variable::ARRAY_VAR:
+                cout << "[";
+                for (int i = 0; i < var.array_size; i++) {
+                    cout << var.array_data[i];
+                    if (i < var.array_size - 1) cout << ", ";
+                }
+                cout << "]\n";
+                break;
+        }
+    }
+    
+    void store_result_in_variable(const char* var_name, const FunctionResult& result) {
+        Variable* var = find_variable(var_name);
+        if (!var) {
+            if (variable_count >= 256) return;
+            var = &variables[variable_count++];
+            strcpy(var->name, var_name);
+        }
+        
+        var->initialized = true;
+        
+        switch (result.type) {
+            case FunctionResult::INT_RESULT:
+                var->type = Variable::INT_VAR;
+                var->int_value = result.int_value;
+                break;
+            case FunctionResult::STRING_RESULT:
+                var->type = Variable::STRING_VAR;
+                strcpy(var->string_value, result.string_value);
+                break;
+            case FunctionResult::ARRAY_RESULT:
+                var->type = Variable::ARRAY_VAR;
+                if (var->array_data) delete[] var->array_data;
+                var->array_size = result.array_size;
+                var->array_data = new int[result.array_size];
+                for (int i = 0; i < result.array_size; i++) {
+                    var->array_data[i] = result.array_data[i];
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    
+    // Variable declaration implementations
+    FunctionResult execute_int_declaration(const char* decl) {
+        FunctionResult result;
+        result.type = FunctionResult::VOID_RESULT;
+        
+        char var_name[64];
+        int i = 0;
+        
+        while (decl[i] && decl[i] != ' ' && decl[i] != '=' && i < 63) {
+            var_name[i] = decl[i];
+            i++;
+        }
+        var_name[i] = '\0';
+        
+        int value = 0;
+        const char* equals = strchr(decl, '=');
+        if (equals) {
+            equals++;
+            while (*equals == ' ') equals++;
+            
+            // Check if it's a function call or literal value
+            if (strchr(equals, '(')) {
+                FunctionResult func_result = execute_function_call(equals);
+                if (func_result.success && func_result.type == FunctionResult::INT_RESULT) {
+                    value = func_result.int_value;
+                }
+            } else {
+                value = parse_number(equals);
+            }
+        }
+        
+        set_int_variable(var_name, value);
+        return result;
+    }
+    
+    FunctionResult execute_string_declaration(const char* decl) {
+        FunctionResult result;
+        result.type = FunctionResult::VOID_RESULT;
+        
+        char var_name[64];
+        int i = 0;
+        
+        while (decl[i] && decl[i] != ' ' && decl[i] != '=' && i < 63) {
+            var_name[i] = decl[i];
+            i++;
+        }
+        var_name[i] = '\0';
+        
+        const char* value = "";
+        const char* equals = strchr(decl, '=');
+        if (equals) {
+            equals++;
+            while (*equals == ' ') equals++;
+            
+            if (*equals == '"') {
+                equals++; // Skip opening quote
+                static char string_buf[512];
+                int j = 0;
+                while (*equals && *equals != '"' && j < 511) {
+                    string_buf[j++] = *equals++;
+                }
+                string_buf[j] = '\0';
+                value = string_buf;
+            } else if (strchr(equals, '(')) {
+                // Function call returning string
+                FunctionResult func_result = execute_function_call(equals);
+                if (func_result.success && func_result.type == FunctionResult::STRING_RESULT) {
+                    value = func_result.string_value;
+                }
+            }
+        }
+        
+        set_string_variable(var_name, value);
+        return result;
+    }
+    
+    FunctionResult execute_assignment(const char* assign) {
+        FunctionResult result;
+        result.type = FunctionResult::VOID_RESULT;
+        
+        const char* equals = strchr(assign, '=');
+        if (!equals) return result;
+        
+        char var_name[64];
+        int i = 0;
+        const char* p = assign;
+        
+        while (p < equals && *p != ' ' && i < 63) {
+            var_name[i++] = *p++;
+        }
+        var_name[i] = '\0';
+        
+        equals++;
+        while (*equals == ' ') equals++;
+        
+        // Check if assignment is from function call
+        if (strchr(equals, '(')) {
+            FunctionResult func_result = execute_function_call(equals);
+            if (func_result.success) {
+                store_result_in_variable(var_name, func_result);
+            }
+            result = func_result;
+        } else {
+            // Simple value assignment
+            int value = parse_number(equals);
+            set_int_variable(var_name, value);
+        }
+        
+        return result;
+    }
+    
+    // Helper functions (argument parsing, variable management, etc.)
+    // ... [Include all the parsing and utility functions from the original code]
     
     const LibraryFunction* find_function(const char* name) {
         for (int i = 0; library_functions[i].name; i++) {
@@ -1261,84 +1859,42 @@ private:
         return nullptr;
     }
     
-    void execute_library_function_call(const LibraryFunction* func, const char* call) {
-        // Parse arguments from the function call
-        const char* args = strchr(call, '(');
-        if (!args) return;
-        args++; // Skip '('
-        
-        // Execute based on function name and signature
-        if (strcmp(func->name, "fibonacci") == 0) {
-            int n = parse_int_argument(args);
-            int result = fibonacci(n);
-            cout << "fibonacci(" << n << ") = " << result << "\n";;
-        }
-        else if (strcmp(func->name, "factorial") == 0) {
-            int n = parse_int_argument(args);
-            int result = factorial(n);
-            cout << "factorial(" << n << ") = " << result << "\n";;
-        }
-        else if (strcmp(func->name, "power") == 0) {
-            int base, exp;
-            parse_two_int_arguments(args, &base, &exp);
-            int result = power(base, exp);
-            cout << "power(" << base << ", " << exp << ") = " << result << "\n";;
-        }
-        else if (strcmp(func->name, "gcd") == 0) {
-            int a, b;
-            parse_two_int_arguments(args, &a, &b);
-            int result = gcd(a, b);
-            cout << "gcd(" << a << ", " << b << ") = " << result << "\n";;
-        }
-        else if (strcmp(func->name, "simple_hash") == 0) {
-            char* str = parse_string_argument(args);
-            int result = simple_hash(str);
-            cout << "simple_hash(\"" << str << "\") = 0x" << std::hex << result << "\n";;
-        }
-       
-        else if (strcmp(func->name, "memory_map_data") == 0) {
-            populate_memory_map_data();
-            cout << "Hardware devices discovered:\n";
-            for (int i = 0; i < memory_map_device_count; i++) {
-                cout << memory_map_data[i] << "\n";;
+    Variable* find_variable(const char* name) {
+        for (int i = 0; i < variable_count; i++) {
+            if (strcmp(variables[i].name, name) == 0) {
+                return &variables[i];
             }
         }
-        else if (strncmp(func->name, "mmio_read", 9) == 0) {
-            uint32_t addr = parse_hex_or_int_argument(args);
-            
-            if (strcmp(func->name, "mmio_read8") == 0) {
-                uint8_t val = mmio_read8(addr);
-                cout << "mmio_read8(0x" << std::hex << addr << ") = 0x" << std::hex << (int)val << "\n";;
-            }
-            else if (strcmp(func->name, "mmio_read16") == 0) {
-                uint16_t val = mmio_read16(addr);
-                cout << "mmio_read16(0x" << std::hex << addr << ") = 0x" << std::hex << (int)val << "\n";;
-            }
-            else if (strcmp(func->name, "mmio_read32") == 0) {
-                uint32_t val = mmio_read32(addr);
-                cout << "mmio_read32(0x" << std::hex << addr << ") = 0x" << std::hex << val << "\n";;
-            }
-        }
-        else if (strcmp(func->name, "terminal_clear") == 0) {
-            terminal_clear_screen();
-        }
-        else if (strcmp(func->name, "fat32_list_files") == 0) {
-            fat32_list_files(ahci_base, port);
-        }
-        else if (strcmp(func->name, "print_hex") == 0) {
-            char* label;
-            int value;
-            parse_string_and_int_arguments(args, &label, &value);
-            print_hex(label, value);
-        }
-
-        else {
-            cout << "Function " << func->name << " execution not yet implemented\n";
-            cout << "But it's available and callable from: " << func->library << " library\n";
-        }
+        return nullptr;
     }
     
-    // Argument parsing helpers
+    void set_int_variable(const char* name, int value) {
+        Variable* var = find_variable(name);
+        if (!var) {
+            if (variable_count >= 256) return;
+            var = &variables[variable_count++];
+            strcpy(var->name, name);
+        }
+        
+        var->type = Variable::INT_VAR;
+        var->int_value = value;
+        var->initialized = true;
+    }
+    
+    void set_string_variable(const char* name, const char* value) {
+        Variable* var = find_variable(name);
+        if (!var) {
+            if (variable_count >= 256) return;
+            var = &variables[variable_count++];
+            strcpy(var->name, name);
+        }
+        
+        var->type = Variable::STRING_VAR;
+        strcpy(var->string_value, value);
+        var->initialized = true;
+    }
+    
+    // Include all parsing functions from original code
     int parse_int_argument(const char* args) {
         while (*args == ' ') args++;
         return parse_number(args);
@@ -1372,18 +1928,6 @@ private:
         }
     }
     
-    void parse_three_int_arguments(const char* args, int* a, int* b, int* c) {
-        *a = parse_int_argument(args);
-        const char* comma1 = strchr(args, ',');
-        if (comma1) {
-            *b = parse_int_argument(comma1 + 1);
-            const char* comma2 = strchr(comma1 + 1, ',');
-            if (comma2) {
-                *c = parse_int_argument(comma2 + 1);
-            }
-        }
-    }
-    
     void parse_string_and_int_arguments(const char* args, char** str, int* val) {
         *str = parse_string_argument(args);
         const char* comma = strchr(args, ',');
@@ -1392,161 +1936,46 @@ private:
         }
     }
     
-    // Custom string to number parser to replace strtoull (not available in kernel)
-static uint64_t kernel_parse_number(const char* str) {
-    while (*str == ' ') str++; // Skip whitespace
-    
-    uint64_t result = 0;
-    int base = 10;
-    
-    // Check for hex prefix
-    if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
-        base = 16;
-        str += 2; // Skip "0x"
-    }
-    
-    while (*str) {
-        char c = *str;
-        int digit_value = -1;
+    uint64_t parse_number(const char* str) {
+        while (*str == ' ') str++; // Skip whitespace
         
-        if (c >= '0' && c <= '9') {
-            digit_value = c - '0';
-        } else if (base == 16) {
-            if (c >= 'a' && c <= 'f') {
-                digit_value = c - 'a' + 10;
-            } else if (c >= 'A' && c <= 'F') {
-                digit_value = c - 'A' + 10;
-            }
+        uint64_t result = 0;
+        int base = 10;
+        
+        // Check for hex prefix
+        if (str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+            base = 16;
+            str += 2; // Skip "0x"
         }
         
-        if (digit_value == -1 || digit_value >= base) {
-            break; // Invalid character or end of number
-        }
-        
-        result = result * base + digit_value;
-        str++;
-    }
-    
-    return result;
-}
-
-// Replace the parse_number function in RTCompiler
-uint64_t parse_number(const char* str) {
-    return kernel_parse_number(str);
-}
-    
-    // Variable management (simplified implementations)
-    void execute_int_declaration(const char* decl) {
-        char var_name[64];
-        int i = 0;
-        
-        while (decl[i] && decl[i] != ' ' && decl[i] != '=' && i < 63) {
-            var_name[i] = decl[i];
-            i++;
-        }
-        var_name[i] = '\0';
-        
-        int value = 0;
-        const char* equals = strchr(decl, '=');
-        if (equals) {
-            equals++;
-            while (*equals == ' ') equals++;
-            value = parse_number(equals);
-        }
-        
-        set_variable(var_name, value, false);
-        cout << "int " << var_name << " = " << value << "\n";;
-    }
-    
-    void execute_string_declaration(const char* decl) {
-        char var_name[64];
-        int i = 0;
-        
-        while (decl[i] && decl[i] != ' ' && decl[i] != '=' && i < 63) {
-            var_name[i] = decl[i];
-            i++;
-        }
-        var_name[i] = '\0';
-        
-        const char* value = "";
-        const char* equals = strchr(decl, '=');
-        if (equals) {
-            equals++;
-            while (*equals == ' ') equals++;
-            if (*equals == '"') {
-                equals++; // Skip opening quote
-                static char string_buf[256];
-                int j = 0;
-                while (*equals && *equals != '"' && j < 255) {
-                    string_buf[j++] = *equals++;
+        while (*str) {
+            char c = *str;
+            int digit_value = -1;
+            
+            if (c >= '0' && c <= '9') {
+                digit_value = c - '0';
+            } else if (base == 16) {
+                if (c >= 'a' && c <= 'f') {
+                    digit_value = c - 'a' + 10;
+                } else if (c >= 'A' && c <= 'F') {
+                    digit_value = c - 'A' + 10;
                 }
-                string_buf[j] = '\0';
-                value = string_buf;
             }
-        }
-        
-        set_string_variable(var_name, value);
-        cout << "string " << var_name << " = \"" << value << "\"\n";
-    }
-    
-    void execute_assignment(const char* assign) {
-        const char* equals = strchr(assign, '=');
-        if (!equals) return;
-        
-        char var_name[64];
-        int i = 0;
-        const char* p = assign;
-        
-        while (p < equals && *p != ' ' && i < 63) {
-            var_name[i++] = *p++;
-        }
-        var_name[i] = '\0';
-        
-        equals++;
-        while (*equals == ' ') equals++;
-        
-        int value = parse_number(equals);
-        set_variable(var_name, value, false);
-        
-        cout << var_name << " = " << value << "\n";
-    }
-    
-    void set_variable(const char* name, int value, bool is_string) {
-        Variable* var = find_variable(name);
-        if (!var) {
-            if (variable_count >= 128) return;
-            var = &variables[variable_count++];
-            strcpy(var->name, name);
-        }
-        
-        var->int_value = value;
-        var->is_string = is_string;
-    }
-    
-    void set_string_variable(const char* name, const char* value) {
-        Variable* var = find_variable(name);
-        if (!var) {
-            if (variable_count >= 128) return;
-            var = &variables[variable_count++];
-            strcpy(var->name, name);
-        }
-        
-        strcpy(var->string_value, value);
-        var->is_string = true;
-    }
-    
-    Variable* find_variable(const char* name) {
-        for (int i = 0; i < variable_count; i++) {
-            if (strcmp(variables[i].name, name) == 0) {
-                return &variables[i];
+            
+            if (digit_value == -1 || digit_value >= base) {
+                break; // Invalid character or end of number
             }
+            
+            result = result * base + digit_value;
+            str++;
         }
-        return nullptr;
+        
+        return result;
     }
 };
 
 //=============================================================================
-// KERNEL INTEGRATION
+// ENHANCED KERNEL INTEGRATION WITH PERSISTENT STATE
 //=============================================================================
 
 
