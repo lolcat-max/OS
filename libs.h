@@ -11,4 +11,3 @@
 //#include "array_lib.cpp"       // Array manipulation
 //#include "file_lib.cpp"        // File utilities
 //#include "physics_lib.cpp"     // Physics simulation
-#include "notepad.cpp"      // Extended string functions

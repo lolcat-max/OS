@@ -1,6 +1,6 @@
 #include "test.h"
 #include "terminal_hooks.h"
-
+#include "kernel.h"
 // --- Game Constants ---
 #define SCREEN_WIDTH 80
 #define SCREEN_HEIGHT 25
@@ -95,48 +95,6 @@ void reset_ball() {
     ai_is_missing = false;
     ai_miss_timer = 0;
     ai_reaction_counter = 0;
-}
-
-/**
- * @brief Simple integer to string conversion.
- */
-void int_to_string(int num, char* str) {
-    if (num == 0) {
-        str[0] = '0';
-        str[1] = '\0';
-        return;
-    }
-    
-    int i = 0;
-    bool negative = false;
-    
-    if (num < 0) {
-        negative = true;
-        num = -num;
-    }
-    
-    // Convert digits in reverse
-    while (num > 0) {
-        str[i++] = '0' + (num % 10);
-        num /= 10;
-    }
-    
-    if (negative) {
-        str[i++] = '-';
-    }
-    
-    str[i] = '\0';
-    
-    // Reverse the string
-    int start = 0;
-    int end = i - 1;
-    while (start < end) {
-        char temp = str[start];
-        str[start] = str[end];
-        str[end] = temp;
-        start++;
-        end--;
-    }
 }
 
 /**
