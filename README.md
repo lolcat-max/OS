@@ -6,7 +6,8 @@ sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with 
 
 TODO: 
 1. add formatfs
-2. inspect hex representation
-4. implement hardware IO
+2. fix hex representation
+3. stringify functions
+4. inspect hardware IO
 5. add notepad
 6. setup USB keyboard HID
