@@ -4,6 +4,7 @@ sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with 
 
 TODO: 
 1. inspect hardware IO
-2. complete file read/write
-3. complete file editor
-4. setup USB keyboard HID
+2. fix file read/write out of memory error
+3. improve variable/function dynamics in compiler
+4. complete file editor
+5. setup USB keyboard HID
