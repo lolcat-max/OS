@@ -717,24 +717,29 @@ FunctionResult execute_library_function_call(const LibraryFunction* func, const 
             strcpy(result.error_message, "fat32_read_file requires a filename");
         }
     }
-    else if (strcmp(func->name, "fat32_write_file") == 0) {
-        char* filename = parse_string_argument(args);
-        const char* comma = strchr(args, ',');
-        if (filename && comma) {
-            char* content = parse_string_argument(comma + 1);
-            if (content) {
-                int write_result = fat32_write_file(ahci_base, port, filename, content, strlen(content));
-                result.type = FunctionResult::INT_RESULT;
-                result.int_value = write_result;
-            } else {
-                result.success = false;
-                strcpy(result.error_message, "Invalid content argument for fat32_write_file");
-            }
-        } else {
-            result.success = false;
-            strcpy(result.error_message, "fat32_write_file requires filename and content");
-        }
+else if (strcmp(func->name, "fat32_write_file") == 0) {
+    // Create separate, dedicated buffers for the filename and content
+    char filename[256];
+    char content[256];
+    
+    // A pointer to keep track of our position in the argument string
+    const char* current_pos = args;
+
+    // Parse the first argument into 'filename' and the second into 'content'
+    if (parse_file_argument(&current_pos, filename, sizeof(filename)) &&
+        parse_file_argument(&current_pos, content, sizeof(content))) {
+        
+        // Now 'filename' and 'content' are in separate memory and hold the correct values
+        int write_result = fat32_write_file(ahci_base, port, filename, content, strlen(content));
+        
+        result.type = FunctionResult::INT_RESULT;
+        result.int_value = write_result;
+
+    } else {
+        result.success = false;
+        strcpy(result.error_message, "fat32_write_file requires two valid string arguments (e.g., \"file.txt\", \"data\")");
     }
+}
 
     // --- Kernel & Display Library ---
     else if (strcmp(func->name, "memory_map_data") == 0) {
@@ -1059,7 +1064,45 @@ FunctionResult execute_library_function_call(const LibraryFunction* func, const 
         while (*args == ' ') args++;
         return parse_number(args);
     }
-    
+    /**
+ * Parses a double-quoted string from the input.
+ * @param args_ptr A pointer to a char pointer, which will be advanced past the parsed string.
+ * @param out_buffer The buffer to store the parsed string.
+ * @param buffer_size The size of the output buffer.
+ * @return True on success, false on parsing failure.
+ */
+	bool parse_file_argument(const char** args_ptr, char* out_buffer, int buffer_size) {
+		const char* p = *args_ptr;
+		
+		// Skip leading whitespace and a single comma
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == ',') {
+			p++;
+			while (*p == ' ' || *p == '\t') p++;
+		}
+
+		// Ensure the string starts with a quote
+		if (*p != '"') {
+			return false;
+		}
+		p++; // Skip opening quote
+
+		// Copy characters until the closing quote or buffer limit
+		int i = 0;
+		while (*p && *p != '"' && i < buffer_size - 1) {
+			out_buffer[i++] = *p++;
+		}
+		out_buffer[i] = '\0'; // Null-terminate the string
+
+		// Check for a closing quote and skip it
+		if (*p != '"') {
+			return false; // Unterminated string
+		}
+		p++; // Skip closing quote
+
+		*args_ptr = p; // Update the original pointer for the next call
+		return true;
+	}
     char* parse_string_argument(const char* args) {
         while (*args == ' ') args++;
         if (*args == '"') {
