@@ -6,5 +6,4 @@ TODO:
 1. inspect hardware IO
 2. improve variable/function dynamics in compiler
 3. deconstructor and constructor for REGISTER_FUNCTION_EXT dataset 
-4. implement file editor
-5. setup USB keyboard HID
+4. setup USB keyboard HID
