@@ -406,54 +406,125 @@ int fat32_rename_file(uint64_t ahci_base, int port, const char* old_name, const 
     }
     return -2; // File not found
 }
+int fat32_read_file_chunk(uint64_t ahci_base, int port, uint32_t start_cluster, uint32_t offset, void* buffer, uint32_t bytes_to_read) {
+    if (bytes_to_read == 0 || start_cluster < 2) return 0;
+
+    uint32_t cluster_size = fat32_bpb.sec_per_clus * SECTOR_SIZE;
+    uint32_t start_in_cluster = offset % cluster_size;
+    uint32_t current_cluster = start_cluster;
+
+    // 1. Traverse cluster chain to the starting cluster for the given offset
+    for (uint32_t i = 0; i < offset / cluster_size; ++i) {
+        current_cluster = read_fat_entry(ahci_base, port, current_cluster);
+        if (current_cluster >= FAT_END_OF_CHAIN) return 0; // Offset is past end of file
+    }
+
+    // 2. Read data chunk by chunk
+    uint32_t bytes_read = 0;
+    uint8_t* out_ptr = (uint8_t*)buffer;
+
+    while (bytes_read < bytes_to_read && current_cluster < FAT_END_OF_CHAIN) {
+        uint64_t lba = cluster_to_lba(current_cluster);
+        uint32_t sector_in_cluster = start_in_cluster / SECTOR_SIZE;
+
+        for (uint32_t s = sector_in_cluster; s < fat32_bpb.sec_per_clus; ++s) {
+            uint8_t sector_buffer[SECTOR_SIZE];
+            if (read_sectors(ahci_base, port, lba + s, 1, sector_buffer) != 0) return -1;
+
+            uint32_t offset_in_sector = start_in_cluster % SECTOR_SIZE;
+            uint32_t to_copy = SECTOR_SIZE - offset_in_sector;
+            if (to_copy > (bytes_to_read - bytes_read)) {
+                to_copy = bytes_to_read - bytes_read;
+            }
+
+            simple_memcpy(out_ptr, sector_buffer + offset_in_sector, to_copy);
+            out_ptr += to_copy;
+            bytes_read += to_copy;
+            start_in_cluster = 0; // Only the first read is offset within the cluster
+
+            if (bytes_read >= bytes_to_read) break;
+        }
+
+        if (bytes_read >= bytes_to_read) break;
+        current_cluster = read_fat_entry(ahci_base, port, current_cluster);
+    }
+    return bytes_read;
+}
 
 // Copies a file by reading it into memory and creating a new file with its contents.
 int fat32_copy_file(uint64_t ahci_base, int port, const char* src_name, const char* dest_name) {
     uint8_t dir_sector_buffer[SECTOR_SIZE];
-    uint64_t lba = cluster_to_lba(current_directory_cluster);
+    uint64_t dir_lba = cluster_to_lba(current_directory_cluster);
     char src_target[11];
     to_83_format(src_name, src_target);
-    
-    // 1. Find the source file to get its size
+
+    // 1. Find the source file to get its size and starting cluster
     uint32_t file_size = 0;
+    uint32_t src_first_cluster = 0;
     bool found = false;
-    for (uint8_t s = 0; s < fat32_bpb.sec_per_clus; s++) {
-        if (read_sectors(ahci_base, port, lba + s, (uint32_t)1, dir_sector_buffer) != 0) return -1;
+
+    for (uint8_t s = 0; s < fat32_bpb.sec_per_clus && !found; s++) {
+        if (read_sectors(ahci_base, port, dir_lba + s, 1, dir_sector_buffer) != 0) {
+            return -1; // Read error
+        }
         for (uint16_t e = 0; e < SECTOR_SIZE / ENTRY_SIZE; e++) {
             fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_sector_buffer + e * ENTRY_SIZE);
-            if (entry->name[0] == 0) break;
-            if (entry->name[0] != DELETED_ENTRY && simple_memcmp(entry->name, src_target, 11) == 0) {
+            if (entry->name[0] == 0x00) { s = fat32_bpb.sec_per_clus; break; } // End of directory
+            if (entry->name[0] == DELETED_ENTRY) continue;
+
+            if (simple_memcmp(entry->name, src_target, 11) == 0) {
                 file_size = entry->file_size;
+                src_first_cluster = (entry->fst_clus_hi << 16) | entry->fst_clus_lo;
                 found = true;
                 break;
             }
         }
-        if (found) break;
     }
 
     if (!found) return -2; // Source file not found
     if (file_size == 0) { // Handle empty file case
         return fat32_add_file(ahci_base, port, dest_name, "", 0);
     }
+    if (src_first_cluster < 2) return -2; // File found but has no data
 
-    // 2. Allocate memory and read the source file into the buffer
-    char* file_buffer = new char[file_size];
-    if (!file_buffer) return -4; // Memory allocation failed
+    // 2. Allocate a new cluster chain for the destination file
+    uint32_t needed_clusters = clusters_needed(file_size);
+    uint32_t dest_first_cluster = allocate_cluster_chain(ahci_base, port, needed_clusters);
+    if (dest_first_cluster == 0) return -6; // Not enough space on disk
 
-    int bytes_read = fat32_read_file(ahci_base, port, src_name, file_buffer, file_size + 1);
-    if (bytes_read < 0) {
-        delete[] file_buffer;
-        return -1; // Read error
+    // 3. Read from source and write to destination, one sector at a time
+    uint8_t copy_buffer[SECTOR_SIZE];
+    uint32_t bytes_remaining = file_size;
+    uint32_t current_src_cluster = src_first_cluster;
+    uint32_t current_dest_cluster = dest_first_cluster;
+
+    while (bytes_remaining > 0 && current_src_cluster < FAT_END_OF_CHAIN) {
+        uint64_t src_cluster_lba = cluster_to_lba(current_src_cluster);
+        uint64_t dest_cluster_lba = cluster_to_lba(current_dest_cluster);
+
+        for (uint8_t i = 0; i < fat32_bpb.sec_per_clus; i++) {
+            if (bytes_remaining == 0) break;
+
+            if (read_sectors(ahci_base, port, src_cluster_lba + i, 1, copy_buffer) != 0) {
+                free_cluster_chain(ahci_base, port, dest_first_cluster);
+                return -1; // Read error
+            }
+            if (write_sectors(ahci_base, port, dest_cluster_lba + i, 1, copy_buffer) != 0) {
+                free_cluster_chain(ahci_base, port, dest_first_cluster);
+                return -7; // Write error
+            }
+
+            uint32_t bytes_in_sector = (bytes_remaining > SECTOR_SIZE) ? SECTOR_SIZE : bytes_remaining;
+            bytes_remaining -= bytes_in_sector;
+        }
+
+        current_src_cluster = read_fat_entry(ahci_base, port, current_src_cluster);
+        current_dest_cluster = read_fat_entry(ahci_base, port, current_dest_cluster);
     }
 
-    // 3. Write the buffer to the destination file
-    int result = fat32_add_file(ahci_base, port, dest_name, file_buffer, file_size);
-    
-    // 4. Clean up and return
-    delete[] file_buffer;
-    return result;
+    // 4. Create the directory entry for the new file using the pre-allocated chain
+    return fat32_add_file(ahci_base, port, dest_name, nullptr, file_size);
 }
-
 
 
 // --- The main chkdsk command (now uses the Bitmap) ---
