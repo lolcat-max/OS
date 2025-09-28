@@ -223,11 +223,14 @@ public:
             
             if (!current_lib || strcmp(current_lib, func.library) != 0) {
                 current_lib = func.library;
+				cout << "Press enter to continue...";
+				char* input;
+				cin >> input;
                 cout << "\n" << func.library << " Library:\n";
             }
             
-            cout << "  " << func.return_type << " " << func.name 
-                 << func.signature << " - " << func.description << "\n";
+            cout << "  " << func.return_type << " " << func.name << " " << 
+			func.signature << " - " << func.description << "\n";
         }
         cout << "\n";
     }
