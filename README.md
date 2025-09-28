@@ -4,7 +4,7 @@ sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with 
 
 TODO: 
 1. inspect hardware IO
-2. fix notepad glitches
+2. clear residual memory of notepad before each use
 3. improve variable/function dynamics in compiler
 4. deconstructor and constructor for REGISTER_FUNCTION_EXT dataset 
 5. setup USB keyboard HID
