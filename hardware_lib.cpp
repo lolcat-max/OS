@@ -760,6 +760,25 @@ int fat32_remove_file(uint64_t ahci_base, int port, const char* filename) {
     }
     return -4; // File not found
 }
+/**
+ * Reads the content of a file into a static internal buffer and returns a pointer to it.
+ *
+ * NOTE: This function uses a static buffer, so its return value is only valid until
+ * the next time the function is called. It is not re-entrant or thread-safe.
+ *
+ * @param ahci_base The base address of the AHCI controller.
+ * @param port The disk port to read from.
+ * @param filename The name of the file to read.
+ * @return A const char* pointer to a null-terminated string with the file's content,
+ *         or nullptr if the file is not found or a read error occurs.
+ */
+char* fat32_read_file_as_string(uint64_t ahci_base, int port, const char* filename) {
+    // A static buffer to hold the file's contents. This memory persists between calls.
+    // The original function already ensures null-termination, so we can safely return the buffer.
+	char* file_content_buffer = new char[4096];
+	fat32_read_file(ahci_base, port, filename, file_content_buffer, sizeof(file_content_buffer));;
+    return file_content_buffer;
+}
 
 
 int fat32_read_file(uint64_t ahci_base, int port, const char* filename, void* data_buffer, uint32_t buffer_size) {

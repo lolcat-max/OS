@@ -75,9 +75,7 @@ static void int_to_string(int value, char* buffer) {
 // to the self-hosted compiler automatically
 //=============================================================================
 #include "libs.h"
-//=============================================================================
-// AUTOMATIC FUNCTION REGISTRATION SYSTEM
-//=============================================================================
+
 //=============================================================================
 // ENHANCED REAL-TIME COMPILER WITH DATA RETURNS AND PERSISTENT VARIABLES
 //=============================================================================
@@ -701,11 +699,14 @@ FunctionResult execute_library_function_call(const LibraryFunction* func, const 
         result.type = FunctionResult::VOID_RESULT;
     }
     else if (strcmp(func->name, "fat32_read_file") == 0) {
-        char* filename = parse_string_argument(args);
-        if (filename) {
-            static char file_buffer[4096]; // Static buffer for file content
-            int bytes_read = fat32_read_file(ahci_base, port, filename, file_buffer, sizeof(file_buffer));
-            if (bytes_read >= 0) {
+        // A pointer to keep track of our position in the argument string
+		const char* current_pos = args;
+		char filename[256];
+		// Parse the first argument into 'filename' and the second into 'content'
+		if (parse_file_argument(&current_pos, filename, sizeof(filename))) {
+			char* file_buffer = new char[4096];
+            file_buffer = fat32_read_file_as_string(ahci_base, 0, filename);
+            if (sizeof(file_buffer) >= 0) {
                 result.type = FunctionResult::STRING_RESULT;
                 strcpy(result.string_value, file_buffer); // Return content as a string
             } else {
