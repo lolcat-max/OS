@@ -30,17 +30,6 @@ int fat32_write_file(uint64_t ahci_base, int port, const char* filename, const v
 // --- Add to FORWARD DECLARATIONS ---
 void cmd_cat(uint64_t ahci_base, int port, const char* filename);
 
-// --- COMMAND IMPLEMENTATIONS ---
-void cmd_help() {
-    cout << "--- KERNEL COMMANDS ---\n"
-         << "  help, clear, pong, ls, rm, chkdsk\n"
-         << "  cat <file>, kbtest\n"
-         << "  cp <src> <dest>, mv <old> <new>\n"
-         << "  compile <file.cpp>, run <file.obj>\n"
-         << "  exec <inline_code>\n"
-         << "  formatfs, mount, unmount\n";
-}
-
 static void int_to_string(int value, char* buffer) {
     if (value == 0) {
         buffer[0] = '0';
@@ -1375,3 +1364,4 @@ extern "C" void kernel_main() {
         }
     }
 }
+
