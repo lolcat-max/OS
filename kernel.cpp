@@ -13,7 +13,27 @@
 #include "notepad.h"
 #include "xhci.h"
 
+extern "C" {
+    // A 64-bit integer is used for the guard variable.
+    // The first byte is a flag, 0 for not yet initialized, 1 for initialized.
+    int __cxa_guard_acquire(long long *guard) {
+        // In a single-threaded kernel, we can simply check the flag.
+        // The first byte of the guard variable acts as a flag.
+        return !(*(char*)guard);
+    }
 
+    void __cxa_guard_release(long long *guard) {
+        // Mark the guard as initialized.
+        *(char*)guard = 1;
+    }
+
+    // This function is also part of the Itanium C++ ABI for pure virtual function calls.
+    // It's good practice to provide it to avoid other potential linker errors.
+    void __cxa_pure_virtual() {
+        // You can halt, panic, or log an error here.
+        // This function should ideally never be called.
+    }
+}
 
 
 
@@ -41,7 +61,6 @@ void cmd_cat(uint64_t ahci_base, int port, const char* filename);
 //=============================================================================
 
 
-int fat32_write_file( const char* filename, const void* data, uint32_t size);
 // Result structure to hold function return data
 struct FunctionResult {
     enum Type { VOID_RESULT, INT_RESULT, STRING_RESULT, ARRAY_RESULT } type;
@@ -670,7 +689,7 @@ FunctionResult execute_library_function_call(const LibraryFunction* func, const 
 		// Parse the first argument into 'filename' and the second into 'content'
 		if (parse_file_argument(&current_pos, filename, sizeof(filename))) {
 			char* file_buffer = new char[4096];
-            file_buffer = fat32_read_file_as_string(ahci_base, 0, filename);
+            int i = fat32_read_file(ahci_base, 0, filename, data_buffer, size_t(data_buffer));
             if (sizeof(file_buffer) >= 0) {
                 result.type = FunctionResult::STRING_RESULT;
                 strcpy(result.string_value, file_buffer); // Return content as a string
@@ -1242,8 +1261,6 @@ static int visible_lines = MAX_VISIBLE_LINES;
 
 extern bool extended_key;
 extern int input_length;
-extern bool is_pong_running();
-extern uint64_t ahci_base;
 
 
 // VGA text mode cursor and buffer functions
@@ -1337,14 +1354,14 @@ void notepad_save_and_exit(const char* filename_arg) {
 }
 void notepad_load_file(const char* filename) {
     notepad_clear_buffer();
-    char* load_buffer = new char[MAX_LINES * (MAX_LINE_LENGTH + 1)]  ;
-    load_buffer = fat32_read_file_as_string(ahci_base, 0, filename);
-    if (sizeof(load_buffer) >= 0) {
-        load_buffer[sizeof(load_buffer)] = '\0';
+    static char view_buffer[4096];
+    int bytes_read = fat32_read_file(ahci_base, 0, filename, (unsigned char*)view_buffer,sizeof(view_buffer) - 1);
+    if (sizeof(view_buffer) >= 0) {
+        view_buffer[sizeof(view_buffer)] = '\0';
         strcpy(current_filename, filename);
         int line = 0, col = 0;
-        for (int i = 0; i < sizeof(load_buffer) && line < MAX_LINES; i++) {
-            char c = load_buffer[i];
+        for (int i = 0; i < sizeof(view_buffer) && line < MAX_LINES; i++) {
+            char c = view_buffer[i];
             if (c == '\n') {
                 notepad_buffer[line][col] = '\0';
                 line++;
