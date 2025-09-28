@@ -4,6 +4,6 @@ sudo dd if=/home/user/Desktop/Text_OS-main/main.iso of=/dev/sdX (replace X with 
 
 TODO: 
 1. inspect hardware IO
-2. improve variable/function dynamics in compiler
+2. improve variable/function dynamics in compiler, deconstructor and constructor for REGISTER_FUNCTION_EXT dataset 
 3. implement file editor
 4. setup USB keyboard HID
