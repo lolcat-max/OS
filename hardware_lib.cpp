@@ -6,7 +6,6 @@
 
 #include "iostream_wrapper.h"
 
-int fat32_write_file(uint64_t ahci_base, int port, const char* filename, const void* data, uint32_t size);
 
 
 
@@ -175,7 +174,7 @@ void fat32_list_files(uint64_t ahci_base, int port);
 int fat32_add_file(uint64_t ahci_base, int port, const char* filename, const void* data, uint32_t size);
 int fat32_remove_file(uint64_t ahci_base, int port, const char* filename);
 int fat32_read_file(uint64_t ahci_base, int port, const char* filename, void* data_buffer, uint32_t buffer_size);
-int fat32_write_file(uint64_t ahci_base, int port, const char* filename, const void* data, uint32_t size);
+int fat32_write_file(const char* filename, const void* data, uint32_t size);
 
 // Commands
 void cmd_help();
@@ -846,7 +845,7 @@ int fat32_remove_file(uint64_t ahci_base, int port, const char* filename) {
 char* fat32_read_file_as_string(uint64_t ahci_base, int port, const char* filename) {
     // A static buffer to hold the file's contents. This memory persists between calls.
     // The original function already ensures null-termination, so we can safely return the buffer.
-	char* file_content_buffer = new char[4096];
+	char* file_content_buffer = new char[100000];
 	fat32_read_file(ahci_base, port, filename, file_content_buffer, sizeof(file_content_buffer));;
     return file_content_buffer;
 }
@@ -879,9 +878,9 @@ int fat32_read_file(uint64_t ahci_base, int port, const char* filename, void* da
     return -2; // Not found
 }
 
-int fat32_write_file(uint64_t ahci_base, int port, const char* filename, const void* data, uint32_t size) {
-    fat32_remove_file(ahci_base, port, filename); // Ignore error if file doesn't exist
-    return fat32_add_file(ahci_base, port, filename, data, size);
+int fat32_write_file(const char* filename, const void* data, uint32_t size) {
+    fat32_remove_file(ahci_base, 0, filename); // Ignore error if file doesn't exist
+    return fat32_add_file(ahci_base, 0, filename, data, size);
 }
 
 bool fat32_format(uint64_t ahci_base, int port, uint32_t total_sectors, uint8_t sectors_per_cluster) {
@@ -1209,7 +1208,7 @@ void cmd_save_memmap(const char* filename, int port, uint64_t ahci_base) {
     }
 
     // 4. Write the final buffer to the file
-    int result = fat32_write_file(ahci_base, port, filename, map_buffer, strlen(map_buffer));
+    int result = fat32_write_file(filename, map_buffer, strlen(map_buffer));
 
     if (result == 0) {
         cout << "Hardware memory map saved to file: " << filename << "\n";

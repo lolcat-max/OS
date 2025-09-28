@@ -76,12 +76,7 @@ const char scancode_to_ascii_shifted[128] = {
                 // These are real extended keys, process them
                 if (is_notepad_running()) {
                     notepad_handle_special_key(scancode);
-                } else if (is_pong_running()) {
-                    switch (scancode) {
-                        case 0x48: pong_handle_input('w'); break; // Up
-                        case 0x50: pong_handle_input('s'); break; // Down
-                    }
-                }
+                } 
                 extended_key = false;
                 outb(0x20, 0x20);
                 return;
@@ -131,13 +126,6 @@ const char scancode_to_ascii_shifted[128] = {
         }
     }
 
-    // F5 to start Pong if notepad inactive
-    if (scancode == SCANCODE_F5_PRESS && !is_notepad_running()) {
-        start_pong_game();
-        outb(0x20, 0x20);
-        return;
-    }
-
     // Normal input processing (ASCII characters)
     const char* lookup_table = shift_pressed ? scancode_to_ascii_shifted : scancode_to_ascii;
     char ch = lookup_table[scancode];
@@ -145,8 +133,6 @@ const char scancode_to_ascii_shifted[128] = {
     if (ch != 0) {
         if (is_notepad_running()) {
             notepad_handle_input(ch);
-        } else if (is_pong_running()) {
-            pong_handle_input(ch);
         } else {
             // Terminal input buffer handling here
             if (ch == '\n') {
@@ -171,14 +157,10 @@ const char scancode_to_ascii_shifted[128] = {
 
 // REPLACE timer_handler() to prevent blink glitch
 extern "C" void timer_handler() {
-    // Update Pong game if it's running
-    if (is_pong_running()) {
-        pong_update();
-    } else if (!is_pong_running() && !is_notepad_running()) {
+    if (!is_notepad_running()) {
         // Only blink cursor when not in game AND not in notepad
         update_cursor_state();
     }
-    // Don't update cursor when notepad or pong is running to prevent blink glitch
     
     // Send EOI to PIC
     outb(0x20, 0x20);

@@ -351,31 +351,18 @@ void process_keyboard_data(usb_keyboard_report_t* report) {
             continue;
         }
         
-        // Handle F5 key for Pong
-        if (keycode == HID_KEY_F5) {
-            extern void start_pong_game();
-            extern bool is_notepad_running();
-            if (!is_notepad_running()) {
-                start_pong_game();
-            }
-            continue;
-        }
-        
+     
         // Convert HID code to ASCII
         char ascii_char = usb_hid_to_ascii(keycode, shift_pressed, usb_caps_lock_on);
         if (ascii_char != 0) {
             // Send to appropriate handler
             extern void notepad_handle_input(char c);
-            extern void pong_handle_input(char c);
             extern bool is_notepad_running();
-            extern bool is_pong_running();
             extern int input_length;
             extern bool input_ready;
             
             if (is_notepad_running()) {
                 notepad_handle_input(ascii_char);
-            } else if (is_pong_running()) {
-                pong_handle_input(ascii_char);
             } else {
                 // Normal terminal input
                 if (ascii_char == '\n') {
@@ -954,7 +941,6 @@ void usb_keyboard_self_test() {
     }
     
     cout << "\nKeyboard Input Legend:\n";
-    cout << " F5: Start Pong Game\n";
     cout << " Caps Lock: Toggle capitalization\n";
     cout << " Ctrl+C: Not yet implemented\n";
     cout << " All other keys: Normal input\n";
