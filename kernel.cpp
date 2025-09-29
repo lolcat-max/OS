@@ -1376,19 +1376,42 @@ void notepad_load_file(const char* filename) {
         strcpy(current_filename, filename);
     }
 }
-
 void start_notepad(const char* filename) {
+    // 1. Initial Setup
     notepad_running = true;
     notepad_hide_cursor();
+
+    // 2. Clear the screen completely before drawing anything
+    for (int i = 0; i < 25 * 80; i++) {
+        vga_buffer[i] = 0x0720; // Space with gray on black
+    }
+
+    // Load file or clear buffer
     if (filename && filename[0] != '\0') {
         notepad_load_file(filename);
     } else {
         notepad_clear_buffer();
         current_filename[0] = '\0';
     }
+
+    // Draw the initial UI
     notepad_draw_interface();
     notepad_update_cursor();
+
+    // 3. Main Notepad Loop (This is the new, blocking part)
+    while (is_notepad_running()) {
+        // Halt the CPU until the next interrupt (e.g., a key press).
+        // This is an efficient way to wait for input.
+        asm("hlt");
+    }
+
+    // 4. Cleanup on Exit
+    // The screen is already cleared by notepad_save_and_exit,
+    // so no extra cleanup is needed here. Execution will now return
+    // to kernel_main, which will print a fresh "rtcpp>" prompt.
 }
+
+
 
 void cmd_notepad(const char* filename) {
     strcpy(notepad_filename, filename);
@@ -1411,8 +1434,9 @@ void notepad_ensure_cursor_visible() {
 }
 
 void notepad_draw_interface() {
-    for (int row = 0; row < 25; row++) {
-        notepad_clear_line(row, 0x07);
+    // Clear the entire screen in one operation before drawing
+    for (int i = 0; i < 25 * 80; i++) {
+        vga_buffer[i] = 0x0720; // Attribute 0x07 (light grey) on 0x20 (black)
     }
 
     // Title bar
@@ -1779,7 +1803,7 @@ extern "C" void kernel_main() {
             cout << "  formatfs                - format drive on sata port 0\n";
 
         }
-        else if (strlen(cmd) > 0) {
+        else if (strlen(cmd) == 0) {
             cout << "Unknown command. Type 'help' for available commands.\n";
         }
     }
