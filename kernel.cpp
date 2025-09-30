@@ -575,5 +575,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
 		// Copy to real framebuffer once
 		swap_buffers();
+
+		for (volatile int i = 0; i < 1000; i++); // optional small delay
 	}
 }
