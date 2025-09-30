@@ -1,4 +1,5 @@
 #include <cstdarg>
+
 // --- Type Definitions ---
 typedef unsigned char uint8_t;
 typedef unsigned short uint16_t;
@@ -18,34 +19,16 @@ static inline uint8_t inb(uint16_t port) { uint8_t ret; asm volatile ("inb %1, %
 
 // --- Standard Library Implementations ---
 int strncmp(const char* str1, const char* str2, size_t n) {
-    // Handle edge cases
-    if (n == 0) {
-        return 0;  // No characters to compare
-    }
-    
-    if (str1 == str2) {
-        return 0;  // Same pointer, strings are identical
-    }
-    
-    // Compare characters one by one up to n characters
+    if (n == 0) return 0;
+    if (str1 == str2) return 0;
     for (size_t i = 0; i < n; i++) {
-        // Check if we've reached the end of either string
         if (str1[i] == '\0' || str2[i] == '\0') {
-            // If both strings end at the same position, they're equal
-            if (str1[i] == str2[i]) {
-                return 0;
-            }
-            // Otherwise, return the difference
             return (unsigned char)str1[i] - (unsigned char)str2[i];
         }
-        
-        // If characters are different, return the difference
         if (str1[i] != str2[i]) {
             return (unsigned char)str1[i] - (unsigned char)str2[i];
         }
     }
-    
-    // All n characters compared were equal
     return 0;
 }
 
@@ -123,19 +106,23 @@ int strcmp(const char* s1, const char* s2) { while(*s1 && (*s1 == *s2)) { s1++; 
 // --- Basic Memory Allocator (Bump Allocator) ---
 static uint8_t kernel_heap[1024 * 1024]; // 1MB heap
 static uintptr_t heap_ptr = (uintptr_t)kernel_heap;
-void* operator new(size_t size) { uintptr_t addr = heap_ptr; heap_ptr += size; return (void*)addr; }
+void* operator new(size_t size) {
+    uintptr_t end_of_heap = (uintptr_t)kernel_heap + sizeof(kernel_heap);
+    if (heap_ptr + size > end_of_heap) {
+        return nullptr;
+    }
+    uintptr_t addr = heap_ptr;
+    heap_ptr += size;
+    return (void*)addr;
+}
 void* operator new[](size_t size) { return operator new(size); }
 void operator delete(void* ptr) noexcept { /* No-op */ }
 void operator delete[](void* ptr) noexcept { /* No-op */ }
 void operator delete(void* ptr, size_t size) noexcept { 
-    (void)ptr; // Suppress unused parameter warning
-    (void)size; // Suppress unused parameter warning
-    /* No-op */ 
+    (void)ptr; (void)size; /* No-op */ 
 }
 void operator delete[](void* ptr, size_t size) noexcept { 
-    (void)ptr; // Suppress unused parameter warning
-    (void)size; // Suppress unused parameter warning
-    /* No-op */ 
+    (void)ptr; (void)size; /* No-op */ 
 }
 // --- CXX ABI Stubs ---
 extern "C" { int __cxa_guard_acquire(long long *g) {return !*(char *)(g);}; void __cxa_guard_release(long long *g) {*(char *)g = 1;}; void __cxa_pure_virtual() {}; }
@@ -160,37 +147,24 @@ struct RTC_Time {
 
 RTC_Time read_rtc() {
     RTC_Time t;
-    uint8_t century = 20; // for 20xx
-
-    // Wait for update-in-progress to be clear
+    uint8_t century = 20;
     while (rtc_read(0x0A) & 0x80); 
-
     uint8_t regB = rtc_read(0x0B);
-    bool is_bcd = !(regB & 0x04); // BCD if bit 2 = 0
-
+    bool is_bcd = !(regB & 0x04);
     t.second = rtc_read(0x00);
     t.minute = rtc_read(0x02);
     t.hour   = rtc_read(0x04);
     t.day    = rtc_read(0x07);
     t.month  = rtc_read(0x08);
     t.year   = rtc_read(0x09);
-
-    // Convert BCD to binary if necessary
     if (is_bcd) {
-        t.second = bcd_to_bin(t.second);
-        t.minute = bcd_to_bin(t.minute);
-        t.hour   = bcd_to_bin(t.hour);
-        t.day    = bcd_to_bin(t.day);
-        t.month  = bcd_to_bin(t.month);
-        t.year   = bcd_to_bin(t.year);
+        t.second = bcd_to_bin(t.second); t.minute = bcd_to_bin(t.minute);
+        t.hour   = bcd_to_bin(t.hour);   t.day    = bcd_to_bin(t.day);
+        t.month  = bcd_to_bin(t.month);  t.year   = bcd_to_bin(t.year);
     }
-
-    t.year += century * 100; // simple 20xx
-
+    t.year += century * 100;
     return t;
 }
-
-
 
 // --- Multiboot & Framebuffer ---
 struct multiboot_info {
@@ -203,7 +177,7 @@ struct multiboot_info {
 struct FramebufferInfo { uint32_t* ptr; uint32_t width, height, pitch; } fb_info;
 
 // --- Basic Font (8x8) ---
-#include "font.h" // Assuming the font array is in a separate header file for cleanliness
+#include "font.h" 
 
 // --- Graphics Functions ---
 void put_pixel_back(int x, int y, uint32_t color) {
@@ -250,8 +224,10 @@ public:
     int x, y, w, h;
     const char* title;
     bool has_focus;
+    bool is_closed;
 
-    Window(int x, int y, int w, int h, const char* title) : x(x), y(y), w(w), h(h), title(title), has_focus(false) {}
+    Window(int x, int y, int w, int h, const char* title) 
+        : x(x), y(y), w(w), h(h), title(title), has_focus(false), is_closed(false) {}
     virtual ~Window() {}
 
     virtual void draw() = 0;
@@ -262,10 +238,20 @@ public:
     bool is_in_titlebar(int mx, int my) {
         return mx > x && mx < x + w && my > y && my < y + 25;
     }
+
+    bool is_in_close_button(int mx, int my) {
+        int btn_x = x + w - 22;
+        int btn_y = y + 4;
+        return mx >= btn_x && mx < btn_x + 18 && my >= btn_y && my < btn_y + 18;
+    }
+
+    void close() {
+        is_closed = true;
+    }
 };
 
-class TerminalWindow; // Forward declaration for command handler
-void launch_new_terminal(); // Forward declaration for command handler
+class TerminalWindow; 
+void launch_new_terminal();
 
 class TerminalWindow : public Window {
 private:
@@ -302,21 +288,18 @@ private:
 				 t.hour, t.minute, t.second, t.day, t.month, t.year);
 		print_line(buf);
 	}
-
     else if (strcmp(current_line, "version") == 0) {
         print_line("RTOS++ v0.1 - Bare-metal OS");
     }
     else if (strlen(current_line) > 0) {
         print_line("Unknown command.");
     }
-    
     print_prompt();
 }
 
 void print_prompt() {
     print_string("RTOS++> ");
 }
-
     
 public:
     TerminalWindow(int x, int y) : Window(x, y, 640, 425, "Terminal"), cursor_x(0), cursor_y(0), line_pos(0) {
@@ -360,6 +343,11 @@ public:
         draw_rect_filled(x + 2, y + 2, w - 4, h - 4, 0x000033);
         draw_rect_filled(x, y, w, 25, title_color);
         draw_string(title, x + 5, y + 8, 0xFFFFFF);
+        
+        int btn_x = x + w - 22;
+        int btn_y = y + 4;
+        draw_rect_filled(btn_x, btn_y, 18, 18, 0xFF0000); // Red square
+        draw_char('X', btn_x + 5, btn_y + 5, 0xFFFFFF); // White 'X'
 
         for (int i = 0; i < 25; i++) {
             draw_string(buffer[i], x + 5, y + 30 + i * 15, 0xDDDDDD);
@@ -367,7 +355,6 @@ public:
     }
     
     void update() override {
-        // Blinking cursor
         static int blink_counter = 0;
         if (has_focus && (blink_counter++ / 20) % 2 == 0) {
             draw_rect_filled(x + 5 + cursor_x * 8, y + 30 + cursor_y * 15, 8, 15, 0xFFFFFF);
@@ -385,10 +372,7 @@ public:
             current_line[line_pos] = '\0';
             cursor_x = 0;
             cursor_y++;
-            if (cursor_y >= 25) {
-                scroll();
-                cursor_y = 24;
-            }
+            if (cursor_y >= 25) { scroll(); cursor_y = 24; }
             handle_command();
             line_pos = 0;
         } else {
@@ -402,11 +386,12 @@ public:
     void on_mouse_event(int mx, int my, bool clicked) override {}
 };
 
-	void draw_cursor(int x, int y, uint32_t color) {
-		for(int i = 0; i < 12; i++) put_pixel_back(x, y + i, color);
-		for(int i = 0; i < 8; i++) put_pixel_back(x + i, y + i, color);
-		for(int i = 0; i < 4; i++) put_pixel_back(x + i, y + (11 - i), color);
-	}
+void draw_cursor(int x, int y, uint32_t color) {
+    for(int i = 0; i < 12; i++) put_pixel_back(x, y + i, color);
+    for(int i = 0; i < 8; i++) put_pixel_back(x + i, y + i, color);
+    for(int i = 0; i < 4; i++) put_pixel_back(x + i, y + (11 - i), color);
+}
+
 class WindowManager {
 private:
     Window* windows[10];
@@ -419,7 +404,7 @@ public:
     WindowManager() : num_windows(0), focused_idx(-1), dragging_idx(-1) {}
 
     void add_window(Window* win) {
-        if (num_windows < 10) {
+        if (num_windows < 10 && win != nullptr) {
             windows[num_windows] = win;
             set_focus(num_windows);
             num_windows++;
@@ -427,11 +412,14 @@ public:
     }
 
     void set_focus(int idx) {
-        if (focused_idx != -1) windows[focused_idx]->has_focus = false;
+        if (focused_idx != -1 && focused_idx < num_windows) {
+            windows[focused_idx]->has_focus = false;
+        }
         focused_idx = idx;
+        if (idx == -1) return;
+
         windows[focused_idx]->has_focus = true;
         
-        // Bring to front (by swapping with last element)
         Window* focused = windows[idx];
         for (int i = idx; i < num_windows - 1; i++) {
             windows[i] = windows[i + 1];
@@ -439,11 +427,31 @@ public:
         windows[num_windows - 1] = focused;
         focused_idx = num_windows - 1;
     }
+    
+    // --- MODIFIED: Replaced with a safer implementation ---
+    void cleanup_closed_windows() {
+		int new_count = 0;
+		for (int i = 0; i < num_windows; i++) {
+			if (!windows[i]->is_closed) {
+				windows[new_count++] = windows[i];
+			}
+		}
+		num_windows = new_count;
+
+		// Reset focus to top-most window
+		if (num_windows > 0) {
+			for (int i = 0; i < num_windows; i++) windows[i]->has_focus = false;
+			focused_idx = num_windows - 1;
+			windows[focused_idx]->has_focus = true;
+		} else {
+			focused_idx = -1;
+		}
+	}
 
     void draw_desktop() {
-        draw_rect_filled(0, 0, fb_info.width, fb_info.height, 0x336699); // Blue background
-        draw_rect_filled(0, fb_info.height - 40, fb_info.width, 40, 0x808080); // Taskbar
-        draw_rect_filled(5, fb_info.height - 35, 75, 30, 0xC0C0C0); // Start button
+        draw_rect_filled(0, 0, fb_info.width, fb_info.height, 0x336699);
+        draw_rect_filled(0, fb_info.height - 40, fb_info.width, 40, 0x808080);
+        draw_rect_filled(5, fb_info.height - 35, 75, 30, 0xC0C0C0);
         draw_string("Terminal", 10, fb_info.height - 28, 0x000000);
     }
     
@@ -466,14 +474,17 @@ public:
         }
         
         if (left_clicked) {
-            // Check for Start button click
-            if (mx > 5 && mx < 65 && my > (int)fb_info.height - 35 && my < (int)fb_info.height - 5) {
+            if (mx > 5 && mx < 80 && my > (int)fb_info.height - 35 && my < (int)fb_info.height - 5) {
+                for (volatile int i = 0; i < 1000000; i++);
                 launch_new_terminal();
-                return; // Prevent window focus change
+                return; // ADDED: Prevents fall-through bug
             }
-
-            // Check for window focus change / drag start
+            
             for (int i = num_windows - 1; i >= 0; i--) {
+                if (windows[i]->is_in_close_button(mx, my)) {
+                    windows[i]->close();
+                    return;
+                }
                 if (windows[i]->is_in_titlebar(mx, my)) {
                     set_focus(i);
                     dragging_idx = focused_idx;
@@ -490,12 +501,15 @@ public:
     }
 };
 
-WindowManager wm; // Global Window Manager instance
+WindowManager wm;
 
 void launch_new_terminal() {
     static int win_count = 0;
-    wm.add_window(new TerminalWindow(80 + (win_count * 30), 80 + (win_count * 30)));
-    win_count++;
+    TerminalWindow* term = new TerminalWindow(80 + (win_count * 30), 80 + (win_count * 30));
+    if (term) {
+        wm.add_window(term);
+        win_count++;
+    }
 }
 
 // --- PS/2 Driver ---
@@ -509,7 +523,7 @@ bool mouse_left_down = false, mouse_left_last = false;
 char last_key_press = 0;
 
 void poll_input() {
-    last_key_press = 0; // Reset key press for this frame
+    last_key_press = 0; 
     while (inb(0x64) & 1) {
         uint8_t status = inb(0x64);
         uint8_t scancode = inb(0x60);
@@ -546,36 +560,31 @@ void poll_input() {
     }
 }
 
-
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     multiboot_info* mbi = (multiboot_info*)multiboot_addr;
     
     if (!(mbi->flags & (1 << 12))) { return; }
     fb_info = { (uint32_t*)((uintptr_t)mbi->framebuffer_addr), mbi->framebuffer_width, mbi->framebuffer_height, mbi->framebuffer_pitch };
 
-    // Initialize PS/2 Controller (simplified)
     outb(0x64, 0xA8); outb(0x64, 0x20);
     uint8_t status = (inb(0x60) | 2) & ~0x20;
     outb(0x64, 0x60); outb(0x60, status);
     outb(0x64, 0xD4); outb(0x60, 0xF6); inb(0x60);
     outb(0x64, 0xD4); outb(0x60, 0xF4); inb(0x60);
 
-    launch_new_terminal(); // Create the first window
-
-    int frame_counter = 0;
-
+    launch_new_terminal();
+    
     while (true) {
-		poll_input();
+        poll_input();
 		bool mouse_clicked_this_frame = mouse_left_down && !mouse_left_last;
+
 		wm.handle_input(last_key_press, mouse_x, mouse_y, mouse_left_down, mouse_clicked_this_frame);
+ 
+        wm.cleanup_closed_windows();
 
-		// Draw everything into backbuffer
-		wm.update_all();
-		draw_cursor(mouse_x, mouse_y, 0xFFFFFF);
+        wm.update_all();
+        draw_cursor(mouse_x, mouse_y, 0xFFFFFF);
 
-		// Copy to real framebuffer once
-		swap_buffers();
-
-		for (volatile int i = 0; i < 1000; i++); // optional small delay
-	}
+        swap_buffers();
+    }
 }
