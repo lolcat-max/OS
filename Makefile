@@ -3,51 +3,17 @@
 ISODIR := iso
 MULTIBOOT := $(ISODIR)/boot/main.elf
 MAIN := main.iso
-
+CXXFLAGS = -ffreestanding -O2 -Wall -Wextra -std=c++17 -fno-exceptions -fno-rtti -Iinclude
 .PHONY: clean run
 
 $(MAIN):
 	as -32 boot.S -o boot.o
 
-	gcc -c kernel.cpp -ffreestanding -fno-exceptions -m32 -o kernel.o 
-
-	gcc -c types.cpp -ffreestanding -m32 -o types.o 
-
-	gcc -c terminal_io.cpp -ffreestanding -m32 -o terminal_io.o 
-
-	gcc -c terminal_hooks.cpp -ffreestanding -m32 -o terminal_hooks.o 
-
-	gcc -c stdlib_hooks.cpp -ffreestanding -m32 -o stdlib_hooks.o 
-
-	gcc -c iostream_wrapper.cpp -ffreestanding -m32 -o iostream_wrapper.o 
-
-	gcc -c interrupts.cpp -ffreestanding -m32 -o interrupts.o 
-
-	gcc -c string.cpp -ffreestanding -m32 -o string.o 
-
-	gcc -c hardware_specs.cpp -ffreestanding -m32 -o hardware_specs.o 
-
-	gcc -c pci.cpp -ffreestanding -m32 -o pci.o 
-
-	gcc -c io_port.cpp -ffreestanding -m32 -o io_port.o 
-	
-	gcc -c dma_memory.cpp -ffreestanding -m32 -o dma_memory.o 
-	
-	gcc -c xhci.cpp -ffreestanding -m32 -o xhci.o 
-	
-	gcc -c math_lib.cpp -ffreestanding -m32 -o math_lib.o 
-	
-	gcc -c crypto_lib.cpp -ffreestanding -m32 -o crypto_lib.o 
-
-	gcc -c string_lib.cpp -ffreestanding -m32 -o string_lib.o 
-
-	gcc -c hardware_lib.cpp -ffreestanding -m32 -o hardware_lib.o 
+	gcc -c kernel.cpp -ffreestanding -fno-rtti -fno-exceptions -m32 -o kernel.o 
 
 
-	gcc -c notepad.cpp -ffreestanding -m32 -o notepad.o 
 
-
-	gcc -ffreestanding -m32 -nostdlib -o '$(MULTIBOOT)' -T linker.ld boot.o kernel.o string.o types.o terminal_io.o terminal_hooks.o stdlib_hooks.o iostream_wrapper.o interrupts.o hardware_specs.o io_port.o pci.o dma_memory.o xhci.o notepad.o  -lgcc
+	gcc -ffreestanding -m32 -nostdlib -o '$(MULTIBOOT)' -T linker.ld boot.o kernel.o -lgcc
 
 	grub-mkrescue -o '$@' '$(ISODIR)'
 
