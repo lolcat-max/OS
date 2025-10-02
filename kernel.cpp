@@ -65,6 +65,7 @@ int memcmp(const void* ptr1, const void* ptr2, size_t n) { const uint8_t* p1 = (
 int strcmp(const char* s1, const char* s2) { while(*s1 && (*s1 == *s2)) { s1++; s2++; } return *(const unsigned char*)s1 - *(const unsigned char*)s2; }
 int strncmp(const char* s1, const char* s2, size_t n) { if (n == 0) return 0; do { if (*s1 != *s2++) return *(unsigned const char*)s1 - *(unsigned const char*)--s2; if (*s1++ == 0) break; } while (--n != 0); return 0; }
 char* strchr(const char* s, int c) { while (*s != (char)c) if (!*s++) return nullptr; return (char*)s; }
+char* strcpy(char *dest, const char *src) { char *ret = dest; while ((*dest++ = *src++)); return ret; }
 char* strncpy(char* dest, const char* src, size_t n) { size_t i; for (i = 0; i < n && src[i] != '\0'; i++) dest[i] = src[i]; for ( ; i < n; i++) dest[i] = '\0'; return dest; }
 char* strncat(char *dest, const char *src, size_t n) {
     size_t dest_len = strlen(dest);
@@ -123,6 +124,21 @@ void operator delete[](void* ptr) noexcept {}
 void operator delete(void* ptr, size_t size) noexcept { (void)ptr; (void)size; }
 void operator delete[](void* ptr, size_t size) noexcept { (void)ptr; (void)size; }
 
+
+void* memmove(void* dest, const void* src, size_t n) {
+    uint8_t* d = (uint8_t*)dest;
+    const uint8_t* s = (const uint8_t*)src;
+    if (d < s) {
+        for (size_t i = 0; i < n; i++) {
+            d[i] = s[i];
+        }
+    } else {
+        for (size_t i = n; i != 0; i--) {
+            d[i-1] = s[i-1];
+        }
+    }
+    return dest;
+}
 
 // =============================================================================
 // SECTION 2: BOOTLOADER INFO, FONT, RTC
@@ -309,6 +325,14 @@ public:
 WindowManager wm; // Global instance
 
 // --- Terminal Window Class ---
+#define KEY_UP     -1
+#define KEY_DOWN   -2
+#define KEY_LEFT   -3
+#define KEY_RIGHT  -4
+#define KEY_DELETE -5
+#define KEY_HOME   -6
+#define KEY_END    -7
+
 class TerminalWindow : public Window {
 private:
     char buffer[40][120];
@@ -317,9 +341,12 @@ private:
     int line_pos;
     bool in_editor;
     char edit_filename[32];
-    char* edit_buffer;
-    int edit_buf_pos;
-
+    char** edit_lines;
+    int edit_line_count;
+    int edit_current_line;
+    int edit_cursor_col;
+    int edit_scroll_offset;
+    
     void scroll() {
         for(int i=0; i<39; ++i) memcpy(buffer[i], buffer[i+1], 120);
         memset(buffer[39], 0, 120);
@@ -331,16 +358,22 @@ private:
     }
     
     void print_prompt() { push_line(">"); }
-
     void handle_command();
 
 public:
-    TerminalWindow(int x, int y) : Window(x, y, 640, 400, "Terminal"), line_count(0), line_pos(0), in_editor(false), edit_buffer(nullptr), edit_buf_pos(0) { // Add edit_buf_pos(0) here
+    TerminalWindow(int x, int y) : Window(x, y, 640, 400, "Terminal"), line_count(0), line_pos(0), in_editor(false), 
+        edit_lines(nullptr), edit_line_count(0), edit_current_line(0), edit_cursor_col(0), edit_scroll_offset(0) {
         memset(buffer, 0, sizeof(buffer));
         current_line[0] = '\0';
         print_prompt();
     }
-    ~TerminalWindow() { if(edit_buffer) delete[] edit_buffer; }
+    
+    ~TerminalWindow() { 
+        if(edit_lines) {
+            for(int i = 0; i < edit_line_count; i++) delete[] edit_lines[i];
+            delete[] edit_lines;
+        }
+    }
 
     void draw() override {
         uint32_t border_color = has_focus ? 0xFFFFFF : 0x888888;
@@ -353,55 +386,169 @@ public:
         draw_rect_filled(btn_x, btn_y, 18, 18, 0xFF0000);
         draw_char('X', btn_x + 5, btn_y + 5, 0xFFFFFF);
 
-        int max_lines_shown = (h - 40) / 10;
-        int start = (line_count > max_lines_shown) ? line_count - max_lines_shown : 0;
-        for (int i = 0; i < max_lines_shown && (start + i) < line_count; ++i) {
-            draw_string(buffer[start + i], x + 5, y + 30 + i * 10, 0xDDDDDD);
-        }
+        if (in_editor) {
+            int max_lines = (h - 60) / 10;
+            draw_rect_filled(x, y + h - 25, w, 25, 0x004400);
+            char status[120];
+            snprintf(status, 120, "%s | Ln %d/%d Col %d | ^Q=Save | Move: Arrows, Home, End", 
+                     edit_filename, edit_current_line + 1, edit_line_count, edit_cursor_col + 1);
+            draw_string(status, x + 5, y + h - 18, 0xFFFFFF);
+            
+            for (int i = 0; i < max_lines && (edit_scroll_offset + i) < edit_line_count; i++) {
+                uint32_t line_color = (edit_scroll_offset + i == edit_current_line) ? 0xFFFFFF : 0xDDDDDD;
+                draw_string(edit_lines[edit_scroll_offset + i], x + 5, y + 30 + i * 10, line_color);
+                
+                if (edit_scroll_offset + i == edit_current_line) {
+                    int cursor_x = x + 5 + edit_cursor_col * 8;
+                    int cursor_y = y + 30 + i * 10;
+                    draw_rect_filled(cursor_x, cursor_y, 2, 8, 0x00FF00);
+                }
+            }
+        } else {
+            int max_lines_shown = (h - 40) / 10;
+            int start = (line_count > max_lines_shown) ? line_count - max_lines_shown : 0;
+            for (int i = 0; i < max_lines_shown && (start + i) < line_count; ++i) {
+                draw_string(buffer[start + i], x + 5, y + 30 + i * 10, 0xDDDDDD);
+            }
 
-        // **THE FIX**: Change the prompt based on editor mode
-        if (line_count > 0 && (line_count - 1 >= start)) {
-            char temp_prompt[120];
-            const char* prompt = in_editor ? "EDIT: " : buffer[line_count - 1];
-            snprintf(temp_prompt, 120, "%s%s", prompt, current_line);
-            draw_string(temp_prompt, x + 5, y + 30 + (line_count - 1 - start) * 10, 0xFFFFFF);
+            if (line_count > 0 && (line_count - 1 >= start)) {
+                char temp_prompt[120];
+                snprintf(temp_prompt, 120, "%s%s", buffer[line_count - 1], current_line);
+                draw_string(temp_prompt, x + 5, y + 30 + (line_count - 1 - start) * 10, 0xFFFFFF);
+                
+                int cursor_x = x + 5 + (strlen(buffer[line_count - 1]) + line_pos) * 8;
+                int cursor_y = y + 30 + (line_count - 1 - start) * 10;
+                draw_rect_filled(cursor_x, cursor_y, 2, 8, 0x00FF00);
+            }
         }
     }
 
     void update() override {}
 
     void on_key_press(char c) override {
-        if (c == '\b') { if (line_pos > 0) current_line[--line_pos] = '\0'; }
-        else if (c == '\n') {
-            if(in_editor) {
-                if(strcmp(current_line, "save") == 0) {
-                    edit_buffer[edit_buf_pos] = '\0';
-                    fat32_remove_file(edit_filename);
-                    if (fat32_write_file(edit_filename, edit_buffer, edit_buf_pos) == 0) {
-                        console_print("File saved.\n");
-                    } else {
-                        console_print("Error saving file.\n");
-                    }
-                    delete[] edit_buffer;
-                    edit_buffer = nullptr;
-                    in_editor = false;
-                    print_prompt();
+        if (in_editor) {
+            if (c == '\x11') { // Ctrl+Q: Save
+                int total_size = 0;
+                for (int i = 0; i < edit_line_count; i++) total_size += strlen(edit_lines[i]) + 1;
+                
+                char* file_content = new char[total_size + 1];
+                char* ptr = file_content;
+                for (int i = 0; i < edit_line_count; i++) {
+                    int len = strlen(edit_lines[i]);
+                    memcpy(ptr, edit_lines[i], len);
+                    ptr += len;
+                    *ptr++ = '\n';
+                }
+                *ptr = '\0';
+                
+                fat32_remove_file(edit_filename);
+                if (fat32_write_file(edit_filename, file_content, total_size) == 0) {
+                    console_print("File saved.\n");
                 } else {
-                    // **THE FIX**: Don't call push_line, just append to the buffer
-                    if(edit_buffer && (edit_buf_pos + line_pos + 1 < 16384)) {
-                        memcpy(edit_buffer + edit_buf_pos, current_line, line_pos);
-                        edit_buf_pos += line_pos;
-                        edit_buffer[edit_buf_pos++] = '\n';
+                    console_print("Error saving.\n");
+                }
+                delete[] file_content;
+                
+                for(int i = 0; i < edit_line_count; i++) delete[] edit_lines[i];
+                delete[] edit_lines;
+                edit_lines = nullptr;
+                edit_line_count = 0;
+                in_editor = false;
+                print_prompt();
+            } else if (c == KEY_HOME) { // Home key
+                edit_cursor_col = 0;
+            } else if (c == KEY_END) { // End key
+                edit_cursor_col = strlen(edit_lines[edit_current_line]);
+            } else if (c == KEY_LEFT) { // Left Arrow
+                if (edit_cursor_col > 0) edit_cursor_col--;
+            } else if (c == KEY_RIGHT) { // Right Arrow
+                if (edit_cursor_col < (int)strlen(edit_lines[edit_current_line])) edit_cursor_col++;
+            } else if (c == KEY_UP) { // Up Arrow
+                if (edit_current_line > 0) {
+                    edit_current_line--;
+                    if (edit_cursor_col > (int)strlen(edit_lines[edit_current_line])) {
+                        edit_cursor_col = strlen(edit_lines[edit_current_line]);
+                    }
+                    if (edit_current_line < edit_scroll_offset) edit_scroll_offset = edit_current_line;
+                }
+            } else if (c == KEY_DOWN) { // Down Arrow
+                if (edit_current_line < edit_line_count - 1) {
+                    edit_current_line++;
+                    if (edit_cursor_col > (int)strlen(edit_lines[edit_current_line])) {
+                        edit_cursor_col = strlen(edit_lines[edit_current_line]);
+                    }
+                    int max_lines = (h - 60) / 10;
+                    if (edit_current_line >= edit_scroll_offset + max_lines) edit_scroll_offset = edit_current_line - max_lines + 1;
+                }
+            } else if (c == KEY_DELETE) { // Delete key
+                char* line = edit_lines[edit_current_line];
+                int len = strlen(line);
+                if (edit_cursor_col < len) {
+                    for (int i = edit_cursor_col; i < len; i++) line[i] = line[i + 1];
+                }
+            } else if (c == '\b') { // Backspace
+                if (edit_cursor_col > 0) {
+                    char* line = edit_lines[edit_current_line];
+                    int len = strlen(line);
+                    for (int i = edit_cursor_col - 1; i < len; i++) line[i] = line[i + 1];
+                    edit_cursor_col--;
+                } else if (edit_current_line > 0) {
+                    int prev_len = strlen(edit_lines[edit_current_line - 1]);
+                    int curr_len = strlen(edit_lines[edit_current_line]);
+                    if (prev_len + curr_len < 119) {
+                        strncat(edit_lines[edit_current_line - 1], edit_lines[edit_current_line], 119 - prev_len);
+                        delete[] edit_lines[edit_current_line];
+                        for (int i = edit_current_line; i < edit_line_count - 1; i++) {
+                            edit_lines[i] = edit_lines[i + 1];
+                        }
+                        edit_line_count--;
+                        edit_current_line--;
+                        edit_cursor_col = prev_len;
                     }
                 }
-            } else {
+            } else if (c == '\n') { // Enter: Split line
+                char* current = edit_lines[edit_current_line];
+                char* new_line = new char[120];
+                memset(new_line, 0, 120);
+                strcpy(new_line, current + edit_cursor_col);
+                current[edit_cursor_col] = '\0';
+                
+                char** new_lines = new char*[edit_line_count + 1];
+                for (int i = 0; i <= edit_current_line; i++) new_lines[i] = edit_lines[i];
+                new_lines[edit_current_line + 1] = new_line;
+                for (int i = edit_current_line + 1; i < edit_line_count; i++) {
+                    new_lines[i + 1] = edit_lines[i];
+                }
+                delete[] edit_lines;
+                edit_lines = new_lines;
+                edit_line_count++;
+                edit_current_line++;
+                edit_cursor_col = 0;
+                
+                int max_lines = (h - 60) / 10;
+                if (edit_current_line >= edit_scroll_offset + max_lines) edit_scroll_offset = edit_current_line - max_lines + 1;
+            } else if (c >= 32 && c < 127) { // Regular character
+                char* line = edit_lines[edit_current_line];
+                int len = strlen(line);
+                if (len < 119) {
+                    for (int i = len; i >= edit_cursor_col; i--) line[i + 1] = line[i];
+                    line[edit_cursor_col] = c;
+                    edit_cursor_col++;
+                }
+            }
+        } else {
+            if (c == '\b') { 
+                if (line_pos > 0) current_line[--line_pos] = '\0'; 
+            } else if (c == '\n') {
                 if (line_count > 0) strncat(buffer[line_count-1], current_line, 119 - strlen(buffer[line_count-1]));
                 handle_command();
+                line_pos = 0;
+                current_line[0] = '\0';
+            } else if (line_pos < 119 && c >= 32 && c < 127) { 
+                current_line[line_pos++] = c; 
+                current_line[line_pos] = '\0'; 
             }
-            line_pos = 0;
-            current_line[0] = '\0';
-
-        } else if (line_pos < 119) { current_line[line_pos++] = c; current_line[line_pos] = '\0'; }
+        }
     }
     
     void console_print(const char* s) override {
@@ -447,7 +594,9 @@ void launch_new_terminal() {
 // =============================================================================
 const char sc_ascii_nomod_map[]={0,0,'1','2','3','4','5','6','7','8','9','0','-','=','\b','\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',0,'a','s','d','f','g','h','j','k','l',';','\'','`',0,'\\','z','x','c','v','b','n','m',',','.','/',0,0,0,' ',0};
 const char sc_ascii_shift_map[]={0,0,'!','@','#','$','%','^','&','*','(',')','_','+','\b','\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',0,'A','S','D','F','G','H','J','K','L',':','"','~',0,'|','Z','X','C','V','B','N','M','<','>','?',0,0,0,' ',0};
+const char sc_ascii_ctrl_map[]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,'\b','\t','\x11',0,0,0,0,0,0,0,0,'\x10',0,0,'\n',0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,' ',0};
 bool is_shift_pressed = false;
+bool is_ctrl_pressed = false;
 int mouse_x = 400, mouse_y = 300;
 bool mouse_left_down = false;
 bool mouse_left_last_frame = false;
@@ -476,9 +625,20 @@ void poll_input() {
             bool is_press = !(scancode & 0x80);
             if (!is_press) scancode -= 0x80;
             if (scancode == 0x2A || scancode == 0x36) { is_shift_pressed = is_press; }
+            if (scancode == 0x1D) { is_ctrl_pressed = is_press; }
+            
             if (is_press) {
-                const char* map = is_shift_pressed ? sc_ascii_shift_map : sc_ascii_nomod_map;
-                if (scancode < sizeof(sc_ascii_nomod_map) && map[scancode] != 0) last_key_press = map[scancode];
+                if (scancode == 0x48) { last_key_press = KEY_UP; }
+                else if (scancode == 0x50) { last_key_press = KEY_DOWN; }
+                else if (scancode == 0x4B) { last_key_press = KEY_LEFT; }
+                else if (scancode == 0x4D) { last_key_press = KEY_RIGHT; }
+                else if (scancode == 0x53) { last_key_press = KEY_DELETE; }
+                else if (scancode == 0x47) { last_key_press = KEY_HOME; }
+                else if (scancode == 0x4F) { last_key_press = KEY_END; }
+                else {
+                    const char* map = is_ctrl_pressed ? sc_ascii_ctrl_map : (is_shift_pressed ? sc_ascii_shift_map : sc_ascii_nomod_map);
+                    if (scancode < sizeof(sc_ascii_nomod_map) && map[scancode] != 0) last_key_press = map[scancode];
+                }
             }
         }
     }
@@ -486,6 +646,7 @@ void poll_input() {
     mouse_left_down = new_mouse_state;
 }
 void draw_cursor(int x, int y, uint32_t color) { for(int i=0;i<12;i++) put_pixel_back(x,y+i,color); for(int i=0;i<8;i++) put_pixel_back(x+i,y+i,color); for(int i=0;i<4;i++) put_pixel_back(x+i,y+(11-i),color); }
+
 // =============================================================================
 // SECTION 5: DISK DRIVER & FAT32 FILESYSTEM
 // =============================================================================
@@ -545,6 +706,25 @@ typedef volatile struct {
     HBA_PORT ports[1];    // 0x90 ~ HBA memory mapped space, 1 ~ 32 ports
 } HBA_MEM;
 
+
+typedef struct { 
+    uint8_t order; 
+    uint16_t name1[5]; 
+    uint8_t attr; 
+    uint8_t type; 
+    uint8_t checksum; 
+    uint16_t name2[6]; 
+    uint16_t fst_clus_lo; 
+    uint16_t name3[2]; 
+} __attribute__((packed)) fat_lfn_entry_t;
+
+uint8_t lfn_checksum(const unsigned char *p_fname) {
+    uint8_t sum = 0;
+    for (int i = 11; i; i--) {
+        sum = ((sum & 1) ? 0x80 : 0) + (sum >> 1) + *p_fname++;
+    }
+    return sum;
+}
 static int g_ahci_port = -1; // Will store the first active port number
 typedef struct { uint8_t cfl:5, a:1, w:1, p:1, r:1, b:1, c:1, res0:1; uint16_t prdtl; volatile uint32_t prdbc; uint64_t ctba; uint32_t res1[4]; } __attribute__((packed)) HBA_CMD_HEADER;
 typedef struct { uint64_t dba; uint32_t res0; uint32_t dbc:22, res1:9, i:1; } __attribute__((packed)) HBA_PRDT_ENTRY;
@@ -605,7 +785,6 @@ int read_write_sectors(int port_num, uint64_t lba, uint16_t count, bool write, v
     prdt->dba = (uint64_t)(uintptr_t)buffer;
     prdt->dbc = (count * SECTOR_SIZE) - 1;
     
-    // **THE FIX**: Do not request an interrupt for a polled command.
     prdt->i = 0;
 
     // Configure the command FIS
@@ -625,7 +804,6 @@ int read_write_sectors(int port_num, uint64_t lba, uint16_t count, bool write, v
     // Issue the command
     port->ci = (1 << slot);
 
-    // **THE ROBUSTNESS IMPROVEMENT**: Add a timeout to the wait loop.
     int spin = 0;
     while (spin < 1000000) {
         if ((port->ci & (1 << slot)) == 0) {
@@ -667,20 +845,16 @@ void disk_init() {
 found:
     if (!ahci_base) return;
 
-    // **THE FIX**: Allocate all DMA structures with correct alignment
     cmd_list = (HBA_CMD_HEADER*)alloc_aligned(32 * sizeof(HBA_CMD_HEADER), 1024);
     cmd_table_buffer = (char*)alloc_aligned(32 * 256, 128);
     char* fis_buffer = (char*)alloc_aligned(256, 256);
     
-    // Check for allocation failures
     if (!cmd_list || !cmd_table_buffer || !fis_buffer) return;
 
-    // Link command headers to their corresponding command tables
     for(int k=0; k<32; ++k) {
         cmd_list[k].ctba = (uint64_t)(uintptr_t)(cmd_table_buffer + (k * 256));
     }
 
-    // Read the "Ports Implemented" register to know which ports are available
     uint32_t ports_implemented = *(volatile uint32_t*)(ahci_base + 0x0C);
 
     for (int i = 0; i < 32; i++) {
@@ -721,8 +895,24 @@ bool fat32_init() {
 }
 uint64_t cluster_to_lba(uint32_t cluster) { return data_start_sector + (cluster - 2) * bpb.sec_per_clus; }
 void to_83_format(const char* filename, char* out) { memset(out, ' ', 11); int i = 0, j = 0; while (filename[i] && filename[i] != '.' && j < 8) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } if(filename[i] == '.') i++; j=8; while(filename[i] && j<11) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } }
-void from_83_format(const char* fat_name, char* out) { int i, j = 0; for (i = 0; i < 8 && fat_name[i] != ' '; i++) out[j++] = fat_name[i]; if (fat_name[8] != ' ') { out[j++] = '.'; for (i = 8; i < 11 && fat_name[i] != ' '; i++) out[j++] = fat_name[i]; } out[j] = '\0'; }
-
+void from_83_format(const char* fat_name, char* out) {
+    int i, j = 0;
+    // Process the name part (before the extension)
+    for (i = 0; i < 8 && fat_name[i] != ' '; i++) {
+        // Only convert uppercase letters to lowercase
+        out[j++] = (fat_name[i] >= 'A' && fat_name[i] <= 'Z') ? fat_name[i] + 32 : fat_name[i];
+    }
+    
+    // Process the extension part, if it exists
+    if (fat_name[8] != ' ') {
+        out[j++] = '.';
+        for (i = 8; i < 11 && fat_name[i] != ' '; i++) {
+            // Only convert uppercase letters to lowercase
+            out[j++] = (fat_name[i] >= 'A' && fat_name[i] <= 'Z') ? fat_name[i] + 32 : fat_name[i];
+        }
+    }
+    out[j] = '\0';
+}
 uint32_t read_fat_entry(uint32_t cluster) {
     uint8_t* fat_sector = new uint8_t[SECTOR_SIZE];
     uint32_t fat_offset = cluster * 4;
@@ -775,42 +965,53 @@ uint32_t allocate_cluster_chain(uint32_t num_clusters) {
 }
 
 bool read_data_from_clusters(uint32_t start_cluster, void* data, uint32_t size) {
+    if (size == 0) return true;
     uint8_t* data_ptr = (uint8_t*)data;
     uint32_t remaining = size;
     uint32_t current_cluster = start_cluster;
     uint32_t cluster_size = bpb.sec_per_clus * SECTOR_SIZE;
 
-    while (current_cluster < FAT_END_OF_CHAIN && remaining > 0) {
+    while (current_cluster >= 2 && current_cluster < FAT_END_OF_CHAIN && remaining > 0) {
         uint32_t to_read = (remaining > cluster_size) ? cluster_size : remaining;
         uint8_t* cluster_buf = new uint8_t[cluster_size];
-        if(read_write_sectors(0, cluster_to_lba(current_cluster), bpb.sec_per_clus, false, cluster_buf) != 0) { delete[] cluster_buf; return false; }
+        memset(cluster_buf, 0, cluster_size); // Clear buffer
+        if(read_write_sectors(0, cluster_to_lba(current_cluster), bpb.sec_per_clus, false, cluster_buf) != 0) { 
+            delete[] cluster_buf; 
+            return false; 
+        }
         memcpy(data_ptr, cluster_buf, to_read);
         delete[] cluster_buf;
         data_ptr += to_read;
         remaining -= to_read;
-        current_cluster = read_fat_entry(current_cluster);
+        if (remaining > 0) current_cluster = read_fat_entry(current_cluster);
+        else break;
     }
-    return remaining == 0;
+    return true;
 }
 
 bool write_data_to_clusters(uint32_t start_cluster, const void* data, uint32_t size) {
+    if (size == 0) return true;
     const uint8_t* data_ptr = (const uint8_t*)data;
     uint32_t remaining = size;
     uint32_t current_cluster = start_cluster;
     uint32_t cluster_size = bpb.sec_per_clus * SECTOR_SIZE;
     uint8_t* cluster_buf = new uint8_t[cluster_size];
 
-    while (current_cluster < FAT_END_OF_CHAIN && remaining > 0) {
+    while (current_cluster >= 2 && current_cluster < FAT_END_OF_CHAIN && remaining > 0) {
         uint32_t to_write = (remaining > cluster_size) ? cluster_size : remaining;
         memset(cluster_buf, 0, cluster_size);
         memcpy(cluster_buf, data_ptr, to_write);
-        if (read_write_sectors(0, cluster_to_lba(current_cluster), bpb.sec_per_clus, true, cluster_buf) != 0) { delete[] cluster_buf; return false; }
+        if (read_write_sectors(0, cluster_to_lba(current_cluster), bpb.sec_per_clus, true, cluster_buf) != 0) { 
+            delete[] cluster_buf; 
+            return false; 
+        }
         data_ptr += to_write;
         remaining -= to_write;
-        current_cluster = read_fat_entry(current_cluster);
+        if (remaining > 0) current_cluster = read_fat_entry(current_cluster);
+        else break;
     }
     delete[] cluster_buf;
-    return remaining == 0;
+    return true;
 }
 
 uint32_t clusters_needed(uint32_t size) {
@@ -820,48 +1021,127 @@ uint32_t clusters_needed(uint32_t size) {
 }
 
 void fat32_list_files() {
-    if(!ahci_base || !current_directory_cluster) { wm.print_to_focused("Filesystem not ready.\n"); return; }
+    if (!ahci_base || !current_directory_cluster) {
+        wm.print_to_focused("Filesystem not ready.\n");
+        return;
+    }
     uint8_t* buffer = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
-    if (read_write_sectors(0, cluster_to_lba(current_directory_cluster), bpb.sec_per_clus, false, buffer) != 0) { wm.print_to_focused("Read error\n"); delete[] buffer; return; }
-    
-    wm.print_to_focused("Name          Size\n");
+    if (read_write_sectors(0, cluster_to_lba(current_directory_cluster), bpb.sec_per_clus, false, buffer) != 0) {
+        wm.print_to_focused("Read error\n");
+        delete[] buffer;
+        return;
+    }
+
+    wm.print_to_focused("Name                           Size\n");
+    char lfn_buf[256] = {0};
+
     for (uint32_t i = 0; i < (bpb.sec_per_clus * SECTOR_SIZE); i += sizeof(fat_dir_entry_t)) {
-        fat_dir_entry_t *entry = (fat_dir_entry_t *)(buffer + i);
+        fat_dir_entry_t* entry = (fat_dir_entry_t*)(buffer + i);
+
         if (entry->name[0] == 0x00) break;
-        if ((uint8_t)entry->name[0] == DELETED_ENTRY || (entry->attr & (ATTR_LONG_NAME | ATTR_VOLUME_ID))) continue;
-        char fname[13]; from_83_format(entry->name, fname);
-        char line[40]; snprintf(line, 40, "%-12s %d\n", fname, entry->file_size);
-        wm.print_to_focused(line);
+        if ((uint8_t)entry->name[0] == DELETED_ENTRY) {
+            lfn_buf[0] = '\0';
+            continue;
+        }
+        if (entry->name[0] == '.') continue;
+
+        if (entry->attr == ATTR_LONG_NAME) {
+            fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
+            if (lfn->order & 0x40) lfn_buf[0] = '\0';
+
+            char name_part[14] = {0};
+            int k = 0;
+            auto extract = [&](uint16_t val) {
+                if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
+            };
+            for(int j=0; j<5; j++) extract(lfn->name1[j]);
+            for(int j=0; j<6; j++) extract(lfn->name2[j]);
+            for(int j=0; j<2; j++) extract(lfn->name3[j]);
+
+            memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
+            memcpy(lfn_buf, name_part, k);
+
+        } else if (!(entry->attr & ATTR_VOLUME_ID)) {
+            char line[120];
+            char fname_83[13];
+            const char* name_to_print;
+
+            if (lfn_buf[0] != '\0') {
+                name_to_print = lfn_buf;
+            } else {
+                from_83_format(entry->name, fname_83);
+                name_to_print = fname_83;
+            }
+
+            // Manually copy and pad the filename to 30 characters
+            int name_len = strlen(name_to_print);
+            int copy_len = (name_len > 30) ? 30 : name_len;
+            memcpy(line, name_to_print, copy_len);
+            for (int k = copy_len; k < 30; ++k) {
+                line[k] = ' ';
+            }
+            line[30] = '\0'; // Terminate after the padded name
+
+            // Use a simple snprintf for just the size
+            snprintf(line + 30, 90, " %d\n", entry->file_size);
+            
+            wm.print_to_focused(line);
+            lfn_buf[0] = '\0'; // Reset for next entry
+        }
     }
     delete[] buffer;
 }
-
 int fat32_write_file(const char* filename, const void* data, uint32_t size) {
-    char target_83[11]; to_83_format(filename, target_83);
+    // First, safely remove the file if it already exists to handle overwrites correctly.
+    fat32_remove_file(filename);
+
+    char target_83[11];
+    to_83_format(filename, target_83);
     uint32_t first_cluster = 0;
+
     if (size > 0) {
-        first_cluster = allocate_cluster_chain(clusters_needed(size));
-        if (first_cluster == 0) return -1;
-        if (!write_data_to_clusters(first_cluster, data, size)) { free_cluster_chain(first_cluster); return -1; }
+        uint32_t num_clusters = clusters_needed(size);
+        if (num_clusters == 0) return -1;
+        
+        first_cluster = allocate_cluster_chain(num_clusters);
+        if (first_cluster == 0) return -1; // Out of space
+        if (!write_data_to_clusters(first_cluster, data, size)) {
+            free_cluster_chain(first_cluster);
+            return -1; // Write error
+        }
     }
+
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    for(uint8_t s = 0; s < bpb.sec_per_clus; s++) {
-        read_write_sectors(0, cluster_to_lba(current_directory_cluster) + s, 1, false, dir_buf);
-        for(uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
+    for (uint8_t s = 0; s < bpb.sec_per_clus; s++) {
+        uint64_t sector_lba = cluster_to_lba(current_directory_cluster) + s;
+        if (read_write_sectors(0, sector_lba, 1, false, dir_buf) != 0) continue;
+
+        for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
             fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
-            if(entry->name[0] == 0x00 || (uint8_t)entry->name[0] == DELETED_ENTRY) {
+            if (entry->name[0] == 0x00 || (uint8_t)entry->name[0] == DELETED_ENTRY) {
+                // Found a free slot, create the entry.
+                memset(entry, 0, sizeof(fat_dir_entry_t));
                 memcpy(entry->name, target_83, 11);
-                entry->attr = ATTR_ARCHIVE; entry->file_size = size;
-                entry->fst_clus_lo = first_cluster & 0xFFFF; entry->fst_clus_hi = (first_cluster >> 16) & 0xFFFF;
-                read_write_sectors(0, cluster_to_lba(current_directory_cluster) + s, 1, true, dir_buf);
-                delete[] dir_buf;
-                return 0;
+                entry->attr = ATTR_ARCHIVE;
+                entry->file_size = size;
+                entry->fst_clus_lo = first_cluster & 0xFFFF;
+                entry->fst_clus_hi = (first_cluster >> 16) & 0xFFFF;
+                
+                if (read_write_sectors(0, sector_lba, 1, true, dir_buf) == 0) {
+                    delete[] dir_buf;
+                    return 0; // Success
+                } else {
+                    delete[] dir_buf;
+                    if(first_cluster > 0) free_cluster_chain(first_cluster);
+                    return -1; // Directory write error
+                }
             }
         }
     }
+
     delete[] dir_buf;
-    if(first_cluster > 0) free_cluster_chain(first_cluster);
-    return -1;
+    if (first_cluster > 0) free_cluster_chain(first_cluster);
+    return -1; // Directory is full
 }
 
 char* fat32_read_file_as_string(const char* filename) {
@@ -889,20 +1169,60 @@ char* fat32_read_file_as_string(const char* filename) {
 }
 
 int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t* sector_out, uint32_t* offset_out) {
-    char target[11]; to_83_format(filename, target);
+    char lfn_buf[256] = {0};
+    uint8_t current_checksum = 0;
+    
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
     for(uint8_t s=0; s<bpb.sec_per_clus; ++s) {
         uint32_t current_sector = cluster_to_lba(current_directory_cluster) + s;
-        if(read_write_sectors(0, current_sector, 1, false, dir_buf) != 0) { delete[] dir_buf; return -1; }
+        if(read_write_sectors(0, current_sector, 1, false, dir_buf) != 0) { 
+            delete[] dir_buf; 
+            return -1; 
+        }
+        
         for(uint16_t e=0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); ++e) {
             fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e*sizeof(fat_dir_entry_t));
-            if(entry->name[0] == 0x00) { delete[] dir_buf; return -1; } // End of directory
-            if(memcmp(entry->name, target, 11) == 0) {
-                memcpy(entry_out, entry, sizeof(fat_dir_entry_t));
-                *sector_out = current_sector;
-                *offset_out = e*sizeof(fat_dir_entry_t);
-                delete[] dir_buf;
-                return 0;
+            if(entry->name[0] == 0x00) { delete[] dir_buf; return -1; }
+            if((uint8_t)entry->name[0] == DELETED_ENTRY) { lfn_buf[0] = '\0'; continue; }
+
+            if(entry->attr == ATTR_LONG_NAME) {
+                fat_lfn_entry_t* lfn = (fat_lfn_entry_t*)entry;
+                if (lfn->order & 0x40) { 
+                    lfn_buf[0] = '\0'; 
+                    current_checksum = lfn->checksum; 
+                }
+                
+                char name_part[14] = {0};
+                int k = 0;
+                auto extract = [&](uint16_t val) {
+                    if (k < 13 && val != 0x0000 && val != 0xFFFF) name_part[k++] = (char)val;
+                };
+                for(int j=0; j<5; j++) extract(lfn->name1[j]);
+                for(int j=0; j<6; j++) extract(lfn->name2[j]);
+                for(int j=0; j<2; j++) extract(lfn->name3[j]);
+
+                memmove(lfn_buf + k, lfn_buf, strlen(lfn_buf) + 1);
+                memcpy(lfn_buf, name_part, k);
+
+            } else if (!(entry->attr & ATTR_VOLUME_ID)) {
+                bool match = false;
+                if(lfn_buf[0] != '\0' && lfn_checksum((unsigned char*)entry->name) == current_checksum) {
+                    if(strcmp(lfn_buf, filename) == 0) match = true;
+                } else {
+                    char sfn_name[13]; 
+                    from_83_format(entry->name, sfn_name);
+                    if(strcmp(sfn_name, filename) == 0) match = true;
+                }
+
+                lfn_buf[0] = '\0';
+
+                if(match) {
+                    memcpy(entry_out, entry, sizeof(fat_dir_entry_t));
+                    *sector_out = current_sector;
+                    *offset_out = e * sizeof(fat_dir_entry_t);
+                    delete[] dir_buf;
+                    return 0;
+                }
             }
         }
     }
@@ -928,15 +1248,36 @@ int fat32_remove_file(const char* filename) {
 int fat32_rename_file(const char* old_name, const char* new_name) {
     fat_dir_entry_t entry;
     uint32_t sector, offset;
-    if(fat32_find_entry(old_name, &entry, &sector, &offset) != 0) return -1;
+    fat_dir_entry_t dummy_entry;
+    uint32_t dummy_sector, dummy_offset;
+
+    // 1. Check if new_name already exists. If so, fail.
+    if (fat32_find_entry(new_name, &dummy_entry, &dummy_sector, &dummy_offset) == 0) {
+        return -1; // Destination file already exists
+    }
+
+    // 2. Find the old file. If it doesn't exist, fail.
+    if (fat32_find_entry(old_name, &entry, &sector, &offset) != 0) {
+        return -1; // Source file not found
+    }
     
+    // 3. Read, modify, and write back the directory sector.
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    read_write_sectors(0, sector, 1, false, dir_buf);
+    if (read_write_sectors(0, sector, 1, false, dir_buf) != 0) {
+        delete[] dir_buf;
+        return -1;
+    }
+
     fat_dir_entry_t* target_entry = (fat_dir_entry_t*)(dir_buf + offset);
     to_83_format(new_name, target_entry->name);
-    read_write_sectors(0, sector, 1, true, dir_buf);
+    
+    if (read_write_sectors(0, sector, 1, true, dir_buf) != 0) {
+        delete[] dir_buf;
+        return -1;
+    }
+
     delete[] dir_buf;
-    return 0;
+    return 0; // Success
 }
 
 void fat32_format() {
@@ -946,8 +1287,6 @@ void fat32_format() {
     }
     wm.print_to_focused("WARNING: This is a destructive operation!\nFormatting disk...\n");
 
-    // Create a new, valid BPB in memory. This is the crucial fix.
-    // These values are typical for many virtual disks.
     fat32_bpb_t new_bpb;
     memset(&new_bpb, 0, sizeof(fat32_bpb_t));
     new_bpb.jmp[0] = 0xEB; new_bpb.jmp[1] = 0x58; new_bpb.jmp[2] = 0x90;
@@ -959,9 +1298,6 @@ void fat32_format() {
     new_bpb.media = 0xF8;
     new_bpb.sec_per_trk = 32;
     new_bpb.num_heads = 64;
-    // Assuming a total disk size that can be represented in tot_sec32.
-    // A proper implementation would get this from the disk driver.
-    // For now, let's assume a reasonable size like 128MB.
     uint32_t total_sectors = (128 * 1024 * 1024) / 512;
     new_bpb.tot_sec32 = total_sectors;
     new_bpb.fat_sz32 = (total_sectors * 2) / (new_bpb.sec_per_clus + 512) + 1;
@@ -974,14 +1310,15 @@ void fat32_format() {
     memcpy(new_bpb.vol_lab, "MYOS VOL   ", 11);
     memcpy(new_bpb.fil_sys_type, "FAT32   ", 8);
     
-    // Write the new BPB to sector 0
     wm.print_to_focused("Writing new boot sector...\n");
     char* boot_sector_buffer = new char[SECTOR_SIZE];
     memset(boot_sector_buffer, 0, SECTOR_SIZE);
     memcpy(boot_sector_buffer, &new_bpb, sizeof(fat32_bpb_t));
-    // Add boot signature
     boot_sector_buffer[510] = 0x55;
     boot_sector_buffer[511] = 0xAA;
+	
+	boot_sector_buffer[510] = 0x00; //dummy boot for testing
+    boot_sector_buffer[511] = 0x00; //dummy boot for testing
     if (read_write_sectors(0, 0, 1, true, boot_sector_buffer) != 0) {
         wm.print_to_focused("Error: Failed to write new boot sector.\n");
         delete[] boot_sector_buffer;
@@ -989,12 +1326,10 @@ void fat32_format() {
     }
     delete[] boot_sector_buffer;
 
-    // Now, copy the new BPB into our global bpb for the rest of the function to use
     memcpy(&bpb, &new_bpb, sizeof(fat32_bpb_t));
     fat_start_sector = bpb.rsvd_sec_cnt;
     data_start_sector = fat_start_sector + (bpb.num_fats * bpb.fat_sz32);
 
-    // 1. Zero out both FATs
     uint8_t* zero_sector = new uint8_t[SECTOR_SIZE];
     memset(zero_sector, 0, SECTOR_SIZE);
     wm.print_to_focused("Clearing FATs...\n");
@@ -1003,14 +1338,12 @@ void fat32_format() {
         read_write_sectors(0, fat_start_sector + bpb.fat_sz32 + i, 1, true, zero_sector); // FAT2
     }
 
-    // 2. Zero out the root directory cluster
     wm.print_to_focused("Clearing root directory...\n");
     for (uint8_t i = 0; i < bpb.sec_per_clus; ++i) {
         read_write_sectors(0, cluster_to_lba(bpb.root_clus) + i, 1, true, zero_sector);
     }
     delete[] zero_sector;
 
-    // 3. Set up initial FAT entries
     wm.print_to_focused("Writing initial FAT entries...\n");
     write_fat_entry(0, 0x0FFFFFF8); // Media descriptor
     write_fat_entry(1, 0x0FFFFFFF); // Reserved, EOC
@@ -1121,99 +1454,214 @@ void interpret_c(const char* source) {
 
 
 // --- Command parsing helper ---
-char* get_arg(char* line, int n) {
-    char* p = line;
-    // Skip command itself
-    while (*p && *p != ' ') p++;
-    while (*p && *p == ' ') p++;
+// --- Command parsing helper ---
+char* get_arg(char* args, int n) {
+    char* p = args;
 
+    // Loop to find the start of the Nth argument
     for (int i = 0; i < n; i++) {
-        while (*p && *p != ' ') p++;
+        // Skip leading spaces for the current argument
         while (*p && *p == ' ') p++;
+
+        // If we're at the end of the string, the requested arg doesn't exist
+        if (*p == '\0') return nullptr;
+
+        // Skip over the content of the current argument
+        if (*p == '"') {
+            p++; // Skip opening quote
+            while (*p && *p != '"') p++;
+            if (*p == '"') p++; // Skip closing quote
+        } else {
+            while (*p && *p != ' ') p++;
+        }
     }
 
+    // Now p is at the start of the Nth argument (or spaces before it)
+    while (*p && *p == ' ') p++;
     if (*p == '\0') return nullptr;
 
     char* arg_start = p;
-    while (*p && *p != ' ') p++;
-    if (*p) *p = '\0'; // Null terminate this argument
-
+    if (*p == '"') {
+        arg_start++; // The actual argument starts after the quote
+        p++;
+        while (*p && *p != '"') p++;
+        if (*p == '"') *p = '\0'; // Place null terminator on the closing quote
+    } else {
+        while (*p && *p != ' ') p++;
+        if (*p) *p = '\0'; // Place null terminator on the space
+    }
     return arg_start;
 }
 
 
+
+// --- Terminal command handler ---
 // --- Terminal command handler ---
 void TerminalWindow::handle_command() {
-    if(in_editor) {
-        return; // Should be handled by on_key_press
-    }
-    
-    char cmd_copy[120];
-    strncpy(cmd_copy, current_line, 119);
-    cmd_copy[119] = '\0';
-    
-    char* first_word = cmd_copy;
-    char* space = strchr(cmd_copy, ' ');
-    if (space) {
-        *space = '\0';
+    char cmd_line[120];
+    strncpy(cmd_line, current_line, 119);
+    cmd_line[119] = '\0';
+
+    // 1. Trim leading whitespace
+    char* command = cmd_line;
+    while (*command && *command == ' ') {
+        command++;
     }
 
-    if (strcmp(first_word, "help") == 0) console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, time, version\n");
-    else if (strcmp(first_word, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
-    else if (strcmp(first_word, "ls") == 0) fat32_list_files();
-    else if (strcmp(first_word, "edit") == 0) {
-        char* filename = get_arg(current_line, 0);
+    if (*command == '\0') { // Handle empty or whitespace-only lines
+        if (!in_editor) print_prompt();
+        return;
+    }
+
+    // 2. Isolate the command word and get a pointer to the arguments string
+    char* args = command;
+    while (*args && *args != ' ') {
+        args++;
+    }
+    if (*args) { // If we found a space (i.e., there are arguments)
+        *args = '\0'; // Null-terminate the command word
+        args++;      // Move pointer to the start of the arguments
+        while (*args && *args == ' ') {
+            args++; // Skip any extra spaces
+        }
+    }
+
+    // 3. Now, `command` is the clean first word, and `args` is the rest.
+    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, time, version\n"); }
+    else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
+    else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
+    else if (strcmp(command, "edit") == 0) {
+        char* filename = get_arg(args, 0);
         if(filename) {
             strncpy(edit_filename, filename, 31);
             edit_filename[31] = '\0';
             in_editor = true;
-            edit_buffer = new char[16384]; // 16KB edit buffer
-            memset(edit_buffer, 0, 16384);
-            edit_buf_pos = 0;
-
+            edit_current_line = 0;
+            edit_cursor_col = 0;
+            edit_scroll_offset = 0;
+            // ... (rest of edit logic is unchanged)
             char* content = fat32_read_file_as_string(filename);
             if (content) {
-                console_print("Editing existing file. Contents:\n---\n");
-                console_print(content);
-                console_print("\n---\nType 'save' on a new line to save and exit.\n");
-                strncpy(edit_buffer, content, 16383);
-                edit_buf_pos = strlen(edit_buffer);
+                int line_count_temp = 1;
+                for (char* p = content; *p; p++) if (*p == '\n') line_count_temp++;
+                
+                edit_lines = new char*[line_count_temp];
+                edit_line_count = 0;
+                
+                char* line_start = content;
+                for (char* p = content; *p; p++) {
+                    if (*p == '\n') {
+                        *p = '\0';
+                        edit_lines[edit_line_count] = new char[120];
+                        memset(edit_lines[edit_line_count], 0, 120);
+                        strncpy(edit_lines[edit_line_count], line_start, 119);
+                        edit_line_count++;
+                        line_start = p + 1;
+                    }
+                }
+                if (*line_start) {
+                    edit_lines[edit_line_count] = new char[120];
+                    memset(edit_lines[edit_line_count], 0, 120);
+                    strncpy(edit_lines[edit_line_count], line_start, 119);
+                    edit_line_count++;
+                }
                 delete[] content;
             } else {
-                console_print("New file. Type 'save' on a new line to save and exit.\n");
+                edit_lines = new char*[1];
+                edit_lines[0] = new char[120];
+                memset(edit_lines[0], 0, 120);
+                edit_line_count = 1;
             }
         } else {
-            console_print("Usage: edit <filename>\n");
+            console_print("Usage: edit \"<filename>\"\n");
         }
     }
-    else if (strcmp(first_word, "run") == 0) { char* filename = get_arg(current_line, 0); if(filename) { char* s = fat32_read_file_as_string(filename); if(s) { interpret_c(s); delete[] s; } else { console_print("File not found.\n"); }} else { console_print("Usage: run <filename>\n");}}
-    else if (strcmp(first_word, "rm") == 0) { char* filename = get_arg(current_line, 0); if(filename) { if(fat32_remove_file(filename) == 0) console_print("File removed.\n"); else console_print("Failed.\n");} else { console_print("Usage: rm <filename>\n");}}
-    else if (strcmp(first_word, "cp") == 0) {
-        char* src = get_arg(current_line, 0);
-        char* dest = get_arg(current_line, 1);
-        if(!src || !dest) { console_print("Usage: cp <source> <dest>\n"); }
-        else {
-            char* content = fat32_read_file_as_string(src);
-            if(content) {
-                if(fat32_write_file(dest, content, strlen(content)) == 0) console_print("Copied.\n");
-                else console_print("Write failed.\n");
-                delete[] content;
-            } else { console_print("Source not found.\n"); }
+    else if (strcmp(command, "run") == 0) { 
+        char* filename = get_arg(args, 0); 
+        if(filename) { 
+            char* s = fat32_read_file_as_string(filename); 
+            if(s) { 
+                interpret_c(s); 
+                delete[] s; 
+            } else { 
+                console_print("File not found.\n"); 
+            }
+        } else { 
+            console_print("Usage: run \"<filename>\"\n");
         }
     }
-    else if (strcmp(first_word, "mv") == 0) {
-        char* src = get_arg(current_line, 0);
-        char* dest = get_arg(current_line, 1);
-        if(!src || !dest) { console_print("Usage: mv <source> <dest>\n"); }
-        else {
-            if(fat32_rename_file(src, dest) == 0) console_print("Moved.\n");
-            else console_print("Failed.\n");
+    else if (strcmp(command, "rm") == 0) { 
+        char* filename = get_arg(args, 0); 
+        if(filename) { 
+            if(fat32_remove_file(filename) == 0) 
+                console_print("File removed.\n"); 
+            else 
+                console_print("Failed to remove file.\n");
+        } else { 
+            console_print("Usage: rm \"<filename>\"\n");
         }
     }
-    else if (strcmp(first_word, "formatfs") == 0) { fat32_format(); }
-    else if (strcmp(first_word, "time") == 0) { RTC_Time t = read_rtc(); char buf[64]; snprintf(buf, 64, "%d:%d:%d %d/%d/%d\n", t.hour, t.minute, t.second, t.day, t.month, t.year); console_print(buf); }
-    else if (strcmp(first_word, "version") == 0) { console_print("RTOS++ v0.6 - Stable\n"); }
-    else if (strlen(current_line) > 0) { console_print("Unknown command.\n"); }
+    else if (strcmp(command, "cp") == 0) {
+        char args_for_src[120];
+        strncpy(args_for_src, args, 119);
+        char* src = get_arg(args_for_src, 0);
+
+        char args_for_dest[120];
+        strncpy(args_for_dest, args, 119);
+        char* dest = get_arg(args_for_dest, 1);
+        
+        if(!src || !dest) { 
+            console_print("Usage: cp \"<source>\" \"<dest>\"\n"); 
+        } else {
+            fat_dir_entry_t entry;
+            uint32_t sector, offset;
+            if (fat32_find_entry(src, &entry, &sector, &offset) == 0) {
+                char* content = new char[entry.file_size];
+                if (content && read_data_from_clusters((entry.fst_clus_hi << 16) | entry.fst_clus_lo, content, entry.file_size)) {
+                    if(fat32_write_file(dest, content, entry.file_size) == 0) {
+                        console_print("Copied.\n");
+                    } else {
+                        console_print("Write failed.\n");
+                    }
+                } else {
+                    console_print("Read failed.\n");
+                }
+                if (content) delete[] content;
+            } else {
+                console_print("Source not found.\n");
+            }
+        }
+    }
+    else if (strcmp(command, "mv") == 0) {
+        char args_for_src[120];
+        strncpy(args_for_src, args, 119);
+        char* src = get_arg(args_for_src, 0);
+
+        char args_for_dest[120];
+        strncpy(args_for_dest, args, 119);
+        char* dest = get_arg(args_for_dest, 1);
+
+        if(!src || !dest) { 
+            console_print("Usage: mv \"<source>\" \"<dest>\"\n"); 
+        } else {
+            if(fat32_rename_file(src, dest) == 0) {
+                console_print("Moved.\n");
+            } else {
+                console_print("Failed. (Source not found or destination exists).\n");
+            }
+        }
+    }
+    else if (strcmp(command, "formatfs") == 0) { fat32_format(); }
+    else if (strcmp(command, "time") == 0) { 
+        RTC_Time t = read_rtc(); 
+        char buf[64]; 
+        snprintf(buf, 64, "%d:%d:%d %d/%d/%d\n", t.hour, t.minute, t.second, t.day, t.month, t.year); 
+        console_print(buf); 
+    }
+    else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.0 - Robust Parsing\n"); }
+    else if (strlen(command) > 0) { 
+        console_print("Unknown command.\n"); 
+    }
     
     if(!in_editor) print_prompt();
 }
