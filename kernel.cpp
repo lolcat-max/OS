@@ -609,37 +609,35 @@ void poll_input() {
         uint8_t status = inb(0x64);
         uint8_t scancode = inb(0x60);
         if (status & 0x20) {
-            // In poll_input(), inside the `if (status & 0x20)` block...
+            static uint8_t mouse_cycle = 0;
+            static int8_t mouse_packet[3];
+            mouse_packet[mouse_cycle++] = scancode;
 
-			static uint8_t mouse_cycle = 0;
-			static int8_t mouse_packet[3];
-			mouse_packet[mouse_cycle++] = scancode;
+            if (mouse_cycle == 3) {
+                mouse_cycle = 0;
+                new_mouse_state = mouse_packet[0] & 0x01;
 
-			if (mouse_cycle == 3) {
-				mouse_cycle = 0;
-				new_mouse_state = mouse_packet[0] & 0x01;
+                // Correctly calculate signed deltas
+                int delta_x = mouse_packet[1];
+                int delta_y = mouse_packet[2];
 
-				// Correctly calculate signed deltas
-				int delta_x = mouse_packet[1];
-				int delta_y = mouse_packet[2];
+                if (mouse_packet[0] & 0x10) { // X sign bit is set
+                    delta_x |= 0xFFFFFF00; // Sign extend to a negative 32-bit int
+                }
+                if (mouse_packet[0] & 0x20) { // Y sign bit is set
+                    delta_y |= 0xFFFFFF00; // Sign extend to a negative 32-bit int
+                }
 
-				if (mouse_packet[0] & 0x10) { // X sign bit is set
-					delta_x |= 0xFFFFFF00; // Sign extend to a negative 32-bit int
-				}
-				if (mouse_packet[0] & 0x20) { // Y sign bit is set
-					delta_y |= 0xFFFFFF00; // Sign extend to a negative 32-bit int
-				}
+                // Y movement is inverted in graphics coordinates
+                mouse_x += delta_x;
+                mouse_y -= delta_y;
 
-				// Y movement is inverted in graphics coordinates
-				mouse_x += delta_x;
-				mouse_y -= delta_y;
-
-				// Clamp coordinates to screen bounds
-				if (mouse_x < 0) mouse_x = 0;
-				if (mouse_y < 0) mouse_y = 0;
-				if (mouse_x >= (int)fb_info.width) mouse_x = fb_info.width - 1;
-				if (mouse_y >= (int)fb_info.height) mouse_y = fb_info.height - 1;
-			}
+                // Clamp coordinates to screen bounds
+                if (mouse_x < 0) mouse_x = 0;
+                if (mouse_y < 0) mouse_y = 0;
+                if (mouse_x >= (int)fb_info.width) mouse_x = fb_info.width - 1;
+                if (mouse_y >= (int)fb_info.height) mouse_y = fb_info.height - 1;
+            }
         } else {
             bool is_press = !(scancode & 0x80);
             if (!is_press) scancode -= 0x80;
@@ -685,7 +683,7 @@ void draw_cursor(int x, int y, uint32_t color) { for(int i=0;i<12;i++) put_pixel
 #define ATTR_ARCHIVE 0x20
 #define FAT_FREE_CLUSTER 0x00000000
 #define FAT_END_OF_CHAIN 0x0FFFFFFF
-// Add these definitions near the other AHCI/FAT32 structs
+
 typedef volatile struct {
     uint32_t clb;         // 0x00, command list base address, 1K-byte aligned
     uint32_t clbu;        // 0x04, command list base address upper 32 bits
@@ -1335,9 +1333,9 @@ void fat32_format() {
     memcpy(boot_sector_buffer, &new_bpb, sizeof(fat32_bpb_t));
     boot_sector_buffer[510] = 0x55;
     boot_sector_buffer[511] = 0xAA;
-	
-	boot_sector_buffer[510] = 0x00; //dummy boot for testing
-    boot_sector_buffer[511] = 0x00; //dummy boot for testing
+	boot_sector_buffer[510] = 0x00;
+    boot_sector_buffer[511] = 0x00;
+    
     if (read_write_sectors(0, 0, 1, true, boot_sector_buffer) != 0) {
         wm.print_to_focused("Error: Failed to write new boot sector.\n");
         delete[] boot_sector_buffer;
@@ -1378,174 +1376,445 @@ void fat32_format() {
 
 
 // =============================================================================
-// SECTION 6: SELF-HOSTED C COMPILER
+// SECTION 6: SELF-HOSTED C COMPILER (ELABORATED)
 // =============================================================================
-struct Symbol { char name[32]; int value; };
-static Symbol symbol_table[50];
-static int symbol_count = 0;
-static int get_symbol_value(const char* name) { for (int i = 0; i < symbol_count; ++i) if (strcmp(symbol_table[i].name, name) == 0) return symbol_table[i].value; return 0; }
-static void set_symbol_value(const char* name, int value) { for (int i = 0; i < symbol_count; ++i) if (strcmp(symbol_table[i].name, name) == 0) { symbol_table[i].value = value; return; } if (symbol_count < 50) { strncpy(symbol_table[symbol_count].name, name, 31); symbol_table[symbol_count].name[31] = '\0'; symbol_table[symbol_count].value = value; symbol_count++; } }
 
-// Helper to trim leading/trailing whitespace
-static char* trim(char* str) {
-    if (!str) return str;
-    char* end;
-    while(*str == ' ' || *str == '\t') str++;
-    if(*str == 0) return str;
-    end = str + strlen(str) - 1;
-    while(end > str && (*end == ' ' || *end == '\t')) end--;
-    *(end + 1) = 0;
-    return str;
-}
+// --- Forward Declarations for Parser ---
+static int parse_expression();
+static void parse_statement();
 
-// Helper to evaluate a part of an expression (either a literal or a variable)
-static int eval_expr_part(char* part) {
-    part = trim(part);
-    if(part[0] >= '0' && part[0] <= '9') {
-        return simple_atoi(part);
-    } else {
-        return get_symbol_value(part);
+// --- Tokenizer (Lexer) ---
+enum TokenType {
+    TOKEN_EOF, TOKEN_ERROR,
+    // Keywords
+    TOKEN_INT, TOKEN_PRINT, TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE,
+    // Literals & Identifiers
+    TOKEN_IDENTIFIER, TOKEN_NUMBER,
+    // Single-character tokens
+    TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
+    TOKEN_SEMICOLON, TOKEN_PLUS, TOKEN_MINUS, TOKEN_STAR, TOKEN_SLASH,
+    TOKEN_ASSIGN, TOKEN_LESS, TOKEN_GREATER,
+    // Two-character tokens
+    TOKEN_EQ, TOKEN_NEQ, TOKEN_LEQ, TOKEN_GEQ
+};
+
+struct Token {
+    TokenType type;
+    const char* start;
+    int length;
+    int value; // For TOKEN_NUMBER
+};
+
+struct Lexer {
+    const char* start;
+    const char* current;
+    Token current_token;
+    Token prev_token;
+};
+
+static Lexer lexer;
+
+static bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+static bool is_digit(char c) { return c >= '0' && c <= '9'; }
+static bool is_at_end() { return *lexer.current == '\0'; }
+
+static void skip_whitespace() {
+    for (;;) {
+        char c = *lexer.current;
+        switch (c) {
+            case ' ': case '\r': case '\t': case '\n':
+                lexer.current++;
+                break;
+            default:
+                return;
+        }
     }
 }
 
-// Evaluates a simple expression, e.g., "x + 5" or "y"
-static int eval_expression(char* expr) {
-    expr = trim(expr);
-    char* plus = strchr(expr, '+');
-    if (plus) {
-        *plus = '\0';
-        int lhs = eval_expr_part(expr);
-        int rhs = eval_expr_part(plus + 1);
-        return lhs + rhs;
+static Token make_token(TokenType type) {
+    Token token;
+    token.type = type;
+    token.start = lexer.start;
+    token.length = (int)(lexer.current - lexer.start);
+    return token;
+}
+
+static TokenType check_keyword(int start, int length, const char* rest, TokenType type) {
+    if (lexer.current - lexer.start == start + length && memcmp(lexer.start + start, rest, length) == 0) {
+        return type;
+    }
+    return TOKEN_IDENTIFIER;
+}
+
+static TokenType identifier_type() {
+    switch (lexer.start[0]) {
+        case 'e': return check_keyword(1, 3, "lse", TOKEN_ELSE);
+        case 'i':
+            if (lexer.current - lexer.start > 1) {
+                switch (lexer.start[1]) {
+                    case 'f': return check_keyword(2, 0, "", TOKEN_IF);
+                    case 'n': return check_keyword(2, 1, "t", TOKEN_INT);
+                }
+            }
+            break;
+        case 'p': return check_keyword(1, 4, "rint", TOKEN_PRINT);
+        case 'w': return check_keyword(1, 4, "hile", TOKEN_WHILE);
+    }
+    return TOKEN_IDENTIFIER;
+}
+
+static Token identifier() {
+    while (is_alpha(*lexer.current) || is_digit(*lexer.current)) lexer.current++;
+    return make_token(identifier_type());
+}
+
+static Token number() {
+    while (is_digit(*lexer.current)) lexer.current++;
+    Token t = make_token(TOKEN_NUMBER);
+    t.value = simple_atoi(t.start);
+    return t;
+}
+
+static Token scan_token() {
+    skip_whitespace();
+    lexer.start = lexer.current;
+    if (is_at_end()) return make_token(TOKEN_EOF);
+
+    char c = *lexer.current++;
+    if (is_alpha(c)) return identifier();
+    if (is_digit(c)) return number();
+
+    switch (c) {
+        case '(': return make_token(TOKEN_LPAREN);
+        case ')': return make_token(TOKEN_RPAREN);
+        case '{': return make_token(TOKEN_LBRACE);
+        case '}': return make_token(TOKEN_RBRACE);
+        case ';': return make_token(TOKEN_SEMICOLON);
+        case '+': return make_token(TOKEN_PLUS);
+        case '-': return make_token(TOKEN_MINUS);
+        case '*': return make_token(TOKEN_STAR);
+        case '/': return make_token(TOKEN_SLASH);
+        case '=': return make_token(*lexer.current == '=' ? (lexer.current++, TOKEN_EQ) : TOKEN_ASSIGN);
+        case '!': return make_token(*lexer.current == '=' ? (lexer.current++, TOKEN_NEQ) : TOKEN_ERROR);
+        case '<': return make_token(*lexer.current == '=' ? (lexer.current++, TOKEN_LEQ) : TOKEN_LESS);
+        case '>': return make_token(*lexer.current == '=' ? (lexer.current++, TOKEN_GEQ) : TOKEN_GREATER);
+    }
+
+    return make_token(TOKEN_ERROR);
+}
+
+static void advance() {
+    lexer.prev_token = lexer.current_token;
+    lexer.current_token = scan_token();
+}
+
+static bool match(TokenType type) {
+    if (lexer.current_token.type == type) {
+        advance();
+        return true;
+    }
+    return false;
+}
+
+// --- Symbol Table & Scoping ---
+#define MAX_SYMBOLS_PER_SCOPE 20
+#define MAX_SCOPES 10
+
+struct Symbol {
+    Token name;
+    int value;
+};
+
+struct Scope {
+    Symbol symbols[MAX_SYMBOLS_PER_SCOPE];
+    int symbol_count;
+};
+
+static Scope scope_stack[MAX_SCOPES];
+static int current_scope_level = -1;
+
+static void enter_scope() {
+    if (current_scope_level < MAX_SCOPES - 1) {
+        current_scope_level++;
+        scope_stack[current_scope_level].symbol_count = 0;
+    }
+}
+
+static void leave_scope() {
+    if (current_scope_level >= 0) {
+        current_scope_level--;
+    }
+}
+
+static bool identifiers_equal(Token* a, Token* b) {
+    if (a->length != b->length) return false;
+    return memcmp(a->start, b->start, a->length) == 0;
+}
+
+static void add_symbol(Token name) {
+    if (current_scope_level < 0) return; // Should not happen
+    Scope* scope = &scope_stack[current_scope_level];
+    if (scope->symbol_count < MAX_SYMBOLS_PER_SCOPE) {
+        Symbol* symbol = &scope->symbols[scope->symbol_count++];
+        symbol->name = name;
+        symbol->value = 0;
+    }
+}
+
+static Symbol* find_symbol(Token name) {
+    for (int i = current_scope_level; i >= 0; i--) {
+        Scope* scope = &scope_stack[i];
+        for (int j = 0; j < scope->symbol_count; j++) {
+            if (identifiers_equal(&name, &scope->symbols[j].name)) {
+                return &scope->symbols[j];
+            }
+        }
+    }
+    return nullptr;
+}
+
+// --- Expression Parser ---
+static int parse_primary() {
+    if (match(TOKEN_NUMBER)) {
+        return lexer.prev_token.value;
+    }
+    if (match(TOKEN_IDENTIFIER)) {
+        Symbol* sym = find_symbol(lexer.prev_token);
+        if (sym) return sym->value;
+        return 0; // Undeclared variable evaluates to 0
+    }
+    if (match(TOKEN_LPAREN)) {
+        int value = parse_expression();
+        match(TOKEN_RPAREN); // Consume ')'
+        return value;
+    }
+    return 0;
+}
+
+static int parse_unary() {
+    if (match(TOKEN_MINUS)) {
+        return -parse_unary();
+    }
+    return parse_primary();
+}
+
+static int parse_multiplication() {
+    int value = parse_unary();
+    while (match(TOKEN_STAR) || match(TOKEN_SLASH)) {
+        TokenType op = lexer.prev_token.type;
+        int right = parse_unary();
+        if (op == TOKEN_STAR) value *= right;
+        else if (op == TOKEN_SLASH) {
+            if (right != 0) value /= right; else value = 0;
+        }
+    }
+    return value;
+}
+
+static int parse_addition() {
+    int value = parse_multiplication();
+    while (match(TOKEN_PLUS) || match(TOKEN_MINUS)) {
+        TokenType op = lexer.prev_token.type;
+        int right = parse_multiplication();
+        if (op == TOKEN_PLUS) value += right;
+        else if (op == TOKEN_MINUS) value -= right;
+    }
+    return value;
+}
+
+static int parse_comparison() {
+    int value = parse_addition();
+    while (match(TOKEN_EQ) || match(TOKEN_NEQ) || match(TOKEN_LESS) || match(TOKEN_LEQ) || match(TOKEN_GREATER) || match(TOKEN_GEQ)) {
+        TokenType op = lexer.prev_token.type;
+        int right = parse_addition();
+        switch (op) {
+            case TOKEN_EQ:  value = (value == right); break;
+            case TOKEN_NEQ: value = (value != right); break;
+            case TOKEN_LESS:    value = (value < right);  break;
+            case TOKEN_LEQ: value = (value <= right); break;
+            case TOKEN_GREATER: value = (value > right);  break;
+            case TOKEN_GEQ: value = (value >= right); break;
+            default: break;
+        }
+    }
+    return value;
+}
+
+static int parse_expression() {
+    return parse_comparison();
+}
+
+// --- Statement Parser & Interpreter ---
+static void skip_to_matching_brace() {
+    int brace_level = 1;
+    while (brace_level > 0 && lexer.current_token.type != TOKEN_EOF) {
+        if (match(TOKEN_LBRACE)) brace_level++;
+        else if (match(TOKEN_RBRACE)) brace_level--;
+        else advance();
+    }
+}
+
+static void parse_print_statement() {
+    match(TOKEN_LPAREN);
+    int value = parse_expression();
+    match(TOKEN_RPAREN);
+    match(TOKEN_SEMICOLON);
+    
+    char buf[16];
+    snprintf(buf, 16, "%d\n", value);
+    wm.print_to_focused(buf);
+}
+
+static void parse_declaration() {
+    match(TOKEN_IDENTIFIER);
+    Token var_name = lexer.prev_token;
+    add_symbol(var_name);
+    
+    if (match(TOKEN_ASSIGN)) {
+        int value = parse_expression();
+        Symbol* sym = find_symbol(var_name);
+        if (sym) sym->value = value;
+    }
+    match(TOKEN_SEMICOLON);
+}
+
+static void parse_assignment() {
+    Token var_name = lexer.prev_token;
+    int value = parse_expression();
+    Symbol* sym = find_symbol(var_name);
+    if (sym) sym->value = value;
+    match(TOKEN_SEMICOLON);
+}
+
+static void parse_block() {
+    enter_scope();
+    while (lexer.current_token.type != TOKEN_RBRACE && lexer.current_token.type != TOKEN_EOF) {
+        parse_statement();
+    }
+    match(TOKEN_RBRACE);
+    leave_scope();
+}
+
+static void parse_if_statement() {
+    match(TOKEN_LPAREN);
+    int condition = parse_expression();
+    match(TOKEN_RPAREN);
+    
+    if (condition) {
+        parse_statement();
+        if (match(TOKEN_ELSE)) {
+            // Skip the else block by parsing it into a dummy scope
+            enter_scope();
+            parse_statement();
+            leave_scope();
+        }
     } else {
-        return eval_expr_part(expr);
+        // Skip the 'then' block
+        enter_scope();
+        parse_statement();
+        leave_scope();
+        if (match(TOKEN_ELSE)) {
+            parse_statement();
+        }
+    }
+}
+
+static void parse_while_statement() {
+    const char* loop_start = lexer.current;
+    match(TOKEN_LPAREN);
+    
+    while(true) {
+        lexer.current = loop_start; // Rewind to evaluate condition
+        int condition = parse_expression();
+        match(TOKEN_RPAREN);
+        
+        if (condition) {
+            parse_statement();
+        } else {
+            // Skip the loop body and break
+            enter_scope();
+            parse_statement();
+            leave_scope();
+            break;
+        }
+    }
+}
+
+static void parse_statement() {
+    if (match(TOKEN_PRINT)) { parse_print_statement(); }
+    else if (match(TOKEN_INT)) { parse_declaration(); }
+    else if (match(TOKEN_IF)) { parse_if_statement(); }
+    else if (match(TOKEN_WHILE)) { parse_while_statement(); }
+    else if (match(TOKEN_LBRACE)) { parse_block(); }
+    else if (match(TOKEN_IDENTIFIER)) {
+        if (match(TOKEN_ASSIGN)) {
+            parse_assignment();
+        }
+    } else {
+        advance(); // Skip unknown tokens
     }
 }
 
 void interpret_c(const char* source) {
-    symbol_count = 0;
-    char line[256];
-    int line_pos = 0;
+    lexer.start = source;
+    lexer.current = source;
+    
+    // Global scope
+    current_scope_level = -1;
+    enter_scope();
 
-    while (source && *source) {
-        if (*source == '\n' || *source == '\0') {
-            line[line_pos] = '\0';
-            char* stmt = trim(line);
-
-            if (strlen(stmt) > 0) {
-                if (strncmp(stmt, "int ", 4) == 0) {
-                    char* declaration = stmt + 4;
-                    char* eq = strchr(declaration, '=');
-                    if (eq) {
-                        *eq = '\0';
-                        char* var_name = trim(declaration);
-                        int value = eval_expression(eq + 1);
-                        set_symbol_value(var_name, value);
-                    } else {
-                        set_symbol_value(trim(declaration), 0);
-                    }
-                } else if (strchr(stmt, '=')) {
-                    char* eq = strchr(stmt, '=');
-                    *eq = '\0';
-                    char* var_name = trim(stmt);
-                    int value = eval_expression(eq + 1);
-                    set_symbol_value(var_name, value);
-                } else if (strncmp(stmt, "print(", 6) == 0) {
-                    char* end = strchr(stmt, ')');
-                    if (end) {
-                        *end = '\0';
-                        char* var_name = trim(stmt + 6);
-                        char buf[16];
-                        snprintf(buf, 16, "%d\n", get_symbol_value(var_name));
-                        wm.print_to_focused(buf);
-                    }
-                }
-            }
-
-            line_pos = 0;
-            if (*source == '\0') break;
-        } else if (line_pos < 255) {
-            line[line_pos++] = *source;
-        }
-        source++;
+    advance();
+    while (!match(TOKEN_EOF)) {
+        parse_statement();
     }
+    
+    leave_scope();
 }
 
-
-// --- Command parsing helper ---
 // --- Command parsing helper ---
 char* get_arg(char* args, int n) {
     char* p = args;
+    char* arg_start = nullptr;
+    
+    for (int i = 0; i <= n; i++) {
+        // Skip leading whitespace
+        while (*p && (*p == ' ' || *p == '\t')) p++;
 
-    // Loop to find the start of the Nth argument
-    for (int i = 0; i < n; i++) {
-        // Skip leading spaces for the current argument
-        while (*p && *p == ' ') p++;
+        if (*p == '\0') return nullptr; // End of string, arg not found
 
-        // If we're at the end of the string, the requested arg doesn't exist
-        if (*p == '\0') return nullptr;
-
-        // Skip over the content of the current argument
+        arg_start = p;
         if (*p == '"') {
-            p++; // Skip opening quote
+            arg_start++; // Actual argument starts after the quote
+            p++;
             while (*p && *p != '"') p++;
-            if (*p == '"') p++; // Skip closing quote
+            if (*p == '"') *p++ = '\0'; // Null-terminate and skip closing quote
         } else {
-            while (*p && *p != ' ') p++;
+            while (*p && *p != ' ' && *p != '\t') p++;
+            if (*p) *p++ = '\0'; // Null-terminate and skip space
         }
-    }
-
-    // Now p is at the start of the Nth argument (or spaces before it)
-    while (*p && *p == ' ') p++;
-    if (*p == '\0') return nullptr;
-
-    char* arg_start = p;
-    if (*p == '"') {
-        arg_start++; // The actual argument starts after the quote
-        p++;
-        while (*p && *p != '"') p++;
-        if (*p == '"') *p = '\0'; // Place null terminator on the closing quote
-    } else {
-        while (*p && *p != ' ') p++;
-        if (*p) *p = '\0'; // Place null terminator on the space
     }
     return arg_start;
 }
 
-
-
-// --- Terminal command handler ---
 // --- Terminal command handler ---
 void TerminalWindow::handle_command() {
     char cmd_line[120];
     strncpy(cmd_line, current_line, 119);
     cmd_line[119] = '\0';
 
-    // 1. Trim leading whitespace
     char* command = cmd_line;
-    while (*command && *command == ' ') {
-        command++;
-    }
-
-    if (*command == '\0') { // Handle empty or whitespace-only lines
+    while (*command && *command == ' ') command++;
+    if (*command == '\0') {
         if (!in_editor) print_prompt();
         return;
     }
-
-    // 2. Isolate the command word and get a pointer to the arguments string
     char* args = command;
-    while (*args && *args != ' ') {
+    while (*args && *args != ' ') args++;
+    if (*args) {
+        *args = '\0';
         args++;
+        while (*args && *args == ' ') args++;
     }
-    if (*args) { // If we found a space (i.e., there are arguments)
-        *args = '\0'; // Null-terminate the command word
-        args++;      // Move pointer to the start of the arguments
-        while (*args && *args == ' ') {
-            args++; // Skip any extra spaces
-        }
-    }
-
-    // 3. Now, `command` is the clean first word, and `args` is the rest.
     if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, time, version\n"); }
     else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
@@ -1558,7 +1827,6 @@ void TerminalWindow::handle_command() {
             edit_current_line = 0;
             edit_cursor_col = 0;
             edit_scroll_offset = 0;
-            // ... (rest of edit logic is unchanged)
             char* content = fat32_read_file_as_string(filename);
             if (content) {
                 int line_count_temp = 1;
@@ -1621,13 +1889,10 @@ void TerminalWindow::handle_command() {
         }
     }
     else if (strcmp(command, "cp") == 0) {
-        char args_for_src[120];
-        strncpy(args_for_src, args, 119);
-        char* src = get_arg(args_for_src, 0);
-
-        char args_for_dest[120];
-        strncpy(args_for_dest, args, 119);
-        char* dest = get_arg(args_for_dest, 1);
+        char args_copy1[120]; strncpy(args_copy1, args, 119);
+        char args_copy2[120]; strncpy(args_copy2, args, 119);
+        char* src = get_arg(args_copy1, 0);
+        char* dest = get_arg(args_copy2, 1);
         
         if(!src || !dest) { 
             console_print("Usage: cp \"<source>\" \"<dest>\"\n"); 
@@ -1652,13 +1917,10 @@ void TerminalWindow::handle_command() {
         }
     }
     else if (strcmp(command, "mv") == 0) {
-        char args_for_src[120];
-        strncpy(args_for_src, args, 119);
-        char* src = get_arg(args_for_src, 0);
-
-        char args_for_dest[120];
-        strncpy(args_for_dest, args, 119);
-        char* dest = get_arg(args_for_dest, 1);
+        char args_copy1[120]; strncpy(args_copy1, args, 119);
+        char args_copy2[120]; strncpy(args_copy2, args, 119);
+        char* src = get_arg(args_copy1, 0);
+        char* dest = get_arg(args_copy2, 1);
 
         if(!src || !dest) { 
             console_print("Usage: mv \"<source>\" \"<dest>\"\n"); 
@@ -1677,7 +1939,7 @@ void TerminalWindow::handle_command() {
         snprintf(buf, 64, "%d:%d:%d %d/%d/%d\n", t.hour, t.minute, t.second, t.day, t.month, t.year); 
         console_print(buf); 
     }
-    else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.0 - Robust Parsing\n"); }
+    else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.1 - Elaborate C Interpreter\n"); }
     else if (strlen(command) > 0) { 
         console_print("Unknown command.\n"); 
     }
