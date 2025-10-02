@@ -611,10 +611,8 @@ void poll_input() {
         if (status & 0x20) {
             // In poll_input(), inside the `if (status & 0x20)` block...
 
-			// In poll_input(), inside the `if (status & 0x20)` block...
-
-			static uint8_t mouse_cycle = 0; // Changed from int8_t to uint8_t
-			static uint8_t mouse_packet[3]; // Changed from int8_t to uint8_t
+			static uint8_t mouse_cycle = 0;
+			static int8_t mouse_packet[3];
 			mouse_packet[mouse_cycle++] = scancode;
 
 			if (mouse_cycle == 3) {
@@ -622,11 +620,9 @@ void poll_input() {
 				new_mouse_state = mouse_packet[0] & 0x01;
 
 				// Correctly calculate signed deltas
-				// Now delta_x/y will be treated as values from 0-255 initially
 				int delta_x = mouse_packet[1];
 				int delta_y = mouse_packet[2];
 
-				// This logic now works correctly because delta_x/y are not pre-interpreted as negative.
 				if (mouse_packet[0] & 0x10) { // X sign bit is set
 					delta_x |= 0xFFFFFF00; // Sign extend to a negative 32-bit int
 				}
