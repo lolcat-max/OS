@@ -609,18 +609,37 @@ void poll_input() {
         uint8_t status = inb(0x64);
         uint8_t scancode = inb(0x60);
         if (status & 0x20) {
-            static uint8_t mouse_cycle = 0;
-            static int8_t mouse_packet[3];
-            mouse_packet[mouse_cycle++] = scancode;
-            if (mouse_cycle == 3) {
-                mouse_cycle = 0;
-                new_mouse_state = mouse_packet[0] & 0x01;
-                mouse_x += mouse_packet[1];
-                mouse_y -= mouse_packet[2];
-                if (mouse_x < 0) mouse_x = 0; if (mouse_y < 0) mouse_y = 0;
-                if (mouse_x >= (int)fb_info.width) mouse_x = fb_info.width - 1;
-                if (mouse_y >= (int)fb_info.height) mouse_y = fb_info.height - 1;
-            }
+            // In poll_input(), inside the `if (status & 0x20)` block...
+
+			static uint8_t mouse_cycle = 0;
+			static int8_t mouse_packet[3];
+			mouse_packet[mouse_cycle++] = scancode;
+
+			if (mouse_cycle == 3) {
+				mouse_cycle = 0;
+				new_mouse_state = mouse_packet[0] & 0x01;
+
+				// Correctly calculate signed deltas
+				int delta_x = mouse_packet[1];
+				int delta_y = mouse_packet[2];
+
+				if (mouse_packet[0] & 0x10) { // X sign bit is set
+					delta_x |= 0xFFFFFF00; // Sign extend to a negative 32-bit int
+				}
+				if (mouse_packet[0] & 0x20) { // Y sign bit is set
+					delta_y |= 0xFFFFFF00; // Sign extend to a negative 32-bit int
+				}
+
+				// Y movement is inverted in graphics coordinates
+				mouse_x += delta_x;
+				mouse_y -= delta_y;
+
+				// Clamp coordinates to screen bounds
+				if (mouse_x < 0) mouse_x = 0;
+				if (mouse_y < 0) mouse_y = 0;
+				if (mouse_x >= (int)fb_info.width) mouse_x = fb_info.width - 1;
+				if (mouse_y >= (int)fb_info.height) mouse_y = fb_info.height - 1;
+			}
         } else {
             bool is_press = !(scancode & 0x80);
             if (!is_press) scancode -= 0x80;

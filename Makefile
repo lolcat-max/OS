@@ -9,9 +9,9 @@ CXXFLAGS = -ffreestanding -O2 -Wall -Wextra -std=c++17 -fno-exceptions -fno-rtti
 $(MAIN):
 	as -32 boot.S -o boot.o
 
-	gcc -c kernel.cpp -ffreestanding -m32 -o kernel.o 
+	gcc -c kernel.cpp -ffreestanding -m32 -O3 -o kernel.o 
 
-	gcc -ffreestanding -m32 -nostdlib -o '$(MULTIBOOT)' -T linker.ld boot.o kernel.o -lgcc
+	gcc -ffreestanding -m32 -nostdlib -o '$(MULTIBOOT)' -T linker.ld boot.o kernel.o -O3 -lgcc
 
 	grub-mkrescue -o '$@' '$(ISODIR)'
 
