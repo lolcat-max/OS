@@ -931,11 +931,10 @@ void from_83_format(const char* fat_name, char* out) {
     out[j] = '\0';
 }
 uint32_t read_fat_entry(uint32_t cluster) {
-    uint8_t* fat_sector = new uint8_t[SECTOR_SIZE];
+    static uint8_t fat_sector[SECTOR_SIZE]; // Use a single, reusable static buffer
     uint32_t fat_offset = cluster * 4;
     read_write_sectors(0, fat_start_sector + (fat_offset / SECTOR_SIZE), 1, false, fat_sector);
     uint32_t value = *(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) & 0x0FFFFFFF;
-    delete[] fat_sector;
     return value;
 }
 
@@ -1374,27 +1373,204 @@ void fat32_format() {
     }
 }
 
+// =============================================================================
+// SECTION 5.5: FILESYSTEM CHECK DISK UTILITY
+// =============================================================================
+#define ATTR_DIRECTORY 0x10
+// --- CHKDSK Helper Function ---
+// --- CHKDSK Helper Function ---
+static void scan_directory_recursive(uint32_t current_cluster, uint8_t* status_map, uint32_t max_cluster, int* file_count, int* dir_count, uint32_t* cross_linked_errors, uint8_t* shared_dir_buf) {
+    if (current_cluster == 0) return;
 
+    // Define status values used within this check
+    const uint8_t CLUSTER_STATUS_REFERENCED = 3;
+
+    uint32_t cluster_chain_node = current_cluster;
+    
+    // Mark the directory's own cluster chain as referenced
+    uint32_t temp_node = cluster_chain_node;
+    while(temp_node < 0x0FFFFFF7 && temp_node >= 2) {
+        if (status_map[temp_node] == CLUSTER_STATUS_REFERENCED) {
+            (*cross_linked_errors)++;
+            break; // Already processed this chain, it's cross-linked.
+        }
+        status_map[temp_node] = CLUSTER_STATUS_REFERENCED;
+        temp_node = read_fat_entry(temp_node);
+    }
+    // Mark the final cluster in the chain if it's valid
+    if (temp_node >= 2 && temp_node <= max_cluster && status_map[temp_node] != CLUSTER_STATUS_REFERENCED) {
+         status_map[temp_node] = CLUSTER_STATUS_REFERENCED;
+    }
+
+    while (cluster_chain_node < 0x0FFFFFF7 && cluster_chain_node >= 2) {
+        uint32_t cluster_size_bytes = bpb.sec_per_clus * SECTOR_SIZE;
+        // Use the shared buffer instead of allocating a new one
+        if (read_write_sectors(0, cluster_to_lba(cluster_chain_node), bpb.sec_per_clus, false, shared_dir_buf) != 0) {
+            break; // Stop if read fails
+        }
+
+        for (uint32_t i = 0; i < cluster_size_bytes; i += sizeof(fat_dir_entry_t)) {
+            fat_dir_entry_t* entry = (fat_dir_entry_t*)(shared_dir_buf + i);
+            if (entry->name[0] == 0x00) { // End of directory marker
+                cluster_chain_node = 0; // Force exit from outer while loop
+                break; // Exit inner for loop
+            }
+            if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue;
+            if (entry->attr == ATTR_LONG_NAME || (entry->attr & ATTR_VOLUME_ID)) continue;
+            if (entry->name[0] == '.') continue; // Skip '.' and '..'
+
+            uint32_t start_cluster = (entry->fst_clus_hi << 16) | entry->fst_clus_lo;
+            
+            if (entry->attr & ATTR_DIRECTORY) {
+                (*dir_count)++;
+                scan_directory_recursive(start_cluster, status_map, max_cluster, file_count, dir_count, cross_linked_errors, shared_dir_buf);
+            } else {
+                (*file_count)++;
+                if (start_cluster >= 2) {
+                    uint32_t file_cluster = start_cluster;
+                    while (file_cluster < 0x0FFFFFF7 && file_cluster >= 2) {
+                        if (file_cluster > max_cluster) break;
+                        if (status_map[file_cluster] == CLUSTER_STATUS_REFERENCED) {
+                            (*cross_linked_errors)++;
+                            break;
+                        }
+                         status_map[file_cluster] = CLUSTER_STATUS_REFERENCED;
+                        file_cluster = read_fat_entry(file_cluster);
+                    }
+                }
+            }
+        }
+        if (cluster_chain_node != 0) {
+             cluster_chain_node = read_fat_entry(cluster_chain_node);
+        }
+    }
+}
+
+
+// --- Main CHKDSK Function ---
+void fat32_check_disk() {
+    if (!current_directory_cluster) {
+        wm.print_to_focused("Filesystem not initialized. Cannot run chkdsk.\n");
+        return;
+    }
+
+    wm.print_to_focused("Starting Check Disk...\n\n");
+    char buf[128];
+    uint32_t total_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus;
+    uint32_t cluster_size_kb = (bpb.sec_per_clus * SECTOR_SIZE) / 1024;
+    
+    snprintf(buf, 128, "Volume size: %d MB\nTotal clusters: %d (%d KB each)\n\n", (bpb.tot_sec32 * SECTOR_SIZE) / (1024 * 1024), total_clusters, cluster_size_kb);
+    wm.print_to_focused(buf);
+
+    // --- Phase 1: Verify FAT ---
+    wm.print_to_focused("Phase 1: Verifying File Allocation Table...\n");
+    uint8_t* cluster_status = new uint8_t[total_clusters + 2];
+    memset(cluster_status, 0, total_clusters + 2);
+
+    const uint8_t CLUSTER_STATUS_FREE = 1;
+    const uint8_t CLUSTER_STATUS_IN_USE = 2;
+    const uint8_t CLUSTER_STATUS_BAD = 4;
+
+    uint32_t used_clusters = 0, free_clusters = 0, bad_clusters = 0;
+    for (uint32_t i = 2; i <= total_clusters; i++) {
+        uint32_t entry = read_fat_entry(i);
+        if (entry == FAT_FREE_CLUSTER) {
+            cluster_status[i] = CLUSTER_STATUS_FREE;
+            free_clusters++;
+        } else if (entry >= 0x0FFFFFF7) {
+            cluster_status[i] = (entry == 0x0FFFFFF7) ? CLUSTER_STATUS_BAD : CLUSTER_STATUS_IN_USE;
+            if(entry == 0x0FFFFFF7) bad_clusters++; else used_clusters++;
+        } else {
+            cluster_status[i] = CLUSTER_STATUS_IN_USE;
+            used_clusters++;
+        }
+    }
+    snprintf(buf, 128, "  %d clusters marked as used.\n  %d clusters marked as free.\n  %d clusters marked as bad.\n\n", used_clusters, free_clusters, bad_clusters);
+    wm.print_to_focused(buf);
+
+    // --- Phase 2: Verify Directory Structure ---
+    wm.print_to_focused("Phase 2: Verifying directory structure...\n");
+    int file_count = 0, dir_count = 0;
+    uint32_t cross_linked_errors = 0;
+    // Allocate the shared directory buffer ONCE
+    uint8_t* shared_dir_buf = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
+    scan_directory_recursive(bpb.root_clus, cluster_status, total_clusters, &file_count, &dir_count, &cross_linked_errors, shared_dir_buf);
+    delete[] shared_dir_buf; // Free the shared buffer
+
+    snprintf(buf, 128, "  Found %d files and %d directories.\n  Detected %d cross-linked chains.\n\n", file_count, dir_count, cross_linked_errors);
+    wm.print_to_focused(buf);
+
+    // --- Phase 3: Find Lost Clusters ---
+    wm.print_to_focused("Phase 3: Looking for lost clusters...\n");
+    uint32_t lost_clusters = 0;
+    for (uint32_t i = 2; i <= total_clusters; i++) {
+        if (cluster_status[i] == CLUSTER_STATUS_IN_USE) {
+            lost_clusters++;
+        }
+    }
+    snprintf(buf, 128, "  Found %d lost clusters.\n\n", lost_clusters);
+    wm.print_to_focused(buf);
+
+    // --- Summary ---
+    wm.print_to_focused("Check Disk Summary:\n");
+    uint32_t errors_found = cross_linked_errors + lost_clusters + bad_clusters;
+    snprintf(buf, 128, "  %u KB total disk space.\n  %u KB in %d files.\n  %u KB in lost clusters.\n  %u KB available on disk.\n\n  %u total errors found.\n",
+        (total_clusters + 2) * cluster_size_kb,
+        (used_clusters - lost_clusters) * cluster_size_kb, file_count,
+        lost_clusters * cluster_size_kb,
+        free_clusters * cluster_size_kb,
+        errors_found);
+    wm.print_to_focused(buf);
+
+    delete[] cluster_status;
+    wm.print_to_focused("CHKDSK finished.\n");
+}
 // =============================================================================
 // SECTION 6: SELF-HOSTED C COMPILER (ELABORATED)
 // =============================================================================
 
-// --- Forward Declarations for Parser ---
-static int parse_expression();
-static void parse_statement();
+// --- Forward Declarations ---
+class C_Interpreter;
+static void parse_statement(C_Interpreter* interp);
+
+// --- Interpreter Data Types ---
+enum ValueType { VAL_NIL, VAL_INT, VAL_STRING, VAL_ARRAY };
+
+struct Value; // Forward declare
+
+struct StringObject {
+    char* chars;
+    int length;
+    StringObject* next; // For memory management
+};
+
+struct ArrayObject {
+    Value* items;
+    int count;
+    ArrayObject* next; // For memory management
+};
+
+struct Value {
+    ValueType type;
+    union {
+        int integer;
+        StringObject* string;
+        ArrayObject* array;
+    } as;
+};
 
 // --- Tokenizer (Lexer) ---
 enum TokenType {
     TOKEN_EOF, TOKEN_ERROR,
     // Keywords
-    TOKEN_INT, TOKEN_PRINT, TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE,
+    TOKEN_INT, TOKEN_STRING, TOKEN_PRINT, TOKEN_IF, TOKEN_ELSE, TOKEN_WHILE,
     // Literals & Identifiers
-    TOKEN_IDENTIFIER, TOKEN_NUMBER,
-    // Single-character tokens
-    TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE,
+    TOKEN_IDENTIFIER, TOKEN_NUMBER, TOKEN_STRING_LITERAL,
+    // Single-char
+    TOKEN_LPAREN, TOKEN_RPAREN, TOKEN_LBRACE, TOKEN_RBRACE, TOKEN_LBRACKET, TOKEN_RBRACKET,
     TOKEN_SEMICOLON, TOKEN_PLUS, TOKEN_MINUS, TOKEN_STAR, TOKEN_SLASH,
     TOKEN_ASSIGN, TOKEN_LESS, TOKEN_GREATER,
-    // Two-character tokens
+    // Two-char
     TOKEN_EQ, TOKEN_NEQ, TOKEN_LEQ, TOKEN_GEQ
 };
 
@@ -1402,127 +1578,17 @@ struct Token {
     TokenType type;
     const char* start;
     int length;
-    int value; // For TOKEN_NUMBER
+    Value value;
 };
 
-struct Lexer {
-    const char* start;
-    const char* current;
-    Token current_token;
-    Token prev_token;
-};
-
-static Lexer lexer;
-
-static bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
-static bool is_digit(char c) { return c >= '0' && c <= '9'; }
-static bool is_at_end() { return *lexer.current == '\0'; }
-
-static void skip_whitespace() {
-    for (;;) {
-        char c = *lexer.current;
-        switch (c) {
-            case ' ': case '\r': case '\t': case '\n':
-                lexer.current++;
-                break;
-            default:
-                return;
-        }
-    }
-}
-
-static Token make_token(TokenType type) {
-    Token token;
-    token.type = type;
-    token.start = lexer.start;
-    token.length = (int)(lexer.current - lexer.start);
-    return token;
-}
-
-static TokenType check_keyword(int start, int length, const char* rest, TokenType type) {
-    if (lexer.current - lexer.start == start + length && memcmp(lexer.start + start, rest, length) == 0) {
-        return type;
-    }
-    return TOKEN_IDENTIFIER;
-}
-
-static TokenType identifier_type() {
-    switch (lexer.start[0]) {
-        case 'e': return check_keyword(1, 3, "lse", TOKEN_ELSE);
-        case 'i':
-            if (lexer.current - lexer.start > 1) {
-                switch (lexer.start[1]) {
-                    case 'f': return check_keyword(2, 0, "", TOKEN_IF);
-                    case 'n': return check_keyword(2, 1, "t", TOKEN_INT);
-                }
-            }
-            break;
-        case 'p': return check_keyword(1, 4, "rint", TOKEN_PRINT);
-        case 'w': return check_keyword(1, 4, "hile", TOKEN_WHILE);
-    }
-    return TOKEN_IDENTIFIER;
-}
-
-static Token identifier() {
-    while (is_alpha(*lexer.current) || is_digit(*lexer.current)) lexer.current++;
-    return make_token(identifier_type());
-}
-
-static Token number() {
-    while (is_digit(*lexer.current)) lexer.current++;
-    Token t = make_token(TOKEN_NUMBER);
-    t.value = simple_atoi(t.start);
-    return t;
-}
-
-static Token scan_token() {
-    skip_whitespace();
-    lexer.start = lexer.current;
-    if (is_at_end()) return make_token(TOKEN_EOF);
-
-    char c = *lexer.current++;
-    if (is_alpha(c)) return identifier();
-    if (is_digit(c)) return number();
-
-    switch (c) {
-        case '(': return make_token(TOKEN_LPAREN);
-        case ')': return make_token(TOKEN_RPAREN);
-        case '{': return make_token(TOKEN_LBRACE);
-        case '}': return make_token(TOKEN_RBRACE);
-        case ';': return make_token(TOKEN_SEMICOLON);
-        case '+': return make_token(TOKEN_PLUS);
-        case '-': return make_token(TOKEN_MINUS);
-        case '*': return make_token(TOKEN_STAR);
-        case '/': return make_token(TOKEN_SLASH);
-        case '=': return make_token(*lexer.current == '=' ? (lexer.current++, TOKEN_EQ) : TOKEN_ASSIGN);
-        case '!': return make_token(*lexer.current == '=' ? (lexer.current++, TOKEN_NEQ) : TOKEN_ERROR);
-        case '<': return make_token(*lexer.current == '=' ? (lexer.current++, TOKEN_LEQ) : TOKEN_LESS);
-        case '>': return make_token(*lexer.current == '=' ? (lexer.current++, TOKEN_GEQ) : TOKEN_GREATER);
-    }
-
-    return make_token(TOKEN_ERROR);
-}
-
-static void advance() {
-    lexer.prev_token = lexer.current_token;
-    lexer.current_token = scan_token();
-}
-
-static bool match(TokenType type) {
-    if (lexer.current_token.type == type) {
-        advance();
-        return true;
-    }
-    return false;
-}
-
-// --- Symbol Table & Scoping ---
-#define MAX_SYMBOLS_PER_SCOPE 20
-#define MAX_SCOPES 10
+// --- Interpreter State ---
+#define MAX_SYMBOLS_PER_SCOPE 50
+#define MAX_SCOPES 20
 
 struct Symbol {
     Token name;
-    int value;
+    Value value;
+    int array_size; // 0 for non-arrays
 };
 
 struct Scope {
@@ -1530,40 +1596,199 @@ struct Scope {
     int symbol_count;
 };
 
-static Scope scope_stack[MAX_SCOPES];
-static int current_scope_level = -1;
+class C_Interpreter {
+public:
+    const char* source_start;
+    const char* current_char;
+    Token current_token;
+    Token prev_token;
 
-static void enter_scope() {
-    if (current_scope_level < MAX_SCOPES - 1) {
-        current_scope_level++;
-        scope_stack[current_scope_level].symbol_count = 0;
+    Scope scope_stack[MAX_SCOPES];
+    int current_scope_level;
+
+    StringObject* strings_head = nullptr;
+    ArrayObject* arrays_head = nullptr;
+    
+    TerminalWindow* terminal;
+
+    C_Interpreter(const char* source, TerminalWindow* term) : 
+        source_start(source), current_char(source), current_scope_level(-1), terminal(term) {}
+
+    ~C_Interpreter() {
+        StringObject* s = strings_head;
+        while (s) {
+            StringObject* next = s->next;
+            delete[] s->chars;
+            delete s;
+            s = next;
+        }
+        ArrayObject* a = arrays_head;
+        while (a) {
+            ArrayObject* next = a->next;
+            delete[] a->items;
+            delete a;
+            a = next;
+        }
+    }
+};
+
+static bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+static bool is_digit(char c) { return c >= '0' && c <= '9'; }
+static bool is_at_end(C_Interpreter* interp) { return *interp->current_char == '\0'; }
+
+// --- Memory Management for Interpreter ---
+StringObject* new_string(C_Interpreter* interp, const char* chars, int length) {
+    StringObject* str = new StringObject;
+    str->chars = new char[length + 1];
+    memcpy(str->chars, chars, length);
+    str->chars[length] = '\0';
+    str->length = length;
+    str->next = interp->strings_head;
+    interp->strings_head = str;
+    return str;
+}
+
+ArrayObject* new_array(C_Interpreter* interp, int count) {
+    ArrayObject* arr = new ArrayObject;
+    arr->items = new Value[count];
+    for(int i=0; i<count; ++i) arr->items[i].type = VAL_NIL;
+    arr->count = count;
+    arr->next = interp->arrays_head;
+    interp->arrays_head = arr;
+    return arr;
+}
+
+// --- Lexer Implementation ---
+static void skip_whitespace(C_Interpreter* interp) {
+    for (;;) {
+        char c = *interp->current_char;
+        if (c == ' ' || c == '\r' || c == '\t' || c == '\n') interp->current_char++;
+        else return;
     }
 }
 
-static void leave_scope() {
-    if (current_scope_level >= 0) {
-        current_scope_level--;
+static Token make_token(C_Interpreter* interp, TokenType type) {
+    Token token;
+    token.type = type;
+    token.start = interp->source_start;
+    token.length = (int)(interp->current_char - interp->source_start);
+    token.value.type = VAL_NIL;
+    return token;
+}
+
+static TokenType check_keyword(C_Interpreter* interp, int start, int length, const char* rest, TokenType type) {
+    if (interp->current_char - interp->source_start == start + length && memcmp(interp->source_start + start, rest, length) == 0) return type;
+    return TOKEN_IDENTIFIER;
+}
+
+static TokenType identifier_type(C_Interpreter* interp) {
+    switch (interp->source_start[0]) {
+        case 'e': return check_keyword(interp, 1, 3, "lse", TOKEN_ELSE);
+        case 'i':
+            if (interp->current_char - interp->source_start > 1) {
+                switch (interp->source_start[1]) {
+                    case 'f': return TOKEN_IF;
+                    case 'n': return check_keyword(interp, 2, 1, "t", TOKEN_INT);
+                }
+            }
+            break;
+        case 'p': return check_keyword(interp, 1, 4, "rint", TOKEN_PRINT);
+        case 's': return check_keyword(interp, 1, 5, "tring", TOKEN_STRING);
+        case 'w': return check_keyword(interp, 1, 4, "hile", TOKEN_WHILE);
     }
+    return TOKEN_IDENTIFIER;
+}
+
+static Token string_literal(C_Interpreter* interp) {
+    while (*interp->current_char != '"' && !is_at_end(interp)) interp->current_char++;
+    if (is_at_end(interp)) return make_token(interp, TOKEN_ERROR);
+    interp->current_char++; // Consume closing quote
+    Token token = make_token(interp, TOKEN_STRING_LITERAL);
+    token.value.type = VAL_STRING;
+    token.value.as.string = new_string(interp, token.start + 1, token.length - 2);
+    return token;
+}
+
+static Token scan_token(C_Interpreter* interp) {
+    skip_whitespace(interp);
+    interp->source_start = interp->current_char;
+    if (is_at_end(interp)) return make_token(interp, TOKEN_EOF);
+
+    char c = *interp->current_char++;
+    if (is_alpha(c)) {
+        while (is_alpha(*interp->current_char) || is_digit(*interp->current_char)) interp->current_char++;
+        return make_token(interp, identifier_type(interp));
+    }
+    if (is_digit(c)) {
+        while (is_digit(*interp->current_char)) interp->current_char++;
+        Token t = make_token(interp, TOKEN_NUMBER);
+        t.value.type = VAL_INT;
+        t.value.as.integer = simple_atoi(t.start);
+        return t;
+    }
+    switch (c) {
+        case '(': return make_token(interp, TOKEN_LPAREN);
+        case ')': return make_token(interp, TOKEN_RPAREN);
+        case '{': return make_token(interp, TOKEN_LBRACE);
+        case '}': return make_token(interp, TOKEN_RBRACE);
+        case '[': return make_token(interp, TOKEN_LBRACKET);
+        case ']': return make_token(interp, TOKEN_RBRACKET);
+        case ';': return make_token(interp, TOKEN_SEMICOLON);
+        case '+': return make_token(interp, TOKEN_PLUS);
+        case '-': return make_token(interp, TOKEN_MINUS);
+        case '*': return make_token(interp, TOKEN_STAR);
+        case '/': return make_token(interp, TOKEN_SLASH);
+        case '"': return string_literal(interp);
+        case '=': return make_token(interp, *interp->current_char == '=' ? (interp->current_char++, TOKEN_EQ) : TOKEN_ASSIGN);
+        case '!': return make_token(interp, *interp->current_char == '=' ? (interp->current_char++, TOKEN_NEQ) : TOKEN_ERROR);
+        case '<': return make_token(interp, *interp->current_char == '=' ? (interp->current_char++, TOKEN_LEQ) : TOKEN_LESS);
+        case '>': return make_token(interp, *interp->current_char == '=' ? (interp->current_char++, TOKEN_GEQ) : TOKEN_GREATER);
+    }
+    return make_token(interp, TOKEN_ERROR);
+}
+
+// --- Parser & Interpreter ---
+static void advance(C_Interpreter* interp) {
+    interp->prev_token = interp->current_token;
+    interp->current_token = scan_token(interp);
+}
+
+static bool match(C_Interpreter* interp, TokenType type) {
+    if (interp->current_token.type == type) {
+        advance(interp);
+        return true;
+    }
+    return false;
+}
+
+static void consume(C_Interpreter* interp, TokenType type, const char* msg) {
+    if (interp->current_token.type == type) {
+        advance(interp);
+        return;
+    }
+    // In a real compiler, you'd report an error. Here we just advance.
+    advance(interp);
+}
+
+// --- Scoping ---
+static void enter_scope(C_Interpreter* interp) {
+    if (interp->current_scope_level < MAX_SCOPES - 1) {
+        interp->current_scope_level++;
+        interp->scope_stack[interp->current_scope_level].symbol_count = 0;
+    }
+}
+
+static void leave_scope(C_Interpreter* interp) {
+    if (interp->current_scope_level >= 0) interp->current_scope_level--;
 }
 
 static bool identifiers_equal(Token* a, Token* b) {
-    if (a->length != b->length) return false;
-    return memcmp(a->start, b->start, a->length) == 0;
+    return (a->length == b->length && memcmp(a->start, b->start, a->length) == 0);
 }
 
-static void add_symbol(Token name) {
-    if (current_scope_level < 0) return; // Should not happen
-    Scope* scope = &scope_stack[current_scope_level];
-    if (scope->symbol_count < MAX_SYMBOLS_PER_SCOPE) {
-        Symbol* symbol = &scope->symbols[scope->symbol_count++];
-        symbol->name = name;
-        symbol->value = 0;
-    }
-}
-
-static Symbol* find_symbol(Token name) {
-    for (int i = current_scope_level; i >= 0; i--) {
-        Scope* scope = &scope_stack[i];
+static Symbol* find_symbol(C_Interpreter* interp, Token name) {
+    for (int i = interp->current_scope_level; i >= 0; i--) {
+        Scope* scope = &interp->scope_stack[i];
         for (int j = 0; j < scope->symbol_count; j++) {
             if (identifiers_equal(&name, &scope->symbols[j].name)) {
                 return &scope->symbols[j];
@@ -1573,202 +1798,342 @@ static Symbol* find_symbol(Token name) {
     return nullptr;
 }
 
-// --- Expression Parser ---
-static int parse_primary() {
-    if (match(TOKEN_NUMBER)) {
-        return lexer.prev_token.value;
+static Symbol* add_symbol(C_Interpreter* interp, Token name) {
+    Scope* scope = &interp->scope_stack[interp->current_scope_level];
+    if (scope->symbol_count < MAX_SYMBOLS_PER_SCOPE) {
+        Symbol* symbol = &scope->symbols[scope->symbol_count++];
+        symbol->name = name;
+        symbol->value.type = VAL_NIL;
+        symbol->array_size = 0;
+        return symbol;
     }
-    if (match(TOKEN_IDENTIFIER)) {
-        Symbol* sym = find_symbol(lexer.prev_token);
-        if (sym) return sym->value;
-        return 0; // Undeclared variable evaluates to 0
+    return nullptr;
+}
+
+// --- Expression Parsing ---
+static Value parse_expression(C_Interpreter* interp); // Forward declaration
+
+static Value call_native_function(C_Interpreter* interp, Token name) {
+    Value result; result.type = VAL_NIL;
+
+    // Create named tokens to compare against
+    Token get_mouse_x_tok = {.start="get_mouse_x", .length=11};
+    Token get_mouse_y_tok = {.start="get_mouse_y", .length=11};
+    Token get_time_str_tok = {.start="get_time_str", .length=12};
+    Token string_input_tok = {.start="string_input", .length=12};
+    Token int_to_hex_tok = {.start="int_to_hex", .length=10};
+
+    if (identifiers_equal(&name, &get_mouse_x_tok)){
+        consume(interp, TOKEN_LPAREN, "Expect '('."); consume(interp, TOKEN_RPAREN, "Expect ')'.");
+        result.type = VAL_INT; result.as.integer = mouse_x;
+    } else if (identifiers_equal(&name, &get_mouse_y_tok)){
+        consume(interp, TOKEN_LPAREN, "Expect '('."); consume(interp, TOKEN_RPAREN, "Expect ')'.");
+        result.type = VAL_INT; result.as.integer = mouse_y;
+    } else if (identifiers_equal(&name, &get_time_str_tok)){
+        consume(interp, TOKEN_LPAREN, "Expect '('."); consume(interp, TOKEN_RPAREN, "Expect ')'.");
+        RTC_Time t = read_rtc(); char buf[64];
+        snprintf(buf, 64, "%d:%d:%d %d/%d/%d", t.hour, t.minute, t.second, t.day, t.month, t.year);
+        result.type = VAL_STRING; result.as.string = new_string(interp, buf, strlen(buf));
+    } else if (identifiers_equal(&name, &string_input_tok)){
+        consume(interp, TOKEN_LPAREN, "Expect '('."); consume(interp, TOKEN_RPAREN, "Expect ')'.");
+        char input_buf[120] = {0}; int pos = 0;
+        interp->terminal->console_print("\r> "); // Initial prompt
+        while(true) {
+            poll_input();
+            if(last_key_press) {
+                if (last_key_press == '\n') break;
+                else if (last_key_press == '\b') { if(pos > 0) input_buf[--pos] = '\0'; }
+                else if (pos < 118 && last_key_press >= 32) input_buf[pos++] = last_key_press;
+                
+                // Redraw the input line
+                char full_prompt[128];
+                snprintf(full_prompt, 128, "\r> %s ", input_buf); // Add space to overwrite old chars
+                interp->terminal->console_print(full_prompt);
+            }
+        }
+        interp->terminal->console_print("\n");
+        result.type = VAL_STRING; result.as.string = new_string(interp, input_buf, pos);
+    } else if (identifiers_equal(&name, &int_to_hex_tok)){
+        consume(interp, TOKEN_LPAREN, "Expect '('.");
+        Value arg = parse_expression(interp);
+        consume(interp, TOKEN_RPAREN, "Expect ')'.");
+        if (arg.type == VAL_INT) {
+            char hex_buf[12];
+            // Custom simple hex conversion to avoid complex snprintf formatters
+            uint32_t n = arg.as.integer;
+            char* p = hex_buf + 11;
+            *p-- = '\0';
+            if (n == 0) {
+                *p-- = '0';
+            } else {
+                while(n > 0) {
+                    uint8_t rem = n % 16;
+                    *p-- = (rem < 10) ? (rem + '0') : (rem - 10 + 'A');
+                    n /= 16;
+                }
+            }
+            *p-- = 'x';
+            *p = '0';
+            result.type = VAL_STRING; result.as.string = new_string(interp, p, strlen(p));
+        }
+    } else { advance(interp); /* Unknown function */ }
+    return result;
+}
+
+static Value parse_primary(C_Interpreter* interp) {
+    if (match(interp, TOKEN_NUMBER)) return interp->prev_token.value;
+    if (match(interp, TOKEN_STRING_LITERAL)) return interp->prev_token.value;
+    
+    if (match(interp, TOKEN_IDENTIFIER)) {
+        Token id_token = interp->prev_token;
+        if (interp->current_token.type == TOKEN_LPAREN) return call_native_function(interp, id_token);
+
+        Symbol* sym = find_symbol(interp, id_token);
+        if (!sym) return (Value){.type=VAL_NIL};
+
+        if (match(interp, TOKEN_LBRACKET)) { // Array access
+            Value index_val = parse_expression(interp);
+            consume(interp, TOKEN_RBRACKET, "Expect ']' after index.");
+            if (sym->value.type == VAL_ARRAY && index_val.type == VAL_INT) {
+                if (index_val.as.integer >= 0 && index_val.as.integer < sym->value.as.array->count) {
+                    return sym->value.as.array->items[index_val.as.integer];
+                }
+            }
+            return (Value){.type=VAL_NIL}; // Index out of bounds or not an array
+        }
+        return sym->value;
     }
-    if (match(TOKEN_LPAREN)) {
-        int value = parse_expression();
-        match(TOKEN_RPAREN); // Consume ')'
+
+    if (match(interp, TOKEN_LPAREN)) {
+        Value value = parse_expression(interp);
+        consume(interp, TOKEN_RPAREN, "Expect ')' after expression.");
         return value;
     }
-    return 0;
+    advance(interp);
+    return (Value){.type=VAL_NIL};
 }
 
-static int parse_unary() {
-    if (match(TOKEN_MINUS)) {
-        return -parse_unary();
+static Value parse_unary(C_Interpreter* interp) {
+    if (match(interp, TOKEN_MINUS)) {
+        Value val = parse_unary(interp);
+        if (val.type == VAL_INT) val.as.integer = -val.as.integer;
+        return val;
     }
-    return parse_primary();
+    return parse_primary(interp);
 }
 
-static int parse_multiplication() {
-    int value = parse_unary();
-    while (match(TOKEN_STAR) || match(TOKEN_SLASH)) {
-        TokenType op = lexer.prev_token.type;
-        int right = parse_unary();
-        if (op == TOKEN_STAR) value *= right;
-        else if (op == TOKEN_SLASH) {
-            if (right != 0) value /= right; else value = 0;
+static Value parse_multiplication(C_Interpreter* interp) {
+    Value value = parse_unary(interp);
+    while (match(interp, TOKEN_STAR) || match(interp, TOKEN_SLASH)) {
+        TokenType op = interp->prev_token.type;
+        Value right = parse_unary(interp);
+        if (value.type == VAL_INT && right.type == VAL_INT) {
+            if (op == TOKEN_STAR) value.as.integer *= right.as.integer;
+            else if (op == TOKEN_SLASH) {
+                if (right.as.integer != 0) value.as.integer /= right.as.integer; else value.as.integer = 0;
+            }
         }
     }
     return value;
 }
 
-static int parse_addition() {
-    int value = parse_multiplication();
-    while (match(TOKEN_PLUS) || match(TOKEN_MINUS)) {
-        TokenType op = lexer.prev_token.type;
-        int right = parse_multiplication();
-        if (op == TOKEN_PLUS) value += right;
-        else if (op == TOKEN_MINUS) value -= right;
-    }
-    return value;
-}
-
-static int parse_comparison() {
-    int value = parse_addition();
-    while (match(TOKEN_EQ) || match(TOKEN_NEQ) || match(TOKEN_LESS) || match(TOKEN_LEQ) || match(TOKEN_GREATER) || match(TOKEN_GEQ)) {
-        TokenType op = lexer.prev_token.type;
-        int right = parse_addition();
-        switch (op) {
-            case TOKEN_EQ:  value = (value == right); break;
-            case TOKEN_NEQ: value = (value != right); break;
-            case TOKEN_LESS:    value = (value < right);  break;
-            case TOKEN_LEQ: value = (value <= right); break;
-            case TOKEN_GREATER: value = (value > right);  break;
-            case TOKEN_GEQ: value = (value >= right); break;
-            default: break;
+static Value parse_addition(C_Interpreter* interp) {
+    Value value = parse_multiplication(interp);
+    while (match(interp, TOKEN_PLUS) || match(interp, TOKEN_MINUS)) {
+        TokenType op = interp->prev_token.type;
+        Value right = parse_multiplication(interp);
+        if (op == TOKEN_PLUS) {
+            if (value.type == VAL_INT && right.type == VAL_INT) value.as.integer += right.as.integer;
+            else if (value.type == VAL_STRING && right.type == VAL_STRING) {
+                int new_len = value.as.string->length + right.as.string->length;
+                char* new_chars = new char[new_len + 1];
+                memcpy(new_chars, value.as.string->chars, value.as.string->length);
+                memcpy(new_chars + value.as.string->length, right.as.string->chars, right.as.string->length);
+                new_chars[new_len] = '\0';
+                value.as.string = new_string(interp, new_chars, new_len);
+                delete[] new_chars;
+            }
+        } else if (op == TOKEN_MINUS) {
+            if (value.type == VAL_INT && right.type == VAL_INT) value.as.integer -= right.as.integer;
         }
     }
     return value;
 }
 
-static int parse_expression() {
-    return parse_comparison();
-}
-
-// --- Statement Parser & Interpreter ---
-static void skip_to_matching_brace() {
-    int brace_level = 1;
-    while (brace_level > 0 && lexer.current_token.type != TOKEN_EOF) {
-        if (match(TOKEN_LBRACE)) brace_level++;
-        else if (match(TOKEN_RBRACE)) brace_level--;
-        else advance();
+static Value parse_comparison(C_Interpreter* interp) {
+    Value value = parse_addition(interp);
+    while (match(interp, TOKEN_EQ) || match(interp, TOKEN_NEQ) || match(interp, TOKEN_LESS) || match(interp, TOKEN_LEQ) || match(interp, TOKEN_GREATER) || match(interp, TOKEN_GEQ)) {
+        TokenType op = interp->prev_token.type;
+        Value right = parse_addition(interp);
+        Value result; result.type = VAL_INT;
+        if (value.type == VAL_INT && right.type == VAL_INT) {
+            switch (op) {
+                case TOKEN_EQ: result.as.integer = (value.as.integer == right.as.integer); break;
+                case TOKEN_NEQ: result.as.integer = (value.as.integer != right.as.integer); break;
+                case TOKEN_LESS: result.as.integer = (value.as.integer < right.as.integer); break;
+                case TOKEN_LEQ: result.as.integer = (value.as.integer <= right.as.integer); break;
+                case TOKEN_GREATER: result.as.integer = (value.as.integer > right.as.integer); break;
+                case TOKEN_GEQ: result.as.integer = (value.as.integer >= right.as.integer); break;
+                default: result.as.integer = 0; break;
+            }
+        } else { result.as.integer = 0; }
+        value = result;
     }
+    return value;
 }
 
-static void parse_print_statement() {
-    match(TOKEN_LPAREN);
-    int value = parse_expression();
-    match(TOKEN_RPAREN);
-    match(TOKEN_SEMICOLON);
-    
-    char buf[16];
-    snprintf(buf, 16, "%d\n", value);
-    wm.print_to_focused(buf);
-}
+static Value parse_expression(C_Interpreter* interp) { return parse_comparison(interp); }
 
-static void parse_declaration() {
-    match(TOKEN_IDENTIFIER);
-    Token var_name = lexer.prev_token;
-    add_symbol(var_name);
-    
-    if (match(TOKEN_ASSIGN)) {
-        int value = parse_expression();
-        Symbol* sym = find_symbol(var_name);
-        if (sym) sym->value = value;
-    }
-    match(TOKEN_SEMICOLON);
-}
-
-static void parse_assignment() {
-    Token var_name = lexer.prev_token;
-    int value = parse_expression();
-    Symbol* sym = find_symbol(var_name);
-    if (sym) sym->value = value;
-    match(TOKEN_SEMICOLON);
-}
-
-static void parse_block() {
-    enter_scope();
-    while (lexer.current_token.type != TOKEN_RBRACE && lexer.current_token.type != TOKEN_EOF) {
-        parse_statement();
-    }
-    match(TOKEN_RBRACE);
-    leave_scope();
-}
-
-static void parse_if_statement() {
-    match(TOKEN_LPAREN);
-    int condition = parse_expression();
-    match(TOKEN_RPAREN);
-    
-    if (condition) {
-        parse_statement();
-        if (match(TOKEN_ELSE)) {
-            // Skip the else block by parsing it into a dummy scope
-            enter_scope();
-            parse_statement();
-            leave_scope();
+// --- Statement Parsing ---
+static void skip_statement(C_Interpreter* interp) {
+    if (match(interp, TOKEN_LBRACE)) {
+        int brace_level = 1;
+        while (brace_level > 0 && interp->current_token.type != TOKEN_EOF) {
+            if (match(interp, TOKEN_LBRACE)) brace_level++;
+            else if (match(interp, TOKEN_RBRACE)) brace_level--;
+            else advance(interp);
         }
     } else {
-        // Skip the 'then' block
-        enter_scope();
-        parse_statement();
-        leave_scope();
-        if (match(TOKEN_ELSE)) {
-            parse_statement();
+        while (interp->current_token.type != TOKEN_SEMICOLON && interp->current_token.type != TOKEN_EOF) {
+            advance(interp);
+        }
+        match(interp, TOKEN_SEMICOLON);
+    }
+}
+
+static void parse_print_statement(C_Interpreter* interp) {
+    consume(interp, TOKEN_LPAREN, "Expect '(' after print.");
+    Value value = parse_expression(interp);
+    consume(interp, TOKEN_RPAREN, "Expect ')' after value.");
+    consume(interp, TOKEN_SEMICOLON, "Expect ';' after statement.");
+    
+    char buf[128];
+    if (value.type == VAL_INT) snprintf(buf, 128, "%d\n", value.as.integer);
+    else if (value.type == VAL_STRING) snprintf(buf, 128, "%s\n", value.as.string->chars);
+    else snprintf(buf, 128, "(nil)\n");
+    interp->terminal->console_print(buf);
+}
+
+static void parse_declaration(C_Interpreter* interp, TokenType type) {
+    consume(interp, TOKEN_IDENTIFIER, "Expect variable name.");
+    Token var_name = interp->prev_token;
+    Symbol* sym = add_symbol(interp, var_name);
+
+    if (match(interp, TOKEN_LBRACKET)) { // Array declaration
+        consume(interp, TOKEN_NUMBER, "Expect array size.");
+        int size = interp->prev_token.value.as.integer;
+        consume(interp, TOKEN_RBRACKET, "Expect ']' after size.");
+        if (sym && size > 0) {
+            sym->value.type = VAL_ARRAY;
+            sym->value.as.array = new_array(interp, size);
+            sym->array_size = size;
+        }
+    } else if (match(interp, TOKEN_ASSIGN)) { // Regular var with initializer
+        Value value = parse_expression(interp);
+        if (sym) sym->value = value;
+    }
+    consume(interp, TOKEN_SEMICOLON, "Expect ';' after variable declaration.");
+}
+
+static void parse_assignment(C_Interpreter* interp, Token var_name) {
+    Symbol* sym = find_symbol(interp, var_name);
+    Value index_val;
+    bool is_array_assign = false;
+
+    if (match(interp, TOKEN_LBRACKET)) {
+        is_array_assign = true;
+        index_val = parse_expression(interp);
+        consume(interp, TOKEN_RBRACKET, "Expect ']' after index.");
+    }
+
+    consume(interp, TOKEN_ASSIGN, "Expect '=' for assignment.");
+    Value value = parse_expression(interp);
+    consume(interp, TOKEN_SEMICOLON, "Expect ';' after value.");
+
+    if (sym) {
+        if (is_array_assign) {
+            if (sym->value.type == VAL_ARRAY && index_val.type == VAL_INT) {
+                int idx = index_val.as.integer;
+                if (idx >= 0 && idx < sym->value.as.array->count) {
+                    sym->value.as.array->items[idx] = value;
+                }
+            }
+        } else {
+            sym->value = value;
         }
     }
 }
 
-static void parse_while_statement() {
-    const char* loop_start = lexer.current;
-    match(TOKEN_LPAREN);
+static void parse_block(C_Interpreter* interp) {
+    enter_scope(interp);
+    while (interp->current_token.type != TOKEN_RBRACE && interp->current_token.type != TOKEN_EOF) {
+        parse_statement(interp);
+    }
+    consume(interp, TOKEN_RBRACE, "Expect '}' after block.");
+    leave_scope(interp);
+}
+
+static void parse_if_statement(C_Interpreter* interp) {
+    consume(interp, TOKEN_LPAREN, "Expect '(' after 'if'.");
+    Value condition = parse_expression(interp);
+    consume(interp, TOKEN_RPAREN, "Expect ')' after condition.");
+
+    bool is_true = (condition.type == VAL_INT && condition.as.integer != 0);
+    
+    if (is_true) {
+        parse_statement(interp);
+        if (match(interp, TOKEN_ELSE)) {
+            skip_statement(interp);
+        }
+    } else {
+        skip_statement(interp);
+        if (match(interp, TOKEN_ELSE)) {
+            parse_statement(interp);
+        }
+    }
+}
+
+static void parse_while_statement(C_Interpreter* interp) {
+    const char* loop_start = interp->current_char;
+    consume(interp, TOKEN_LPAREN, "Expect '('.");
     
     while(true) {
-        lexer.current = loop_start; // Rewind to evaluate condition
-        int condition = parse_expression();
-        match(TOKEN_RPAREN);
+        interp->current_char = loop_start;
+        advance(interp); // Re-scan the condition part
+        Value condition = parse_expression(interp);
+        consume(interp, TOKEN_RPAREN, "Expect ')'.");
+
+        bool is_true = (condition.type == VAL_INT && condition.as.integer != 0);
         
-        if (condition) {
-            parse_statement();
+        if (is_true) {
+            parse_statement(interp);
         } else {
-            // Skip the loop body and break
-            enter_scope();
-            parse_statement();
-            leave_scope();
+            skip_statement(interp);
             break;
         }
     }
 }
 
-static void parse_statement() {
-    if (match(TOKEN_PRINT)) { parse_print_statement(); }
-    else if (match(TOKEN_INT)) { parse_declaration(); }
-    else if (match(TOKEN_IF)) { parse_if_statement(); }
-    else if (match(TOKEN_WHILE)) { parse_while_statement(); }
-    else if (match(TOKEN_LBRACE)) { parse_block(); }
-    else if (match(TOKEN_IDENTIFIER)) {
-        if (match(TOKEN_ASSIGN)) {
-            parse_assignment();
-        }
-    } else {
-        advance(); // Skip unknown tokens
-    }
+static void parse_statement(C_Interpreter* interp) {
+    if (match(interp, TOKEN_PRINT)) { parse_print_statement(interp); }
+    else if (match(interp, TOKEN_INT)) { parse_declaration(interp, TOKEN_INT); }
+    else if (match(interp, TOKEN_STRING)) { parse_declaration(interp, TOKEN_STRING); }
+    else if (match(interp, TOKEN_IF)) { parse_if_statement(interp); }
+    else if (match(interp, TOKEN_WHILE)) { parse_while_statement(interp); }
+    else if (match(interp, TOKEN_LBRACE)) { parse_block(interp); }
+    else if (match(interp, TOKEN_IDENTIFIER)) { parse_assignment(interp, interp->prev_token); } 
+    else { advance(interp); }
 }
 
-void interpret_c(const char* source) {
-    lexer.start = source;
-    lexer.current = source;
+void interpret_c(const char* source, TerminalWindow* term) {
+    C_Interpreter interp(source, term);
     
-    // Global scope
-    current_scope_level = -1;
-    enter_scope();
-
-    advance();
-    while (!match(TOKEN_EOF)) {
-        parse_statement();
+    enter_scope(&interp); // Global scope
+    advance(&interp);
+    while (!match(&interp, TOKEN_EOF)) {
+        parse_statement(&interp);
     }
-    
-    leave_scope();
+    leave_scope(&interp);
 }
 
 // --- Command parsing helper ---
@@ -1777,20 +2142,18 @@ char* get_arg(char* args, int n) {
     char* arg_start = nullptr;
     
     for (int i = 0; i <= n; i++) {
-        // Skip leading whitespace
         while (*p && (*p == ' ' || *p == '\t')) p++;
-
-        if (*p == '\0') return nullptr; // End of string, arg not found
+        if (*p == '\0') return nullptr;
 
         arg_start = p;
         if (*p == '"') {
-            arg_start++; // Actual argument starts after the quote
+            arg_start++; 
             p++;
             while (*p && *p != '"') p++;
-            if (*p == '"') *p++ = '\0'; // Null-terminate and skip closing quote
+            if (*p == '"') *p++ = '\0'; 
         } else {
             while (*p && *p != ' ' && *p != '\t') p++;
-            if (*p) *p++ = '\0'; // Null-terminate and skip space
+            if (*p) *p++ = '\0';
         }
     }
     return arg_start;
@@ -1815,10 +2178,11 @@ void TerminalWindow::handle_command() {
         args++;
         while (*args && *args == ' ') args++;
     }
-    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, time, version\n"); }
+    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs,chkdsk, time, version\n"); }
     else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
-    else if (strcmp(command, "edit") == 0) {
+    else if (strcmp(command, "chkdsk") == 0) { fat32_check_disk(); } // NEW
+	else if (strcmp(command, "edit") == 0) {
         char* filename = get_arg(args, 0);
         if(filename) {
             strncpy(edit_filename, filename, 31);
@@ -1868,7 +2232,7 @@ void TerminalWindow::handle_command() {
         if(filename) { 
             char* s = fat32_read_file_as_string(filename); 
             if(s) { 
-                interpret_c(s); 
+                interpret_c(s, this); // Pass 'this' to the interpreter
                 delete[] s; 
             } else { 
                 console_print("File not found.\n"); 
@@ -1939,14 +2303,13 @@ void TerminalWindow::handle_command() {
         snprintf(buf, 64, "%d:%d:%d %d/%d/%d\n", t.hour, t.minute, t.second, t.day, t.month, t.year); 
         console_print(buf); 
     }
-    else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.1 - Elaborate C Interpreter\n"); }
+    else if (strcmp(command, "version") == 0) { console_print("RTOS++ v1.2 - Advanced C Interpreter\n"); }
     else if (strlen(command) > 0) { 
         console_print("Unknown command.\n"); 
     }
     
     if(!in_editor) print_prompt();
 }
-
 // =============================================================================
 // SECTION 7: KERNEL MAIN
 // =============================================================================
