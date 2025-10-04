@@ -6,6 +6,10 @@ sudo apt install make gcc gcc-multilib binutils grub-common xorriso qemu-system-
 *enter OS-main*
 
 
+
+
+
+
 mkdir ~/cross && cd ~/cross
 
 wget https://ftp.gnu.org/gnu/binutils/binutils-2.43.tar.xz
@@ -33,6 +37,9 @@ mkdir build-gcc && cd build-gcc
 make all-gcc -j$(nproc)
 
 sudo make install-gcc
+
+
+
 
 i686-elf-gcc --version
 
