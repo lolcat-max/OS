@@ -11,35 +11,36 @@ sudo apt install make gcc gcc-multilib binutils grub-common xorriso qemu-system-
 
 
 mkdir ~/cross && cd ~/cross
-
 wget https://ftp.gnu.org/gnu/binutils/binutils-2.43.tar.xz
-
 wget https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
-
 tar xf binutils-2.43.tar.xz
-
 tar xf gcc-14.2.0.tar.xz
 
+# Build binutils
 mkdir build-binutils && cd build-binutils
-
-../binutils-2.43/configure --target=i686-elf --prefix=/usr/local/cross --with-sysroot --disable-nls --disable-werror
-
+../binutils-2.43/configure --target=i686-elf --prefix=$HOME/cross --with-sysroot --disable-nls --disable-werror
 make -j$(nproc)
-
-sudo make install
-
+make install
 cd ..
 
+# Build gcc (stage 1, C only)
 mkdir build-gcc && cd build-gcc
-
-../gcc-14.2.0/configure --target=i686-elf --prefix=/usr/local/cross --disable-nls --enable-languages=c,c++ --without-headers
-
+../gcc-14.2.0/configure --target=i686-elf --prefix=$HOME/cross --disable-nls --enable-languages=c,c++ --without-headers
 make all-gcc -j$(nproc)
-
-sudo make install-gcc
-
+make install-gcc
 
 
+
+Afterwards, add this line to your shell’s startup file (~/.bashrc):
+
+export PATH="$HOME/cross/bin:$PATH"
+
+Then reload:
+
+source ~/.bashrc
+
+
+Now check:
 
 i686-elf-gcc --version
 
