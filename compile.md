@@ -25,6 +25,7 @@ i686-elf-gcc --version
 
 
 make clean
+
 make libtcc.a CONFIG_BCHECK=no CC="i686-elf-gcc -ffreestanding -fno-builtin -fno-stack-protector -nostdlib"
 
 sudo make
