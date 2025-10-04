@@ -1,25 +1,15 @@
-.POSIX:
+CXX = i686-elf-g++
+CC  = i686-elf-gcc
+CFLAGS = -ffreestanding -O2 -Wall -Wextra -fno-exceptions -fno-rtti -I./tcc
 
-ISODIR := iso
-MULTIBOOT := $(ISODIR)/boot/main.elf
-MAIN := main.iso
-CXXFLAGS = -ffreestanding -O2 -Wall -Wextra -std=c++17 -fno-exceptions -fno-rtti -Iinclude
-.PHONY: clean run
+OBJS = kernel.o tcc_wrapper.o crt_stubs.o
+LIBS = ./tcc/libtcc.a
 
-$(MAIN):
-	as -32 boot.S -o boot.o
+kernel.elf: $(OBJS)
+	$(CXX) -T linker.ld -o $@ $(OBJS) $(LIBS) -nostdlib
 
-	gcc -c kernel.cpp -ffreestanding -m32 -O3 -o kernel.o 
+tcc_wrapper.o: tcc_wrapper.c
+	$(CC) $(CFLAGS) -c tcc_wrapper.c -o tcc_wrapper.o
 
-	gcc -ffreestanding -m32 -nostdlib -o '$(MULTIBOOT)' -T linker.ld boot.o kernel.o -O3 -lgcc
-
-	grub-mkrescue -o '$@' '$(ISODIR)'
-
-clean:
-	rm -f *.o '$(MULTIBOOT)' '$(MAIN)'
-
-run: $(MAIN)
-	qemu-system-i386 -cdrom '$(MAIN)'
-	# Would also work.
-	#qemu-system-i386 -hda '$(MAIN)'
-	#qemu-system-i386 -kernel '$(MULTIBOOT)'
+crt_stubs.o: crt_stubs.c
+	$(CC) $(CFLAGS) -c crt_stubs.c -o crt_stubs.o
