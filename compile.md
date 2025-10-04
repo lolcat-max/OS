@@ -43,6 +43,8 @@ Now check:
 i686-elf-gcc --version
 
 
+Now compile:
+
 make clean
 
 make libtcc.a CONFIG_BCHECK=no CC="i686-elf-gcc -ffreestanding -fno-builtin -fno-stack-protector -nostdlib"
