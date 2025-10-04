@@ -16,14 +16,12 @@ wget https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
 tar xf binutils-2.43.tar.xz
 tar xf gcc-14.2.0.tar.xz
 
-# Build binutils
 mkdir build-binutils && cd build-binutils
 ../binutils-2.43/configure --target=i686-elf --prefix=$HOME/cross --with-sysroot --disable-nls --disable-werror
 make -j$(nproc)
 make install
 cd ..
 
-# Build gcc (stage 1, C only)
 mkdir build-gcc && cd build-gcc
 ../gcc-14.2.0/configure --target=i686-elf --prefix=$HOME/cross --disable-nls --enable-languages=c,c++ --without-headers
 make all-gcc -j$(nproc)
