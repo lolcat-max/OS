@@ -1,3 +1,6 @@
+a simple GUI interface OS with terminal windows.
+
+
 self hosted compiler features these commands:
 
 "int","char","string","return","if","else","while","break","continue",
@@ -10,4 +13,4 @@ self hosted compiler features these commands:
 "mmio_write8","mmio_write16","mmio_write32","mmio_write64"
 
 
-TODO: implement smp and more GUI features.
+TODO: more GUI features, reduce compiler limitations, implement smp.
