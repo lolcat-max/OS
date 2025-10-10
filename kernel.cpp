@@ -1,3 +1,4 @@
+
 #include <cstdarg>
 
 // =============================================================================
@@ -397,38 +398,91 @@ public:
 
         if (in_editor) {
             int max_lines = (h - 60) / 10;
+            int max_chars_per_line = (w - 10) / 8;
             draw_rect_filled(x, y + h - 25, w, 25, 0x004400);
             char status[120];
             snprintf(status, 120, "%s | Ln %d/%d Col %d | ^Q=Save | Move: Arrows, Home, End", 
                      edit_filename, edit_current_line + 1, edit_line_count, edit_cursor_col + 1);
             draw_string(status, x + 5, y + h - 18, 0xFFFFFF);
             
-            for (int i = 0; i < max_lines && (edit_scroll_offset + i) < edit_line_count; i++) {
-                uint32_t line_color = (edit_scroll_offset + i == edit_current_line) ? 0xFFFFFF : 0xDDDDDD;
-                draw_string(edit_lines[edit_scroll_offset + i], x + 5, y + 30 + i * 10, line_color);
+            int visual_line = 0;
+            for (int i = 0; i < edit_line_count && visual_line < max_lines; i++) {
+                if (i < edit_scroll_offset) continue;
                 
-                if (edit_scroll_offset + i == edit_current_line) {
-                    int cursor_x = x + 5 + edit_cursor_col * 8;
-                    int cursor_y = y + 30 + i * 10;
-                    draw_rect_filled(cursor_x, cursor_y, 2, 8, 0x00FF00);
+                uint32_t line_color = (i == edit_current_line) ? 0xFFFFFF : 0xDDDDDD;
+                const char* line = edit_lines[i];
+                int line_len = strlen(line);
+                
+                // Draw this logical line, wrapping as needed
+                for (int offset = 0; offset < line_len || offset == 0; offset += max_chars_per_line) {
+                    if (visual_line >= max_lines) break;
+                    
+                    int chars_to_draw = (line_len - offset > max_chars_per_line) ? max_chars_per_line : (line_len - offset);
+                    if (chars_to_draw < 0) chars_to_draw = 0;
+                    
+                    char wrapped_line[120];
+                    strncpy(wrapped_line, line + offset, chars_to_draw);
+                    wrapped_line[chars_to_draw] = '\0';
+                    
+                    draw_string(wrapped_line, x + 5, y + 30 + visual_line * 10, line_color);
+                    
+                    // Draw cursor if it's on this visual line
+                    if (i == edit_current_line && edit_cursor_col >= offset && edit_cursor_col < offset + max_chars_per_line) {
+                        int cursor_col_in_segment = edit_cursor_col - offset;
+                        int cursor_x = x + 5 + cursor_col_in_segment * 8;
+                        int cursor_y = y + 30 + visual_line * 10;
+                        draw_rect_filled(cursor_x, cursor_y, 2, 8, 0x00FF00);
+                    }
+                    
+                    visual_line++;
+                    if (offset + max_chars_per_line >= line_len) break;
                 }
             }
         } else {
             int max_lines_shown = (h - 40) / 10;
+            int max_chars_per_line = (w - 10) / 8;
             int start = (line_count > max_lines_shown) ? line_count - max_lines_shown : 0;
             for (int i = 0; i < max_lines_shown && (start + i) < line_count; ++i) {
-                draw_string(buffer[start + i], x + 5, y + 30 + i * 10, 0xDDDDDD);
+                char wrapped_line[120];
+                strncpy(wrapped_line, buffer[start + i], max_chars_per_line);
+                wrapped_line[max_chars_per_line] = '\0';
+                draw_string(wrapped_line, x + 5, y + 30 + i * 10, 0xDDDDDD);
             }
 
-            if (line_count > 0 && (line_count - 1 >= start)) {
-                char temp_prompt[120];
-                snprintf(temp_prompt, 120, "%s%s", buffer[line_count - 1], current_line);
-                draw_string(temp_prompt, x + 5, y + 30 + (line_count - 1 - start) * 10, 0xFFFFFF);
-                
-                int cursor_x = x + 5 + (strlen(buffer[line_count - 1]) + line_pos) * 8;
-                int cursor_y = y + 30 + (line_count - 1 - start) * 10;
-                draw_rect_filled(cursor_x, cursor_y, 2, 8, 0x00FF00);
-            }
+          
+			if (line_count > 0 && (line_count - 1 >= start)) {
+				const int WRAP_WIDTH = (w - 10) / 8;
+				
+				// Combine the prompt (e.g., ">") and the current typed line
+				char full_input_line[240]; 
+				snprintf(full_input_line, 240, "%s%s", buffer[line_count - 1], current_line);
+
+				int prompt_len = strlen(buffer[line_count - 1]);
+				int total_len = strlen(full_input_line);
+				
+				// --- 1. Draw the wrapped text for the input line ---
+				int base_y = y + 30 + (line_count - 1 - start) * 10;
+				for (int i = 0; i < total_len; i += WRAP_WIDTH) {
+					char segment[WRAP_WIDTH + 1];
+					int len_to_copy = (total_len - i > WRAP_WIDTH) ? WRAP_WIDTH : (total_len - i);
+					strncpy(segment, full_input_line + i, len_to_copy);
+					segment[len_to_copy] = '\0';
+					
+					// Calculate the Y position for the current segment
+					int current_line_y = base_y + (i / WRAP_WIDTH) * 10;
+					draw_string(segment, x + 5, current_line_y, 0xFFFFFF);
+				}
+
+				// --- 2. Calculate the wrapped cursor position ---
+				int cursor_abs_pos = prompt_len + line_pos;
+				int cursor_line_offset = cursor_abs_pos / WRAP_WIDTH; // Which wrapped line the cursor is on
+				int cursor_col_offset = cursor_abs_pos % WRAP_WIDTH;  // Which column on that wrapped line
+
+				int cursor_x = x + 5 + cursor_col_offset * 8;
+				int cursor_y = base_y + cursor_line_offset * 10;
+				
+				draw_rect_filled(cursor_x, cursor_y, 2, 8, 0x00FF00);
+			}
         }
     }
 
