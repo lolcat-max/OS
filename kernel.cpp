@@ -402,7 +402,7 @@ public:
     
     if (in_editor) {
         // Editor mode - existing code with corrected variable names
-        int maxlines = (h - 60) / 10;
+        int maxlines = (h - 50) / 10;
         int maxcharsperline = (w - 10) / 8;
         
         draw_rect_filled(x, y + h - 25, w, 25, 0x004400);
