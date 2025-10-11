@@ -43,4 +43,4 @@ i686-elf-gcc --version
 
 sudo make
 
-use VMware with SATA drive, port 0
+use VMware (other-64bit) with SATA drive, port 0
