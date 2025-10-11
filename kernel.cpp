@@ -1110,11 +1110,17 @@ COMMON ISSUES:
 // =============================================================================
 
 // Start with this version - it's the most straightforward:
-
+static inline void io_delay() {
+    for (volatile int i = 0; i < 500; i++);  // small pause to avoid bus lock
+}
 void poll_input_simple() {
     last_key_press = 0;
-    
-    while (inb(0x64) & 1) {
+
+    for (int tries = 0; tries < 8; tries++) { // don’t spin forever
+        if (!(inb(0x64) & 1)) {
+            io_delay();
+            continue;
+        }
         uint8_t status = inb(0x64);
         uint8_t data = inb(0x60);
         
@@ -4241,7 +4247,56 @@ void TerminalWindow::handle_command() {
     
     if(!in_editor) print_prompt();
 }
+static void io_wait() { for (volatile int i = 0; i < 100000; i++); }
 
+static bool init_ps2_mouse_hw() {
+    // Disable both PS/2 ports
+    outb(0x64, 0xAD); // Disable keyboard
+    outb(0x64, 0xA7); // Disable mouse
+    io_wait();
+
+    // Flush output buffer
+    while (inb(0x64) & 1) inb(0x60);
+
+    // Enable auxiliary (mouse) port
+    outb(0x64, 0xA8);
+    io_wait();
+
+    // Enable interrupts for mouse (bit 1) and keyboard (bit 0)
+    outb(0x64, 0x20);
+    uint8_t status = inb(0x60);
+    status |= 0x03;
+    status &= ~0x30;
+    outb(0x64, 0x60);
+    outb(0x60, status);
+    io_wait();
+
+    // Tell the controller we’re sending a mouse command
+    outb(0x64, 0xD4);
+    outb(0x60, 0xF6); // Set defaults
+    if (inb(0x60) != 0xFA) return false;
+    io_wait();
+
+    // Enable data reporting
+    outb(0x64, 0xD4);
+    outb(0x60, 0xF4);
+    if (inb(0x60) != 0xFA) return false;
+    io_wait();
+
+    // Test mouse packet stream
+    for (int i = 0; i < 3; i++) {
+        if (!(inb(0x64) & 1)) io_wait();
+        inb(0x60);
+    }
+
+    return true;
+}
+void init_pit() {
+    uint32_t divisor = 1193180 / 100; // 100Hz
+    outb(0x43, 0x36);
+    outb(0x40, divisor & 0xFF);
+    outb(0x40, (divisor >> 8) & 0xFF);
+}
 // =============================================================================
 // SECTION 7: KERNEL MAIN
 // =============================================================================
@@ -4251,18 +4306,24 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     fb_info = { (uint32_t*)(uint64_t)mbi->framebuffer_addr, mbi->framebuffer_width, mbi->framebuffer_height, mbi->framebuffer_pitch };
     backbuffer = new uint32_t[fb_info.width * fb_info.height];
-    
-    if (init_ps2_mouse()) {
-        wm.print_to_focused("PS/2 mouse initialized.\n");
-    } else {
-        wm.print_to_focused("Using fallback mouse init.\n");
-        // Fallback to your original code
-        outb(0x64, 0xA8); outb(0x64, 0x20);
-        uint8_t status = (inb(0x60) | 2) & ~0x20;
-        outb(0x64, 0x60); outb(0x60, status);
-        outb(0x64, 0xD4); outb(0x60, 0xF6); inb(0x60);
-        outb(0x64, 0xD4); outb(0x60, 0xF4); inb(0x60);
-    }
+    init_pit();
+    if (init_ps2_mouse_hw()) {
+		wm.print_to_focused("PS/2 mouse (hardware) initialized.\n");
+	} else {
+		wm.print_to_focused("PS/2 mouse init failed, using fallback.\n");
+		// Optional fallback (VM-safe)
+		outb(0x64, 0xA8);
+		outb(0x64, 0x20);
+		uint8_t status = (inb(0x60) | 2) & ~0x20;
+		outb(0x64, 0x60);
+		outb(0x60, status);
+		outb(0x64, 0xD4);
+		outb(0x60, 0xF6);
+		inb(0x60);
+		outb(0x64, 0xD4);
+		outb(0x60, 0xF4);
+		inb(0x60);
+	}
 
     disk_init();
     if(ahci_base) fat32_init();
