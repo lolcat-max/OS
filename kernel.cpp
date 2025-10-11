@@ -718,49 +718,471 @@ int mouse_x = 400, mouse_y = 300;
 bool mouse_left_down = false;
 bool mouse_left_last_frame = false;
 char last_key_press = 0;
+// =============================================================================
+// IMPROVED PS/2 MOUSE INITIALIZATION AND HANDLING
+// =============================================================================
+
+// Add these constants near the other keyboard/mouse definitions
+#define PS2_DATA_PORT    0x60
+#define PS2_STATUS_PORT  0x64
+#define PS2_COMMAND_PORT 0x64
+
+// PS/2 Controller Commands
+#define PS2_CMD_READ_CONFIG     0x20
+#define PS2_CMD_WRITE_CONFIG    0x60
+#define PS2_CMD_DISABLE_PORT2   0xA7
+#define PS2_CMD_ENABLE_PORT2    0xA8
+#define PS2_CMD_TEST_PORT2      0xA9
+#define PS2_CMD_WRITE_PORT2     0xD4
+
+// PS/2 Mouse Commands
+#define MOUSE_CMD_RESET         0xFF
+#define MOUSE_CMD_ENABLE_DATA   0xF4
+#define MOUSE_CMD_SET_DEFAULTS  0xF6
+#define MOUSE_CMD_SET_SAMPLE    0xF3
+
+// Status register bits
+#define PS2_STATUS_OUTPUT_FULL  0x01
+#define PS2_STATUS_INPUT_FULL   0x02
+#define PS2_STATUS_TIMEOUT      0x40
+
+// Improved PS/2 wait functions with timeout
+static bool ps2_wait_input(int timeout = 100000) {
+    while (timeout--) {
+        if (!(inb(PS2_STATUS_PORT) & PS2_STATUS_INPUT_FULL)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ps2_wait_output(int timeout = 100000) {
+    while (timeout--) {
+        if (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Send command to PS/2 controller
+static void ps2_write_command(uint8_t cmd) {
+    ps2_wait_input();
+    outb(PS2_COMMAND_PORT, cmd);
+}
+
+// Write data to PS/2 controller
+static void ps2_write_data(uint8_t data) {
+    ps2_wait_input();
+    outb(PS2_DATA_PORT, data);
+}
+
+// Read data from PS/2 controller
+static uint8_t ps2_read_data() {
+    ps2_wait_output();
+    return inb(PS2_DATA_PORT);
+}
+
+// Send command to mouse (port 2)
+static bool ps2_mouse_write(uint8_t cmd) {
+    ps2_write_command(PS2_CMD_WRITE_PORT2);
+    ps2_write_data(cmd);
+    
+    // Wait for ACK (0xFA)
+    if (ps2_wait_output(100000)) {
+        uint8_t response = ps2_read_data();
+        return response == 0xFA;
+    }
+    return false;
+}
+
+// Improved PS/2 mouse initialization
+static bool init_ps2_mouse() {
+    // 1. Disable both PS/2 ports
+    ps2_write_command(0xAD); // Disable keyboard
+    ps2_write_command(PS2_CMD_DISABLE_PORT2); // Disable mouse
+    
+    // 2. Flush output buffer
+    while (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
+        inb(PS2_DATA_PORT);
+    }
+    
+    // 3. Read and modify controller configuration
+    ps2_write_command(PS2_CMD_READ_CONFIG);
+    if (!ps2_wait_output()) return false;
+    uint8_t config = ps2_read_data();
+    
+    // Enable interrupts and clock for both ports
+    config |= 0x03;  // Enable port 1 and port 2 interrupts
+    config &= ~0x30; // Enable both clocks
+    
+    ps2_write_command(PS2_CMD_WRITE_CONFIG);
+    ps2_write_data(config);
+    
+    // 4. Enable second PS/2 port (mouse)
+    ps2_write_command(PS2_CMD_ENABLE_PORT2);
+    
+    // 5. Test second port
+    ps2_write_command(PS2_CMD_TEST_PORT2);
+    if (!ps2_wait_output()) return false;
+    uint8_t test_result = ps2_read_data();
+    if (test_result != 0x00) {
+        return false; // Port test failed
+    }
+    
+    // 6. Reset mouse
+    if (!ps2_mouse_write(MOUSE_CMD_RESET)) {
+        return false;
+    }
+    
+    // Wait for self-test result (0xAA = pass)
+    if (ps2_wait_output(500000)) {
+        uint8_t result = ps2_read_data();
+        if (result != 0xAA) return false;
+        
+        // Read device ID (should be 0x00)
+        if (ps2_wait_output()) {
+            ps2_read_data();
+        }
+    }
+    
+    // 7. Set mouse defaults
+    if (!ps2_mouse_write(MOUSE_CMD_SET_DEFAULTS)) {
+        return false;
+    }
+    
+    // 8. Set sample rate (optional, helps with some USB-PS/2 adapters)
+    ps2_mouse_write(MOUSE_CMD_SET_SAMPLE);
+    ps2_mouse_write(100); // 100 samples/sec
+    
+    // 9. Enable data reporting
+    if (!ps2_mouse_write(MOUSE_CMD_ENABLE_DATA)) {
+        return false;
+    }
+    
+    // 10. Re-enable keyboard
+    ps2_write_command(0xAE);
+    
+    return true;
+}
+
+// Improved mouse packet handling with better synchronization
+struct MouseState {
+    uint8_t cycle;
+    int8_t packet[3];
+    bool synchronized;
+    int x;
+    int y;
+    bool left_button;
+    bool right_button;
+    bool middle_button;
+};
+
+static MouseState mouse_state = {0, {0, 0, 0}, false, 400, 300, false, false, false};
+
+static void handle_mouse_packet() {
+    if (!ps2_wait_output(1000)) return;
+    
+    uint8_t data = ps2_read_data();
+    
+    // If not synchronized, look for valid first byte
+    if (!mouse_state.synchronized) {
+        // First byte always has bit 3 set
+        if (data & 0x08) {
+            mouse_state.packet[0] = data;
+            mouse_state.cycle = 1;
+            mouse_state.synchronized = true;
+        }
+        return;
+    }
+    
+    mouse_state.packet[mouse_state.cycle] = data;
+    mouse_state.cycle++;
+    
+    if (mouse_state.cycle == 3) {
+        mouse_state.cycle = 0;
+        
+        // Verify packet validity (bit 3 should be set in first byte)
+        if (!(mouse_state.packet[0] & 0x08)) {
+            mouse_state.synchronized = false;
+            return;
+        }
+        
+        // Extract button states
+        mouse_state.left_button = mouse_state.packet[0] & 0x01;
+        mouse_state.right_button = mouse_state.packet[0] & 0x02;
+        mouse_state.middle_button = mouse_state.packet[0] & 0x04;
+        
+        // Extract movement with proper sign extension
+        int dx = mouse_state.packet[1];
+        int dy = mouse_state.packet[2];
+        
+        // Check for overflow flags
+        if (mouse_state.packet[0] & 0x40) dx = 0; // X overflow
+        if (mouse_state.packet[0] & 0x80) dy = 0; // Y overflow
+        
+        // Apply sign extension if negative movement flags are set
+        if (mouse_state.packet[0] & 0x10) dx |= 0xFFFFFF00; // X sign
+        if (mouse_state.packet[0] & 0x20) dy |= 0xFFFFFF00; // Y sign
+        
+        // Update position
+        mouse_state.x += dx;
+        mouse_state.y -= dy; // Y is inverted
+        
+        // Clamp to screen bounds
+        if (mouse_state.x < 0) mouse_state.x = 0;
+        if (mouse_state.y < 0) mouse_state.y = 0;
+        if (mouse_state.x >= (int)fb_info.width) mouse_state.x = fb_info.width - 1;
+        if (mouse_state.y >= (int)fb_info.height) mouse_state.y = fb_info.height - 1;
+    }
+}
+
+// =============================================================================
+// IMPROVED MOUSE PACKET HANDLING - FIXED VERSION
+// =============================================================================
+
+// Simpler, more reliable mouse packet handling
+static void process_mouse_data(uint8_t data) {
+    static uint8_t mouse_cycle = 0;
+    static int8_t mouse_packet[3];
+    
+    mouse_packet[mouse_cycle] = data;
+    mouse_cycle++;
+    
+    if (mouse_cycle == 3) {
+        mouse_cycle = 0;
+        
+        // Parse the packet
+        uint8_t flags = mouse_packet[0];
+        
+        // Validate: bit 3 must be set in first byte
+        if (!(flags & 0x08)) {
+            return; // Invalid packet, skip
+        }
+        
+        // Extract button states
+        mouse_state.left_button = flags & 0x01;
+        mouse_state.right_button = flags & 0x02;
+        mouse_state.middle_button = flags & 0x04;
+        
+        // Extract movement deltas
+        int dx = mouse_packet[1];
+        int dy = mouse_packet[2];
+        
+        // Handle sign extension for 9-bit values
+        if (flags & 0x10) dx |= 0xFFFFFF00; // X is negative
+        if (flags & 0x20) dy |= 0xFFFFFF00; // Y is negative
+        
+        // Check for overflow and ignore if present
+        if (flags & 0x40) dx = 0; // X overflow
+        if (flags & 0x80) dy = 0; // Y overflow
+        
+        // Update mouse position
+        mouse_state.x += dx;
+        mouse_state.y -= dy; // Y axis is inverted
+        
+        // Clamp to screen bounds
+        if (mouse_state.x < 0) mouse_state.x = 0;
+        if (mouse_state.y < 0) mouse_state.y = 0;
+        if (mouse_state.x >= (int)fb_info.width) mouse_state.x = fb_info.width - 1;
+        if (mouse_state.y >= (int)fb_info.height) mouse_state.y = fb_info.height - 1;
+    }
+}
+
+// =============================================================================
+// REPLACEMENT FOR poll_input() IN KERNEL MAIN
+// =============================================================================
 
 void poll_input() {
     last_key_press = 0;
     bool new_mouse_state = mouse_left_down;
+
     while (inb(0x64) & 1) {
         uint8_t status = inb(0x64);
-        uint8_t scancode = inb(0x60);
+        uint8_t data = inb(0x60);
+        
         if (status & 0x20) {
-            static uint8_t mouse_cycle = 0;
-            static int8_t mouse_packet[3];
-            mouse_packet[mouse_cycle++] = scancode;
-            if (mouse_cycle == 3) {
-                mouse_cycle = 0;
-                new_mouse_state = mouse_packet[0] & 0x01;
-                mouse_x += mouse_packet[1];
-                mouse_y -= mouse_packet[2];
-                if (mouse_x < 0) mouse_x = 0; if (mouse_y < 0) mouse_y = 0;
-                if (mouse_x >= (int)fb_info.width) mouse_x = fb_info.width - 1;
-                if (mouse_y >= (int)fb_info.height) mouse_y = fb_info.height - 1;
-            }
+            // Mouse data (bit 5 of status = 1)
+            process_mouse_data(data);
+            new_mouse_state = mouse_state.left_button;
         } else {
-            bool is_press = !(scancode & 0x80);
-            if (!is_press) scancode -= 0x80;
-            if (scancode == 0x2A || scancode == 0x36) { is_shift_pressed = is_press; }
-            if (scancode == 0x1D) { is_ctrl_pressed = is_press; }
+            // Keyboard data (bit 5 of status = 0)
+            bool is_press = !(data & 0x80);
+            if (!is_press) data -= 0x80;
             
-            if (is_press) {
-                if (scancode == 0x48) { last_key_press = KEY_UP; }
-                else if (scancode == 0x50) { last_key_press = KEY_DOWN; }
-                else if (scancode == 0x4B) { last_key_press = KEY_LEFT; }
-                else if (scancode == 0x4D) { last_key_press = KEY_RIGHT; }
-                else if (scancode == 0x53) { last_key_press = KEY_DELETE; }
-                else if (scancode == 0x47) { last_key_press = KEY_HOME; }
-                else if (scancode == 0x4F) { last_key_press = KEY_END; }
+            if (data == 0x2A || data == 0x36) { 
+                is_shift_pressed = is_press; 
+            } else if (data == 0x1D) { 
+                is_ctrl_pressed = is_press; 
+            } else if (is_press) {
+                if (data == 0x48) last_key_press = KEY_UP;
+                else if (data == 0x50) last_key_press = KEY_DOWN;
+                else if (data == 0x4B) last_key_press = KEY_LEFT;
+                else if (data == 0x4D) last_key_press = KEY_RIGHT;
+                else if (data == 0x53) last_key_press = KEY_DELETE;
+                else if (data == 0x47) last_key_press = KEY_HOME;
+                else if (data == 0x4F) last_key_press = KEY_END;
                 else {
-                    const char* map = is_ctrl_pressed ? sc_ascii_ctrl_map : (is_shift_pressed ? sc_ascii_shift_map : sc_ascii_nomod_map);
-                    if (scancode < sizeof(sc_ascii_nomod_map) && map[scancode] != 0) last_key_press = map[scancode];
+                    const char* map = is_ctrl_pressed ? sc_ascii_ctrl_map : 
+                                     (is_shift_pressed ? sc_ascii_shift_map : sc_ascii_nomod_map);
+                    if (data < sizeof(sc_ascii_nomod_map) && map[data] != 0) {
+                        last_key_press = map[data];
+                    }
                 }
             }
         }
     }
+    
+    // Update global mouse state
+    mouse_x = mouse_state.x;
+    mouse_y = mouse_state.y;
     mouse_left_last_frame = mouse_left_down;
     mouse_left_down = new_mouse_state;
+}
+// =============================================================================
+// COMPLETE INTEGRATION GUIDE
+// =============================================================================
+
+/*
+STEP 1: Add MouseState structure to your globals (in SECTION 4):
+
+struct MouseState {
+    int x;
+    int y;
+    bool left_button;
+    bool right_button;
+    bool middle_button;
+};
+
+static MouseState mouse_state = {400, 300, false, false, false};
+
+STEP 2: In kernel_main(), replace your existing mouse initialization:
+
+OLD CODE:
+    outb(0x64, 0xA8); outb(0x64, 0x20);
+    uint8_t status = (inb(0x60) | 2) & ~0x20;
+    outb(0x64, 0x60); outb(0x60, status);
+    outb(0x64, 0xD4); outb(0x60, 0xF6); inb(0x60);
+    outb(0x64, 0xD4); outb(0x60, 0xF4); inb(0x60);
+
+NEW CODE:
+    // Initialize PS/2 mouse
+    if (init_ps2_mouse()) {
+        wm.print_to_focused("PS/2 mouse initialized.\n");
+    } else {
+        wm.print_to_focused("Using fallback mouse init.\n");
+        // Fallback to your original code
+        outb(0x64, 0xA8); outb(0x64, 0x20);
+        uint8_t status = (inb(0x60) | 2) & ~0x20;
+        outb(0x64, 0x60); outb(0x60, status);
+        outb(0x64, 0xD4); outb(0x60, 0xF6); inb(0x60);
+        outb(0x64, 0xD4); outb(0x60, 0xF4); inb(0x60);
+    }
+
+STEP 3: Replace your poll_input() function:
+
+OPTION A - Use poll_input_simple() (recommended first try)
+OPTION B - Use poll_input_improved() (if simple doesn't work)
+OPTION C - Use poll_input_debug() (to see what's happening)
+
+STEP 4: In kernel_main() main loop, replace:
+    poll_input();
+WITH:
+    poll_input_simple();  // or poll_input_improved() or poll_input_debug()
+
+TROUBLESHOOTING:
+If mouse still doesn't work:
+
+1. Try poll_input_debug() and watch the console output
+2. Check if mouse_x and mouse_y values are changing
+3. Verify status byte bit 5 is set for mouse packets
+4. Some systems need extra delays in initialization
+
+COMMON ISSUES:
+- Mouse moves but erratically: Sign extension problem (fixed in simple version)
+- Mouse doesn't move at all: Check if status bit 5 is working
+- Mouse moves in wrong direction: Y inversion issue (fixed with -= instead of +=)
+- Mouse jumps around: Overflow not handled (fixed in all versions)
+*/
+
+// =============================================================================
+// FINAL RECOMMENDATION
+// =============================================================================
+
+// Start with this version - it's the most straightforward:
+
+void poll_input_simple() {
+    last_key_press = 0;
+    
+    while (inb(0x64) & 1) {
+        uint8_t status = inb(0x64);
+        uint8_t data = inb(0x60);
+        
+        if (status & 0x20) {
+            // Mouse data detected
+            static uint8_t cycle = 0;
+            static uint8_t bytes[3];
+            
+            bytes[cycle++] = data;
+            
+            if (cycle >= 3) {
+                cycle = 0;
+                
+                // Validate packet (bit 3 must be set)
+                if (bytes[0] & 0x08) {
+                    // Update button
+                    mouse_left_down = bytes[0] & 0x01;
+                    
+                    // Get deltas
+                    int dx = bytes[1];
+                    int dy = bytes[2];
+                    
+                    // Handle negative values (9-bit two's complement)
+                    if (bytes[0] & 0x10) dx -= 256;
+                    if (bytes[0] & 0x20) dy -= 256;
+                    
+                    // Ignore overflow
+                    if (bytes[0] & 0x40) dx = 0;
+                    if (bytes[0] & 0x80) dy = 0;
+                    
+                    // Update position
+                    mouse_x += dx;
+                    mouse_y -= dy; // Y is inverted
+                    
+                    // Clamp to screen
+                    if (mouse_x < 0) mouse_x = 0;
+                    if (mouse_y < 0) mouse_y = 0;
+                    if (mouse_x >= (int)fb_info.width) mouse_x = fb_info.width - 1;
+                    if (mouse_y >= (int)fb_info.height) mouse_y = fb_info.height - 1;
+                }
+            }
+        } else {
+            // Keyboard data
+            bool is_press = !(data & 0x80);
+            if (!is_press) data &= 0x7F;
+            
+            if (data == 0x2A || data == 0x36) is_shift_pressed = is_press;
+            else if (data == 0x1D) is_ctrl_pressed = is_press;
+            else if (is_press) {
+                switch(data) {
+                    case 0x48: last_key_press = KEY_UP; break;
+                    case 0x50: last_key_press = KEY_DOWN; break;
+                    case 0x4B: last_key_press = KEY_LEFT; break;
+                    case 0x4D: last_key_press = KEY_RIGHT; break;
+                    case 0x53: last_key_press = KEY_DELETE; break;
+                    case 0x47: last_key_press = KEY_HOME; break;
+                    case 0x4F: last_key_press = KEY_END; break;
+                    default: {
+                        const char* map = is_ctrl_pressed ? sc_ascii_ctrl_map : 
+                                         (is_shift_pressed ? sc_ascii_shift_map : sc_ascii_nomod_map);
+                        if (data < sizeof(sc_ascii_nomod_map) && map[data] != 0) {
+                            last_key_press = map[data];
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 void draw_cursor(int x, int y, uint32_t color) { for(int i=0;i<12;i++) put_pixel_back(x,y+i,color); for(int i=0;i<8;i++) put_pixel_back(x+i,y+i,color); for(int i=0;i<4;i++) put_pixel_back(x+i,y+(11-i),color); }
 
@@ -1880,14 +2302,65 @@ static const int MAX_HARDWARE_DEVICES = 32;
 static HardwareDevice hardware_registry[MAX_HARDWARE_DEVICES];
 static int hardware_count = 0;
 
-// Hardware discovery functions
+// More comprehensive PCI class codes
+static const char* get_pci_class_name(uint8_t base_class, uint8_t sub_class) {
+    switch (base_class) {
+        case 0x00: return "Unclassified";
+        case 0x01:
+            switch (sub_class) {
+                case 0x00: return "SCSI Controller";
+                case 0x01: return "IDE Controller";
+                case 0x02: return "Floppy Controller";
+                case 0x03: return "IPI Controller";
+                case 0x04: return "RAID Controller";
+                case 0x05: return "ATA Controller";
+                case 0x06: return "SATA Controller";
+                case 0x07: return "SAS Controller";
+                case 0x08: return "NVMe Controller";
+                default: return "Storage Controller";
+            }
+        case 0x02: return "Network Controller";
+        case 0x03:
+            switch (sub_class) {
+                case 0x00: return "VGA Controller";
+                case 0x01: return "XGA Controller";
+                case 0x02: return "3D Controller";
+                default: return "Display Controller";
+            }
+        case 0x04: return "Multimedia Controller";
+        case 0x05: return "Memory Controller";
+        case 0x06: return "Bridge Device";
+        case 0x07: return "Communication Controller";
+        case 0x08: return "System Peripheral";
+        case 0x09: return "Input Device";
+        case 0x0A: return "Docking Station";
+        case 0x0B: return "Processor";
+        case 0x0C:
+            switch (sub_class) {
+                case 0x00: return "FireWire Controller";
+                case 0x01: return "ACCESS Bus";
+                case 0x02: return "SSA";
+                case 0x03: return "USB Controller";
+                case 0x04: return "Fibre Channel";
+                case 0x05: return "SMBus";
+                default: return "Serial Bus Controller";
+            }
+        case 0x0D: return "Wireless Controller";
+        case 0x0E: return "Intelligent Controller";
+        case 0x0F: return "Satellite Controller";
+        case 0x10: return "Encryption Controller";
+        case 0x11: return "Signal Processing Controller";
+        default: return "Unknown Device";
+    }
+}
+
+// Improved PCI device discovery
 static void discover_pci_devices() {
-    // Scan PCI configuration space for devices
     for (uint16_t bus = 0; bus < 256; bus++) {
         for (uint8_t device = 0; device < 32; device++) {
             for (uint8_t function = 0; function < 8; function++) {
                 uint32_t vendor_device = pci_config_read_dword(bus, device, function, 0);
-                if ((vendor_device & 0xFFFF) == 0xFFFF) continue; // No device
+                if ((vendor_device & 0xFFFF) == 0xFFFF) continue;
 
                 if (hardware_count >= MAX_HARDWARE_DEVICES) return;
 
@@ -1895,53 +2368,79 @@ static void discover_pci_devices() {
                 dev.vendor_id = vendor_device & 0xFFFF;
                 dev.device_id = (vendor_device >> 16) & 0xFFFF;
 
-                // Read BAR0 for base address
+                // Read class code
+                uint32_t class_code = pci_config_read_dword(bus, device, function, 0x08);
+                uint8_t base_class = (class_code >> 24) & 0xFF;
+                uint8_t sub_class = (class_code >> 16) & 0xFF;
+
+                // Map to device type
+                switch (base_class) {
+                    case 0x01: dev.device_type = 1; break; // Storage
+                    case 0x02: dev.device_type = 2; break; // Network
+                    case 0x03: dev.device_type = 3; break; // Graphics
+                    case 0x04: dev.device_type = 4; break; // Audio
+                    case 0x0C:
+                        dev.device_type = (sub_class == 0x03) ? 5 : 0; // USB or other
+                        break;
+                    default: dev.device_type = 0; break;
+                }
+
+                // Get description
+                const char* desc = get_pci_class_name(base_class, sub_class);
+                strncpy(dev.description, desc, 63);
+                dev.description[63] = '\0';
+
+                // Read BAR0 for base address (handle both 32-bit and 64-bit BARs)
                 uint32_t bar0 = pci_config_read_dword(bus, device, function, 0x10);
                 if (bar0 & 0x1) {
                     // I/O port
                     dev.base_address = bar0 & 0xFFFFFFFC;
-                    dev.size = 0x100; // Assume 256 bytes for I/O ports
+                    dev.size = 0x100;
                 } else {
                     // Memory mapped
                     dev.base_address = bar0 & 0xFFFFFFF0;
+                    
+                    // Check if 64-bit BAR
                     if ((bar0 & 0x6) == 0x4) {
-                        // 64-bit BAR
                         uint32_t bar1 = pci_config_read_dword(bus, device, function, 0x14);
                         dev.base_address |= ((uint64_t)bar1 << 32);
                     }
-                    dev.size = 0x1000; // Assume 4KB for memory mapped
-                }
-
-                // Determine device type based on class code
-                uint32_t class_code = pci_config_read_dword(bus, device, function, 0x08);
-                uint8_t base_class = (class_code >> 24) & 0xFF;
-
-                switch (base_class) {
-                    case 0x01: dev.device_type = 1; simple_strcpy(dev.description, "Storage Controller"); break;
-                    case 0x02: dev.device_type = 2; simple_strcpy(dev.description, "Network Controller"); break;
-                    case 0x03: dev.device_type = 3; simple_strcpy(dev.description, "Display Controller"); break;
-                    case 0x04: dev.device_type = 4; simple_strcpy(dev.description, "Multimedia Controller"); break;
-                    case 0x0C:
-                        if (((class_code >> 16) & 0xFF) == 0x03) {
-                            dev.device_type = 5;
-                            simple_strcpy(dev.description, "USB Controller");
-                        } else {
-                            dev.device_type = 0;
-                            simple_strcpy(dev.description, "Serial Bus Controller");
-                        }
-                        break;
-                    default: dev.device_type = 0; simple_strcpy(dev.description, "Unknown Device"); break;
+                    
+                    // Try to determine size by writing all 1s and reading back
+                    pci_config_read_dword(bus, device, function, 0x04); // Save command reg
+                    uint32_t orig_bar = bar0;
+                    
+                    outl(0xCF8, 0x80000000 | ((uint32_t)bus << 16) | 
+                         ((uint32_t)device << 11) | ((uint32_t)function << 8) | 0x10);
+                    outl(0xCFC, 0xFFFFFFFF);
+                    uint32_t size_bar = inl(0xCFC);
+                    
+                    // Restore original BAR
+                    outl(0xCF8, 0x80000000 | ((uint32_t)bus << 16) | 
+                         ((uint32_t)device << 11) | ((uint32_t)function << 8) | 0x10);
+                    outl(0xCFC, orig_bar);
+                    
+                    if (size_bar != 0 && size_bar != 0xFFFFFFFF) {
+                        size_bar &= 0xFFFFFFF0;
+                        dev.size = ~size_bar + 1;
+                    } else {
+                        dev.size = 0x1000; // Default to 4KB
+                    }
                 }
 
                 hardware_count++;
 
-                if (function == 0 && !(pci_config_read_dword(bus, device, function, 0x0C) & 0x800000)) {
-                    break; // Single function device
+                if (function == 0) {
+                    uint8_t header_type = (class_code >> 16) & 0xFF;
+                    if (!(header_type & 0x80)) {
+                        break; // Single function device
+                    }
                 }
             }
         }
     }
 }
+
 
 static void discover_memory_regions() {
     // Add known memory regions
@@ -3753,11 +4252,17 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     fb_info = { (uint32_t*)(uint64_t)mbi->framebuffer_addr, mbi->framebuffer_width, mbi->framebuffer_height, mbi->framebuffer_pitch };
     backbuffer = new uint32_t[fb_info.width * fb_info.height];
     
-    outb(0x64, 0xA8); outb(0x64, 0x20);
-    uint8_t status = (inb(0x60) | 2) & ~0x20;
-    outb(0x64, 0x60); outb(0x60, status);
-    outb(0x64, 0xD4); outb(0x60, 0xF6); inb(0x60);
-    outb(0x64, 0xD4); outb(0x60, 0xF4); inb(0x60);
+    if (init_ps2_mouse()) {
+        wm.print_to_focused("PS/2 mouse initialized.\n");
+    } else {
+        wm.print_to_focused("Using fallback mouse init.\n");
+        // Fallback to your original code
+        outb(0x64, 0xA8); outb(0x64, 0x20);
+        uint8_t status = (inb(0x60) | 2) & ~0x20;
+        outb(0x64, 0x60); outb(0x60, status);
+        outb(0x64, 0xD4); outb(0x60, 0xF6); inb(0x60);
+        outb(0x64, 0xD4); outb(0x60, 0xF4); inb(0x60);
+    }
 
     disk_init();
     if(ahci_base) fat32_init();
@@ -3769,7 +4274,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     while (true) {
         wm.cleanup_closed_windows();
-        poll_input();
+        poll_input_simple();
         bool mouse_clicked_this_frame = mouse_left_down && !mouse_left_last_frame;
         wm.handle_input(last_key_press, mouse_x, mouse_y, mouse_left_down, mouse_clicked_this_frame);
         draw_rect_filled(0, 0, fb_info.width, fb_info.height, 0x000000); // Clear backbuffer
