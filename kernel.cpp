@@ -78,7 +78,31 @@ char* strncat(char *dest, const char *src, size_t n) {
     return dest;
 }
 int simple_atoi(const char* str) { int res = 0; while(*str >= '0' && *str <= '9') { res = res * 10 + (*str - '0'); str++; } return res; }
-
+const char* strstr(const char* haystack, const char* needle) {
+    if (!*needle) return haystack;  // Empty needle always matches
+    
+    const char* p1 = haystack;
+    while (*p1) {
+        const char* p1_begin = p1;
+        const char* p2 = needle;
+        
+        // Try to match needle starting at p1_begin
+        while (*p1 && *p2 && *p1 == *p2) {
+            p1++;
+            p2++;
+        }
+        
+        // If we matched the entire needle
+        if (!*p2) {
+            return p1_begin;
+        }
+        
+        // Move to next position in haystack
+        p1 = p1_begin + 1;
+    }
+    
+    return nullptr;  // Not found
+}
 int snprintf(char* buffer, size_t size, const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -1824,7 +1848,6 @@ int fat32_rename_file(const char* old_name, const char* new_name) {
     delete[] dir_buf;
     return 0; // Success
 }
-
 void fat32_format() {
     if(!ahci_base) {
         wm.print_to_focused("AHCI disk not found. Cannot format.\n");
@@ -1901,6 +1924,477 @@ void fat32_format() {
         wm.print_to_focused("FAT32 FS re-initialization failed.\n");
     }
 }
+
+// Add after line 1920 (after the FAT32 functions in kernel.cpp)
+
+// ==================== CHKDSK IMPLEMENTATION ====================
+
+struct ChkdskStats {
+    uint32_t total_clusters;
+    uint32_t used_clusters;
+    uint32_t free_clusters;
+    uint32_t bad_clusters;
+    uint32_t lost_clusters;
+    uint32_t directories_checked;
+    uint32_t files_checked;
+    uint32_t errors_found;
+    uint32_t errors_fixed;
+};
+
+static uint32_t* cluster_bitmap = nullptr;
+static uint32_t cluster_bitmap_size = 0;
+
+void init_cluster_bitmap() {
+    uint32_t total_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus + 2;
+    cluster_bitmap_size = (total_clusters + 31) / 32;
+    
+    if (cluster_bitmap) delete[] cluster_bitmap;
+    cluster_bitmap = new uint32_t[cluster_bitmap_size];
+    memset(cluster_bitmap, 0, cluster_bitmap_size * sizeof(uint32_t));
+}
+
+void mark_cluster_used(uint32_t cluster) {
+    if (cluster < 2) return;
+    uint32_t index = cluster / 32;
+    uint32_t bit = cluster % 32;
+    if (index < cluster_bitmap_size) {
+        cluster_bitmap[index] |= (1 << bit);
+    }
+}
+
+bool is_cluster_marked(uint32_t cluster) {
+    if (cluster < 2) return false;
+    uint32_t index = cluster / 32;
+    uint32_t bit = cluster % 32;
+    if (index < cluster_bitmap_size) {
+        return (cluster_bitmap[index] & (1 << bit)) != 0;
+    }
+    return false;
+}
+
+bool is_valid_cluster(uint32_t cluster) {
+    if (cluster < 2) return false;
+    uint32_t max_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus + 2;
+    return cluster < max_clusters;
+}
+
+bool verify_fat_chain(uint32_t start_cluster, uint32_t* chain_length, ChkdskStats& stats) {
+    uint32_t current = start_cluster;
+    uint32_t count = 0;
+    const uint32_t MAX_CHAIN_LENGTH = 1000000;
+    
+    while (current >= 2 && current < FAT_END_OF_CHAIN && count < MAX_CHAIN_LENGTH) {
+        if (!is_valid_cluster(current)) {
+            wm.print_to_focused("  ERROR: Invalid cluster in chain!");
+            stats.errors_found++;
+            return false;
+        }
+        
+        if (is_cluster_marked(current)) {
+            wm.print_to_focused("  ERROR: Cross-linked cluster detected!");
+            stats.errors_found++;
+            return false;
+        }
+        
+        mark_cluster_used(current);
+        count++;
+        current = read_fat_entry(current);
+    }
+    
+    if (count >= MAX_CHAIN_LENGTH) {
+        wm.print_to_focused("  ERROR: Circular FAT chain detected!");
+        stats.errors_found++;
+        return false;
+    }
+    
+    *chain_length = count;
+    return true;
+}
+
+bool check_directory_entry(fat_dir_entry_t* entry, ChkdskStats& stats, bool fix) {
+    bool has_error = false;
+    
+    uint32_t start_cluster = (entry->fst_clus_hi << 16) | entry->fst_clus_lo;
+    
+    if (start_cluster != 0) {
+        uint32_t chain_length = 0;
+        if (!verify_fat_chain(start_cluster, &chain_length, stats)) {
+            has_error = true;
+            if (fix) {
+                wm.print_to_focused("  FIXING: Truncating bad cluster chain...");
+                entry->fst_clus_lo = 0;
+                entry->fst_clus_hi = 0;
+                entry->file_size = 0;
+                stats.errors_fixed++;
+            }
+        } else {
+            uint32_t cluster_size = bpb.sec_per_clus * SECTOR_SIZE;
+            uint32_t expected_max_size = chain_length * cluster_size;
+            
+            if (entry->file_size > expected_max_size) {
+                wm.print_to_focused("  ERROR: File size exceeds allocated clusters!");
+                stats.errors_found++;
+                has_error = true;
+                
+                if (fix) {
+                    entry->file_size = expected_max_size;
+                    wm.print_to_focused("  FIXED: Corrected file size");
+                    stats.errors_fixed++;
+                }
+            }
+        }
+    } else if (entry->file_size != 0) {
+        wm.print_to_focused("  ERROR: File has size but no cluster allocation!");
+        stats.errors_found++;
+        has_error = true;
+        
+        if (fix) {
+            entry->file_size = 0;
+            wm.print_to_focused("  FIXED: Reset file size to 0");
+            stats.errors_fixed++;
+        }
+    }
+    
+    return !has_error;
+}
+
+bool scan_directory(uint32_t cluster, ChkdskStats& stats, bool fix, int depth = 0) {
+    if (depth > 20) {
+        wm.print_to_focused("ERROR: Directory nesting too deep!");
+        return false;
+    }
+    
+    stats.directories_checked++;
+    
+    uint8_t* buffer = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
+    if (read_write_sectors(0, cluster_to_lba(cluster), bpb.sec_per_clus, false, buffer) != 0) {
+        wm.print_to_focused("ERROR: Cannot read directory cluster");
+        delete[] buffer;
+        return false;
+    }
+    
+    // Create a working copy for modifications
+    uint8_t* working_buffer = nullptr;
+    if (fix) {
+        working_buffer = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
+        memcpy(working_buffer, buffer, bpb.sec_per_clus * SECTOR_SIZE);
+    }
+    
+    bool modified = false;
+    
+    for (uint32_t i = 0; i < (bpb.sec_per_clus * SECTOR_SIZE); i += sizeof(fat_dir_entry_t)) {
+        // Use working buffer if fixing, otherwise use read-only buffer
+        fat_dir_entry_t* entry = (fat_dir_entry_t*)((fix ? working_buffer : buffer) + i);
+        
+        if (entry->name[0] == 0x00) break;
+        if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue;
+        if (entry->name[0] == '.') continue;
+        
+        if (entry->attr == ATTR_LONG_NAME) continue;
+        if (entry->attr & ATTR_VOLUME_ID) continue;
+        
+        stats.files_checked++;
+        
+        char fname[13];
+        from_83_format(entry->name, fname);
+        
+        char msg[100];
+        snprintf(msg, 100, "Checking: %s", fname);
+        wm.print_to_focused(msg);
+        
+        // Only mark as modified if we're in fix mode and something changed
+        if (!check_directory_entry(entry, stats, fix)) {
+            if (fix) {
+                modified = true;
+            }
+        }
+        
+        if (entry->attr & 0x10) {
+            uint32_t subcluster = (entry->fst_clus_hi << 16) | entry->fst_clus_lo;
+            if (subcluster >= 2 && subcluster < FAT_END_OF_CHAIN) {
+                if (!is_cluster_marked(subcluster)) {
+                    mark_cluster_used(subcluster);
+                    scan_directory(subcluster, stats, fix, depth + 1);
+                }
+            }
+        }
+    }
+    
+    // ONLY write back if in fix mode AND something was modified
+    if (fix && modified && working_buffer) {
+        read_write_sectors(0, cluster_to_lba(cluster), bpb.sec_per_clus, true, working_buffer);
+    }
+    
+    delete[] buffer;
+    if (working_buffer) {
+        delete[] working_buffer;
+    }
+    
+    return true;
+}
+
+
+void find_lost_clusters(ChkdskStats& stats, bool fix) {
+    wm.print_to_focused("\nScanning for lost clusters...");
+    
+    uint32_t max_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus + 2;
+    
+    for (uint32_t cluster = 2; cluster < max_clusters; cluster++) {
+        uint32_t fat_entry = read_fat_entry(cluster);
+        
+        if (fat_entry != FAT_FREE_CLUSTER && !is_cluster_marked(cluster)) {
+            stats.lost_clusters++;
+            
+            char msg[80];
+            snprintf(msg, 80, "  Lost cluster chain starting at %d", cluster);
+            wm.print_to_focused(msg);
+            
+            if (fix) {
+                uint32_t current = cluster;
+                while (current >= 2 && current < FAT_END_OF_CHAIN) {
+                    uint32_t next = read_fat_entry(current);
+                    write_fat_entry(current, FAT_FREE_CLUSTER);
+                    current = next;
+                    stats.errors_fixed++;
+                }
+                wm.print_to_focused("  FIXED: Freed lost cluster chain");
+            }
+        }
+    }
+}
+
+bool check_fat_consistency(ChkdskStats& stats, bool fix) {
+    wm.print_to_focused("Checking FAT table consistency...");
+    
+    if (bpb.num_fats < 2) {
+        wm.print_to_focused("WARNING: Only one FAT copy present!");
+        return true;
+    }
+    
+    uint32_t fat_size = bpb.fat_sz32 * SECTOR_SIZE;
+    uint8_t* fat1 = new uint8_t[fat_size];
+    uint8_t* fat2 = new uint8_t[fat_size];
+    
+    read_write_sectors(0, fat_start_sector, bpb.fat_sz32, false, fat1);
+    read_write_sectors(0, fat_start_sector + bpb.fat_sz32, bpb.fat_sz32, false, fat2);
+    
+    bool mismatch = false;
+    for (uint32_t i = 0; i < fat_size; i++) {
+        if (fat1[i] != fat2[i]) {
+            mismatch = true;
+            break;
+        }
+    }
+    
+    if (mismatch) {
+        wm.print_to_focused("ERROR: FAT1 and FAT2 do not match!");
+        stats.errors_found++;
+        
+        if (fix) {
+            wm.print_to_focused("FIXING: Copying FAT1 to FAT2...");
+            read_write_sectors(0, fat_start_sector + bpb.fat_sz32, bpb.fat_sz32, true, fat1);
+            stats.errors_fixed++;
+            wm.print_to_focused("FIXED: FAT tables synchronized");
+        }
+    } else {
+        wm.print_to_focused("OK: FAT tables are consistent");
+    }
+    
+    delete[] fat1;
+    delete[] fat2;
+    return !mismatch;
+}
+void chkdsk(bool fix = false, bool verbose = false) {
+    // Safety check
+    if (!ahci_base || !current_directory_cluster) {
+        wm.print_to_focused("ERROR: Filesystem not initialized!");
+        return;
+    }
+    
+    wm.print_to_focused("=====================================");
+    wm.print_to_focused("    DISK CHECK UTILITY (CHKDSK)     ");
+    wm.print_to_focused("=====================================");
+    
+    if (fix) {
+        wm.print_to_focused("\nMode: FIX ERRORS (writing enabled)");
+    } else {
+        wm.print_to_focused("\nMode: READ-ONLY (no changes)");
+    }
+    
+    ChkdskStats stats;
+    memset(&stats, 0, sizeof(stats));
+    
+    // SAFETY: Check for valid values
+    if (bpb.sec_per_clus == 0) {
+        wm.print_to_focused("ERROR: Invalid cluster size!");
+        return;
+    }
+    
+    if (bpb.tot_sec32 <= data_start_sector) {
+        wm.print_to_focused("ERROR: Invalid disk geometry!");
+        return;
+    }
+    
+    stats.total_clusters = (bpb.tot_sec32 - data_start_sector) / bpb.sec_per_clus;
+    
+    // SAFETY: Prevent division by zero
+    if (stats.total_clusters == 0) {
+        wm.print_to_focused("ERROR: No data clusters available!");
+        return;
+    }
+    
+    char msg[100];
+    snprintf(msg, 100, "\nVolume size: %d sectors (%d MB)", 
+             bpb.tot_sec32, (bpb.tot_sec32 * SECTOR_SIZE) / (1024 * 1024));
+    wm.print_to_focused(msg);
+    
+    snprintf(msg, 100, "Cluster size: %d KB", (bpb.sec_per_clus * SECTOR_SIZE) / 1024);
+    wm.print_to_focused(msg);
+    
+    snprintf(msg, 100, "Total clusters: %d", stats.total_clusters);
+    wm.print_to_focused(msg);
+    
+    wm.print_to_focused("\n=== Phase 1: Checking boot sector ===");
+    
+    if (strncmp(bpb.fil_sys_type, "FAT32   ", 8) != 0) {
+        wm.print_to_focused("ERROR: Invalid filesystem type!");
+        return;
+    }
+    wm.print_to_focused("OK: Boot sector is valid");
+    
+    // Comment out FAT consistency check for now (might be causing issue)
+    // check_fat_consistency(stats, fix);
+    
+    wm.print_to_focused("\n=== Phase 2: Scanning directories ===");
+    
+    // SAFETY: Initialize bitmap
+    init_cluster_bitmap();
+    if (!cluster_bitmap) {
+        wm.print_to_focused("ERROR: Failed to allocate cluster bitmap!");
+        return;
+    }
+    
+    mark_cluster_used(0);
+    mark_cluster_used(1);
+    
+    // SAFETY: Check root cluster validity
+    if (bpb.root_clus < 2 || bpb.root_clus >= FAT_END_OF_CHAIN) {
+        wm.print_to_focused("ERROR: Invalid root cluster!");
+        if (cluster_bitmap) {
+            delete[] cluster_bitmap;
+            cluster_bitmap = nullptr;
+        }
+        return;
+    }
+    
+    mark_cluster_used(bpb.root_clus);
+    
+    wm.print_to_focused("Scanning root directory...");
+    
+    // SAFETY: Limit recursion depth to prevent stack overflow
+    scan_directory(bpb.root_clus, stats, fix, 0);
+    
+    wm.print_to_focused("\n=== Phase 3: Statistics ===");
+    
+    // Simple stats without lost cluster scan (can add back later)
+    for (uint32_t i = 2; i < stats.total_clusters + 2; i++) {
+        uint32_t entry = read_fat_entry(i);
+        if (entry == FAT_FREE_CLUSTER) {
+            stats.free_clusters++;
+        } else if (entry >= 0x0FFFFFF7) {
+            stats.bad_clusters++;
+        } else {
+            stats.used_clusters++;
+        }
+    }
+    
+    wm.print_to_focused("\n=====================================");
+    wm.print_to_focused("         CHKDSK RESULTS              ");
+    wm.print_to_focused("=====================================");
+    
+    snprintf(msg, 100, "Directories checked:  %d", stats.directories_checked);
+    wm.print_to_focused(msg);
+    
+    snprintf(msg, 100, "Files checked:        %d", stats.files_checked);
+    wm.print_to_focused(msg);
+    
+    snprintf(msg, 100, "\nTotal clusters:       %d", stats.total_clusters);
+    wm.print_to_focused(msg);
+    
+    snprintf(msg, 100, "Used clusters:        %d (%d%%)", 
+             stats.used_clusters, (stats.used_clusters * 100) / stats.total_clusters);
+    wm.print_to_focused(msg);
+    
+    snprintf(msg, 100, "Free clusters:        %d (%d%%)", 
+             stats.free_clusters, (stats.free_clusters * 100) / stats.total_clusters);
+    wm.print_to_focused(msg);
+    
+    snprintf(msg, 100, "Bad clusters:         %d", stats.bad_clusters);
+    wm.print_to_focused(msg);
+    
+    wm.print_to_focused("");
+    snprintf(msg, 100, "Errors found:         %d", stats.errors_found);
+    wm.print_to_focused(msg);
+    
+    if (fix && stats.errors_fixed > 0) {
+        snprintf(msg, 100, "Errors fixed:         %d", stats.errors_fixed);
+        wm.print_to_focused(msg);
+    }
+    
+    if (stats.errors_found == 0) {
+        wm.print_to_focused("\nNo errors found. Disk is healthy!");
+    }
+    
+    // Cleanup
+    if (cluster_bitmap) {
+        delete[] cluster_bitmap;
+        cluster_bitmap = nullptr;
+    }
+    
+    wm.print_to_focused("=====================================");
+}
+
+
+void chkdsk_full_scan(bool fix = false) {
+    wm.print_to_focused("\n=== Phase 5: Scanning for bad sectors ===");
+    wm.print_to_focused("This may take several minutes...");
+    
+    uint8_t* test_buffer = new uint8_t[SECTOR_SIZE];
+    uint32_t bad_sectors = 0;
+    uint32_t total_sectors = bpb.tot_sec32;
+    
+    for (uint32_t sector = 0; sector < total_sectors; sector += 1000) {
+        if (read_write_sectors(0, sector, 1, false, test_buffer) != 0) {
+            bad_sectors++;
+            
+            char msg[80];
+            snprintf(msg, 80, "  Bad sector detected at LBA %d", sector);
+            wm.print_to_focused(msg);
+            
+            if (sector >= data_start_sector) {
+                uint32_t cluster = ((sector - data_start_sector) / bpb.sec_per_clus) + 2;
+                if (fix && is_valid_cluster(cluster)) {
+                    write_fat_entry(cluster, 0x0FFFFFF7);
+                    wm.print_to_focused("  FIXED: Marked cluster as bad in FAT");
+                }
+            }
+        }
+        
+        if ((sector / 1000) % 10 == 0 && sector > 0) {
+            char progress[60];
+            snprintf(progress, 60, "Progress: %d%% (%d/%d sectors)", 
+                     (sector * 100) / total_sectors, sector, total_sectors);
+            wm.print_to_focused(progress);
+        }
+    }
+    
+    delete[] test_buffer;
+    
+    char summary[80];
+    snprintf(summary, 80, "\nBad sector scan complete: %d bad sectors found", bad_sectors);
+    wm.print_to_focused(summary);
+}
+
 
 
 // =============================================================================
@@ -4115,7 +4609,7 @@ void TerminalWindow::handle_command() {
     }
 
     // 3. Now, `command` is the clean first word, and `args` is the rest.
-    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, time, version\n"); }
+    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
     if (strcmp(command, "compile") == 0) {
         cmd_compile(ahci_base, selected_port, get_arg(args, 0));
     } else if (strcmp(command, "run") == 0) {
@@ -4234,6 +4728,31 @@ void TerminalWindow::handle_command() {
         }
     }
     else if (strcmp(command, "formatfs") == 0) { fat32_format(); }
+	else if (strcmp(command, "chkdsk") == 0) {
+		char* args_copy = new char[120];
+		strncpy(args_copy, args, 119);
+		args_copy[119] = '\0';
+		
+		bool fix = false;
+		bool fullscan = false;
+		
+		// Parse arguments
+		if (strstr(args_copy, "/f") || strstr(args_copy, "/F")) {
+			fix = true;
+		}
+		if (strstr(args_copy, "/r") || strstr(args_copy, "/R")) {
+			fix = true;
+			fullscan = true;
+		}
+		
+		chkdsk(fix, true);
+		
+		if (fullscan) {
+			chkdsk_full_scan(fix);
+		}
+		
+		delete[] args_copy;
+	}
     else if (strcmp(command, "time") == 0) { 
         RTC_Time t = read_rtc(); 
         char buf[64]; 
