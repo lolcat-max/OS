@@ -742,12 +742,16 @@ int mouse_x = 400, mouse_y = 300;
 bool mouse_left_down = false;
 bool mouse_left_last_frame = false;
 char last_key_press = 0;
+// Add after line 880 (before PS/2 mouse code)
+
 // =============================================================================
-// IMPROVED PS/2 MOUSE INITIALIZATION AND HANDLING
+// USB MOUSE DETECTION AND LEGACY SUPPORT
 // =============================================================================
+
+
+
 // =============================================================================
-// UNIVERSAL AMD64 MOUSE DRIVER INTEGRATION
-// Add this section after SECTION 4 (before SECTION 5)
+// PS/2 CONTROLLER AND MOUSE DEFINITIONS
 // =============================================================================
 
 // PS/2 Controller Ports and Commands
@@ -786,13 +790,22 @@ char last_key_press = 0;
 #define PS2_RESEND              0xFE
 
 // =============================================================================
-// Enhanced I/O Wait Functions for Modern Hardware
+// I/O Wait Functions
+// =============================================================================
+// =============================================================================
+// I/O Wait Functions
 // =============================================================================
 
 static inline void io_wait_short() {
-    // Use port 0x80 for I/O delay (standard POST diagnostic port)
     asm volatile("outb %%al, $0x80" : : "a"(0));
 }
+
+static inline void io_delay_short() {
+    for (volatile int i = 0; i < 100; i++) {
+        io_wait_short();
+    }
+}
+
 
 static inline void io_delay_medium() {
     for (volatile int i = 0; i < 500; i++) {
@@ -807,7 +820,7 @@ static inline void io_delay_long() {
 }
 
 // =============================================================================
-// PS/2 Wait Functions with Extended Timeouts
+// PS/2 Wait Functions
 // =============================================================================
 
 static bool ps2_wait_input_ready(uint32_t timeout = 100000) {
@@ -863,23 +876,21 @@ static bool ps2_read_data(uint8_t* data) {
 }
 
 // =============================================================================
-// Mouse Command with Retry Logic
+// Mouse Command Functions
 // =============================================================================
 
 static bool ps2_mouse_write_command(uint8_t cmd, int max_retries = 3) {
     for (int retry = 0; retry < max_retries; retry++) {
-        // Send command to mouse via controller
         if (!ps2_write_command(PS2_CMD_WRITE_PORT2)) continue;
         if (!ps2_write_data(cmd)) continue;
         
-        // Wait for ACK
         uint8_t response;
         if (ps2_read_data(&response)) {
             if (response == PS2_ACK) {
                 return true;
             } else if (response == PS2_RESEND) {
                 io_delay_long();
-                continue; // Retry
+                continue;
             }
         }
         io_delay_long();
@@ -894,143 +905,26 @@ static bool ps2_mouse_write_with_arg(uint8_t cmd, uint8_t arg) {
 }
 
 // =============================================================================
-// Modern PS/2 Mouse Initialization (AMD64 Compatible)
-// =============================================================================
-
-static bool init_ps2_mouse_modern() {
-    uint8_t data;
-    
-    // Step 1: Disable both PS/2 ports
-    ps2_write_command(PS2_CMD_DISABLE_PORT1);
-    io_delay_long();
-    ps2_write_command(PS2_CMD_DISABLE_PORT2);
-    io_delay_long();
-    
-    // Step 2: Flush output buffer
-    ps2_flush_output_buffer();
-    
-    // Step 3: Get controller configuration
-    if (!ps2_write_command(PS2_CMD_READ_CONFIG)) return false;
-    if (!ps2_read_data(&data)) return false;
-    
-    uint8_t config = data;
-    
-    // Enable interrupts for both ports, enable clocks
-    config |= 0x03;   // Enable port 1 and 2 interrupts
-    config &= ~0x30;  // Clear clock disable bits
-    
-    // Write modified configuration
-    if (!ps2_write_command(PS2_CMD_WRITE_CONFIG)) return false;
-    if (!ps2_write_data(config)) return false;
-    io_delay_long();
-    
-    // Step 4: Controller self-test (important for modern systems)
-    if (!ps2_write_command(PS2_CMD_TEST_CTRL)) return false;
-    if (ps2_read_data(&data)) {
-        if (data != 0x55) {
-            // Self-test failed, but continue anyway
-        }
-    }
-    
-    // Restore configuration after self-test
-    ps2_write_command(PS2_CMD_WRITE_CONFIG);
-    ps2_write_data(config);
-    io_delay_long();
-    
-    // Step 5: Enable second PS/2 port (mouse)
-    if (!ps2_write_command(PS2_CMD_ENABLE_PORT2)) return false;
-    io_delay_long();
-    
-    // Step 6: Test second port
-    if (!ps2_write_command(PS2_CMD_TEST_PORT2)) return false;
-    if (ps2_read_data(&data)) {
-        if (data != 0x00) {
-            // Port test failed - might still work
-        }
-    }
-    
-    io_delay_long();
-    
-    // Step 7: Reset mouse
-    if (!ps2_mouse_write_command(MOUSE_CMD_RESET)) return false;
-    
-    // Wait for BAT (Basic Assurance Test) completion
-    // Device should send 0xAA (pass) then 0x00 (device ID)
-    uint32_t bat_timeout = 500000;
-    bool bat_complete = false;
-    
-    while (bat_timeout-- > 0) {
-        if (ps2_read_data(&data)) {
-            if (data == 0xAA) {
-                bat_complete = true;
-                // Read device ID
-                ps2_read_data(&data);
-                break;
-            }
-        }
-    }
-    
-    if (!bat_complete) {
-        // BAT failed, try fallback
-        return false;
-    }
-    
-    io_delay_long();
-    
-    // Step 8: Set mouse defaults
-    if (!ps2_mouse_write_command(MOUSE_CMD_SET_DEFAULTS)) return false;
-    io_delay_long();
-    
-    // Step 9: Set sample rate (helps with compatibility)
-    if (!ps2_mouse_write_with_arg(MOUSE_CMD_SET_SAMPLE, 100)) {
-        // Non-fatal, continue
-    }
-    io_delay_long();
-    
-    // Step 10: Set resolution (optional, improves precision)
-    if (!ps2_mouse_write_with_arg(MOUSE_CMD_SET_RESOLUTION, 3)) {
-        // Non-fatal, continue
-    }
-    io_delay_long();
-    
-    // Step 11: Enable data reporting
-    if (!ps2_mouse_write_command(MOUSE_CMD_ENABLE_DATA)) return false;
-    io_delay_long();
-    
-    // Step 12: Re-enable keyboard
-    ps2_write_command(PS2_CMD_ENABLE_PORT1);
-    io_delay_long();
-    
-    // Final flush
-    ps2_flush_output_buffer();
-    
-    return true;
-}
-
-// =============================================================================
-// Legacy Fallback Initialization
+// Legacy PS/2 Mouse Initialization (Fallback)
 // =============================================================================
 
 static bool init_ps2_mouse_legacy() {
-    // Simple legacy initialization for older systems or VM compatibility
-    outb(0x64, 0xA8);  // Enable auxiliary device
+    outb(0x64, 0xA8);
     io_delay_long();
     
-    outb(0x64, 0x20);  // Read configuration
+    outb(0x64, 0x20);
     uint8_t status = inb(0x60) | 2;
     status &= ~0x20;
     
-    outb(0x64, 0x60);  // Write configuration
+    outb(0x64, 0x60);
     outb(0x60, status);
     io_delay_long();
     
-    // Set defaults
     outb(0x64, 0xD4);
     outb(0x60, 0xF6);
     inb(0x60);
     io_delay_long();
     
-    // Enable data reporting
     outb(0x64, 0xD4);
     outb(0x60, 0xF4);
     inb(0x60);
@@ -1043,7 +937,11 @@ static bool init_ps2_mouse_legacy() {
 // =============================================================================
 // Mouse State Structure
 // =============================================================================
-
+static inline void pci_write_config_dword(uint16_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value) {
+    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | ((uint32_t)device << 11) | ((uint32_t)function << 8) | (offset & 0xFC);
+    outl(0xCF8, address);
+    outl(0xCFC, value);
+}
 struct UniversalMouseState {
     int x;
     int y;
@@ -1058,15 +956,301 @@ struct UniversalMouseState {
 
 static UniversalMouseState universal_mouse_state = {400, 300, false, false, false, 0, {0}, false, false};
 
-// =============================================================================
-// Universal Mouse Packet Processing
-// =============================================================================
+
+
+
+
+
+
+
+struct USBLegacyInfo {
+    bool has_uhci;      // USB 1.1
+    bool has_ehci;      // USB 2.0
+    bool has_xhci;      // USB 3.0
+    uint64_t legacy_base;
+    bool ps2_emulation_active;
+};
+
+static USBLegacyInfo usb_info = {false, false, false, 0, false};
+
+static bool detect_usb_controllers() {
+    // Scan PCI for USB controllers
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t device = 0; device < 32; device++) {
+            uint32_t class_code = pci_read_config_dword(bus, device, 0, 0x08);
+            uint8_t base_class = (class_code >> 24) & 0xFF;
+            uint8_t sub_class = (class_code >> 16) & 0xFF;
+            uint8_t prog_if = (class_code >> 8) & 0xFF;
+            
+            // Class 0x0C = Serial Bus Controller, Subclass 0x03 = USB
+            if (base_class == 0x0C && sub_class == 0x03) {
+                if (prog_if == 0x00) usb_info.has_uhci = true;      // UHCI
+                else if (prog_if == 0x10) usb_info.has_uhci = true; // OHCI
+                else if (prog_if == 0x20) usb_info.has_ehci = true; // EHCI
+                else if (prog_if == 0x30) usb_info.has_xhci = true; // xHCI
+                
+                // Get base address for legacy support
+                if (prog_if == 0x20 || prog_if == 0x30) { // EHCI or xHCI
+                    uint32_t bar0 = pci_read_config_dword(bus, device, 0, 0x10);
+                    usb_info.legacy_base = bar0 & 0xFFFFFFF0;
+                }
+            }
+        }
+    }
+    
+    return usb_info.has_uhci || usb_info.has_ehci || usb_info.has_xhci;
+}
+
+static bool enable_usb_legacy_support() {
+    // For EHCI controllers (most common on older systems)
+    if (usb_info.has_ehci && usb_info.legacy_base) {
+        // Read EECP (Extended Capabilities Pointer) from capability registers
+        volatile uint32_t* cap_regs = (volatile uint32_t*)usb_info.legacy_base;
+        uint32_t hccparams = cap_regs[2]; // HCCPARAMS offset
+        uint8_t eecp = (hccparams >> 8) & 0xFF;
+        
+        if (eecp >= 0x40) {
+            // Legacy support capability found
+            // Enable SMI handoff to OS
+            uint32_t legsup = pci_read_config_dword(0, 0, 0, eecp);
+            legsup |= (1 << 24); // OS Owned Semaphore
+            pci_write_config_dword(0, 0, 0, eecp, legsup);
+            
+            // Wait for BIOS handoff
+            for (int i = 0; i < 1000; i++) {
+                legsup = pci_read_config_dword(0, 0, 0, eecp);
+                if (!(legsup & (1 << 16))) break; // BIOS Owned Semaphore cleared
+                io_delay_medium();
+            }
+            
+            usb_info.ps2_emulation_active = true;
+            return true;
+        }
+    }
+    
+    // For xHCI (USB 3.0) - similar process
+    if (usb_info.has_xhci && usb_info.legacy_base) {
+        volatile uint32_t* cap_regs = (volatile uint32_t*)usb_info.legacy_base;
+        uint32_t hccparams1 = cap_regs[4]; // xHCI HCCPARAMS1
+        
+        // Check for legacy support capability
+        uint16_t ext_cap = (hccparams1 >> 16) & 0xFFFF;
+        if (ext_cap) {
+            volatile uint32_t* ext_cap_ptr = (volatile uint32_t*)(usb_info.legacy_base + ext_cap);
+            uint32_t usblegsup = ext_cap_ptr[0];
+            
+            // Request OS ownership
+            usblegsup |= (1 << 24);
+            ext_cap_ptr[0] = usblegsup;
+            
+            // Wait for handoff
+            for (int i = 0; i < 1000; i++) {
+                usblegsup = ext_cap_ptr[0];
+                if (!(usblegsup & (1 << 16))) break;
+                io_delay_long();
+            }
+            
+            usb_info.ps2_emulation_active = true;
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+static bool init_ps2_mouse_hardware() {
+    uint8_t data;
+    
+    // Step 0: Disable USB legacy support interference
+    if (usb_info.ps2_emulation_active) {
+        // Some systems need explicit PS/2 enable even with USB legacy
+        io_delay_long();
+    }
+    
+    // Step 1: Disable both PS/2 ports
+    ps2_write_command(PS2_CMD_DISABLE_PORT1);
+    io_delay_long();
+    ps2_write_command(PS2_CMD_DISABLE_PORT2);
+    io_delay_long();
+    
+    // Step 2: Aggressive buffer flush (hardware can have stale data)
+    for (int i = 0; i < 16; i++) {
+        if (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
+            inb(PS2_DATA_PORT);
+        }
+        io_delay_medium();
+    }
+    
+    // Step 3: Controller self-test (CRITICAL for real hardware)
+    if (!ps2_write_command(PS2_CMD_TEST_CTRL)) return false;
+    io_delay_long();
+    
+    bool self_test_passed = false;
+    for (int retry = 0; retry < 5; retry++) {
+        if (ps2_read_data(&data)) {
+            if (data == 0x55) {
+                self_test_passed = true;
+                break;
+            }
+        }
+        io_delay_long();
+    }
+    
+    if (!self_test_passed) {
+        // Critical failure on real hardware
+        return false;
+    }
+    
+    // Step 4: Read and modify configuration
+    if (!ps2_write_command(PS2_CMD_READ_CONFIG)) return false;
+    if (!ps2_read_data(&data)) return false;
+    
+    uint8_t config = data;
+    config |= 0x03;   // Enable interrupts for both ports
+    config &= ~0x30;  // Enable clocks
+    
+    if (!ps2_write_command(PS2_CMD_WRITE_CONFIG)) return false;
+    if (!ps2_write_data(config)) return false;
+    io_delay_long();
+    
+    // Step 5: Test second port (aux/mouse port)
+    if (!ps2_write_command(PS2_CMD_TEST_PORT2)) return false;
+    io_delay_long();
+    
+    bool port_test_passed = false;
+    if (ps2_read_data(&data)) {
+        if (data == 0x00) {
+            port_test_passed = true;
+        }
+    }
+    
+    if (!port_test_passed) {
+        // Port might be disabled in BIOS or hardware issue
+        return false;
+    }
+    
+    // Step 6: Enable second port
+    if (!ps2_write_command(PS2_CMD_ENABLE_PORT2)) return false;
+    io_delay_long();
+    
+    // Step 7: Reset mouse (critical for real hardware state)
+    if (!ps2_mouse_write_command(MOUSE_CMD_RESET)) return false;
+    
+    // Wait for BAT completion (can take longer on real hardware)
+    uint32_t bat_timeout = 1000000; // Extended timeout for slow devices
+    bool bat_complete = false;
+    
+    while (bat_timeout-- > 0) {
+        if (ps2_read_data(&data)) {
+            if (data == 0xAA) {
+                bat_complete = true;
+                // Read device ID
+                io_delay_medium();
+                ps2_read_data(&data); // Should be 0x00 for standard mouse
+                break;
+            } else if (data == 0xFC) {
+                // BAT failed - try recovery
+                io_delay_long();
+                ps2_mouse_write_command(MOUSE_CMD_RESET);
+                bat_timeout = 500000; // Give it another chance
+            }
+        }
+        if (bat_timeout % 10000 == 0) {
+            io_delay_medium();
+        }
+    }
+    
+    if (!bat_complete) {
+        return false;
+    }
+    
+    io_delay_long();
+    
+    // Step 8: Set mouse defaults
+    if (!ps2_mouse_write_command(MOUSE_CMD_SET_DEFAULTS)) return false;
+    io_delay_long();
+    
+    // Step 9: Set sample rate (important for real hardware responsiveness)
+    // Try 100 Hz first (safest), can increase to 200 if needed
+    if (!ps2_mouse_write_with_arg(MOUSE_CMD_SET_SAMPLE, 100)) {
+        // Non-fatal, continue
+    }
+    io_delay_long();
+    
+    // Step 10: Set resolution (real hardware benefits from this)
+    // 3 = 8 counts/mm (good balance)
+    if (!ps2_mouse_write_with_arg(MOUSE_CMD_SET_RESOLUTION, 3)) {
+        // Non-fatal, continue
+    }
+    io_delay_long();
+    
+    // Step 11: Enable mouse scaling 1:1 (disable acceleration)
+    outb(0x64, 0xD4);
+    io_delay_medium();
+    outb(0x60, 0xE6); // Set scaling 1:1
+    io_delay_medium();
+    inb(0x60); // ACK
+    io_delay_medium();
+    
+    // Step 12: Enable data reporting
+    if (!ps2_mouse_write_command(MOUSE_CMD_ENABLE_DATA)) return false;
+    io_delay_long();
+    
+    // Step 13: Re-enable keyboard
+    ps2_write_command(PS2_CMD_ENABLE_PORT1);
+    io_delay_long();
+    
+    // Step 14: Final aggressive flush
+    for (int i = 0; i < 16; i++) {
+        if (inb(PS2_STATUS_PORT) & PS2_STATUS_OUTPUT_FULL) {
+            inb(PS2_DATA_PORT);
+        }
+        io_delay_short();
+    }
+    
+    return true;
+}
+
+bool initialize_universal_mouse() {
+    universal_mouse_state.initialized = false;
+    universal_mouse_state.x = fb_info.width / 2;
+    universal_mouse_state.y = fb_info.height / 2;
+    
+    // Phase 1: Detect USB controllers and enable legacy support
+    bool has_usb = detect_usb_controllers();
+    if (has_usb) {
+        wm.print_to_focused("USB controllers detected...\n");
+        if (enable_usb_legacy_support()) {
+            wm.print_to_focused("USB Legacy PS/2 emulation enabled.\n");
+        }
+    }
+    
+    // Phase 2: Initialize PS/2 mouse with hardware-optimized method
+    wm.print_to_focused("Initializing PS/2 mouse interface...\n");
+    
+    if (init_ps2_mouse_hardware()) {
+        universal_mouse_state.initialized = true;
+        wm.print_to_focused("PS/2 mouse initialized (hardware method).\n");
+        return true;
+    }
+    
+    // Phase 3: Fallback to legacy method
+    wm.print_to_focused("Trying legacy PS/2 initialization...\n");
+    if (init_ps2_mouse_legacy()) {
+        universal_mouse_state.initialized = true;
+        wm.print_to_focused("PS/2 mouse initialized (legacy method).\n");
+        return true;
+    }
+    
+    wm.print_to_focused("ERROR: Mouse initialization failed.\n");
+    wm.print_to_focused("Check BIOS: PS/2 mouse must be enabled.\n");
+    return false;
+}
 
 static void process_universal_mouse_packet(uint8_t data) {
     universal_mouse_state.packet_buffer[universal_mouse_state.packet_cycle] = data;
     universal_mouse_state.packet_cycle++;
     
-    // Standard 3-byte PS/2 mouse packet
     if (universal_mouse_state.packet_cycle >= 3) {
         universal_mouse_state.packet_cycle = 0;
         
@@ -1074,8 +1258,11 @@ static void process_universal_mouse_packet(uint8_t data) {
         
         // Validate packet: bit 3 must always be set in first byte
         if (!(flags & 0x08)) {
-            // Invalid packet - reset synchronization
             universal_mouse_state.synchronized = false;
+            // Clear buffer to resync
+            universal_mouse_state.packet_buffer[0] = 0;
+            universal_mouse_state.packet_buffer[1] = 0;
+            universal_mouse_state.packet_buffer[2] = 0;
             return;
         }
         
@@ -1086,28 +1273,41 @@ static void process_universal_mouse_packet(uint8_t data) {
         universal_mouse_state.right_button = flags & 0x02;
         universal_mouse_state.middle_button = flags & 0x04;
         
-        // Extract movement deltas (9-bit two's complement)
+        // Extract movement deltas with proper sign extension
         int dx = universal_mouse_state.packet_buffer[1];
         int dy = universal_mouse_state.packet_buffer[2];
         
-        // Sign extension for negative values
-        if (flags & 0x10) dx |= 0xFFFFFF00;  // X sign bit
-        if (flags & 0x20) dy |= 0xFFFFFF00;  // Y sign bit
+        if (flags & 0x10) dx -= 256;  // X sign bit
+        if (flags & 0x20) dy -= 256;  // Y sign bit
         
-        // Handle overflow (ignore movement if overflow occurred)
-        if (flags & 0x40) dx = 0;  // X overflow
-        if (flags & 0x80) dy = 0;  // Y overflow
+        // Hardware-specific: Check for overflow and handle gracefully
+        if (flags & 0x40) {
+            // X overflow - use previous delta or cap it
+            dx = (dx > 0) ? 20 : -20;
+        }
+        if (flags & 0x80) {
+            // Y overflow
+            dy = (dy > 0) ? 20 : -20;
+        }
         
-        // Apply sensitivity scaling
-        const int SENSITIVITY = 1;  // Adjust as needed (1-3 typical)
-        dx *= SENSITIVITY;
-        dy *= SENSITIVITY;
+        // Hardware-specific: Adaptive sensitivity based on movement speed
+        // Slower movements = more precision, faster = acceleration
+        int abs_dx = (dx < 0) ? -dx : dx;
+        int abs_dy = (dy < 0) ? -dy : dy;
+        int speed = abs_dx + abs_dy;
         
-        // Update position (Y is inverted in PS/2 protocol)
+        int sensitivity = 1;
+        if (speed > 20) sensitivity = 2;      // Fast movement
+        else if (speed > 40) sensitivity = 3; // Very fast movement
+        
+        dx *= sensitivity;
+        dy *= sensitivity;
+        
+        // Apply movement (Y is inverted in PS/2 protocol)
         universal_mouse_state.x += dx;
         universal_mouse_state.y -= dy;
         
-        // Clamp to screen bounds
+        // Clamp with boundary detection
         if (universal_mouse_state.x < 0) universal_mouse_state.x = 0;
         if (universal_mouse_state.y < 0) universal_mouse_state.y = 0;
         if (universal_mouse_state.x >= (int)fb_info.width) 
@@ -1117,44 +1317,48 @@ static void process_universal_mouse_packet(uint8_t data) {
     }
 }
 
-// =============================================================================
-// Universal Input Polling Function (REPLACE poll_input_simple)
-// =============================================================================
-
 void poll_input_universal() {
-    // Clear keyboard state
     last_key_press = 0;
-    
-    // Save previous mouse state
     mouse_left_last_frame = mouse_left_down;
     
-    // Poll for available data (limit iterations to prevent hanging)
-    for (int iterations = 0; iterations < 16; iterations++) {
-        uint8_t status = inb(PS2_STATUS_PORT);
+    // Hardware-specific: Check controller status first
+    uint8_t status = inb(PS2_STATUS_PORT);
+    
+    // Timeout protection for hung controller
+    if (status == 0xFF) {
+        // Controller might be hung - skip this poll
+        return;
+    }
+    
+    // Process available data (hardware typically has less buffering)
+    int max_iterations = 12; // Sufficient for real hardware
+    
+    for (int iterations = 0; iterations < max_iterations; iterations++) {
+        status = inb(PS2_STATUS_PORT);
         
-        // Check if data is available
         if (!(status & PS2_STATUS_OUTPUT_FULL)) {
-            break;  // No more data
+            break;
         }
+        
+        // Hardware-specific: Small delay before reading data
+        // Prevents race conditions on slower chipsets
+        io_wait_short();
         
         uint8_t data = inb(PS2_DATA_PORT);
         
-        // Determine if this is mouse or keyboard data
         if (status & PS2_STATUS_AUX_DATA) {
-            // Mouse data (bit 5 set in status register)
+            // Mouse data
             process_universal_mouse_packet(data);
         } else {
-            // Keyboard data
+            // Keyboard data (unchanged from your code)
             bool is_press = !(data & 0x80);
             uint8_t scancode = data & 0x7F;
             
-            // Handle modifier keys
             if (scancode == 0x2A || scancode == 0x36) {
                 is_shift_pressed = is_press;
             } else if (scancode == 0x1D) {
                 is_ctrl_pressed = is_press;
             } else if (is_press) {
-                // Handle special keys
                 switch(scancode) {
                     case 0x48: last_key_press = KEY_UP; break;
                     case 0x50: last_key_press = KEY_DOWN; break;
@@ -1164,7 +1368,6 @@ void poll_input_universal() {
                     case 0x47: last_key_press = KEY_HOME; break;
                     case 0x4F: last_key_press = KEY_END; break;
                     default: {
-                        // Handle regular keys using scancode map
                         const char* map = is_ctrl_pressed ? sc_ascii_ctrl_map :
                                          (is_shift_pressed ? sc_ascii_shift_map : sc_ascii_nomod_map);
                         
@@ -1177,97 +1380,10 @@ void poll_input_universal() {
         }
     }
     
-    // Update global mouse state
     mouse_x = universal_mouse_state.x;
     mouse_y = universal_mouse_state.y;
     mouse_left_down = universal_mouse_state.left_button;
 }
-
-// =============================================================================
-// Main Initialization Function
-// =============================================================================
-
-bool initialize_universal_mouse() {
-    universal_mouse_state.initialized = false;
-    
-    // Try modern initialization first
-    if (init_ps2_mouse_modern()) {
-        universal_mouse_state.initialized = true;
-        return true;
-    }
-    
-    // Fallback to legacy initialization
-    if (init_ps2_mouse_legacy()) {
-        universal_mouse_state.initialized = true;
-        return true;
-    }
-    
-    return false;
-}
-
-// =============================================================================
-// INTEGRATION INSTRUCTIONS
-// =============================================================================
-
-/*
-STEP 1: Remove the old mouse initialization code in kernel_main()
-
-OLD CODE TO REMOVE:
-    if (init_ps2_mouse_hw()) {
-        wm.print_to_focused("PS/2 mouse (hardware) initialized.\n");
-    } else {
-        wm.print_to_focused("PS/2 mouse init failed, using fallback.\n");
-        // Optional fallback (VM-safe)
-        outb(0x64, 0xA8);
-        outb(0x64, 0x20);
-        uint8_t status = (inb(0x60) | 2) & ~0x20;
-        outb(0x64, 0x60);
-        outb(0x60, status);
-        outb(0x64, 0xD4);
-        outb(0x60, 0xF6);
-        inb(0x60);
-        outb(0x64, 0xD4);
-        outb(0x60, 0xF4);
-        inb(0x60);
-    }
-
-STEP 2: Replace with new initialization in kernel_main():
-
-    if (initialize_universal_mouse()) {
-        wm.print_to_focused("Universal mouse driver initialized.\n");
-    } else {
-        wm.print_to_focused("WARNING: Mouse initialization failed.\n");
-    }
-
-STEP 3: In kernel_main() main loop, replace:
-
-    poll_input_simple();
-
-WITH:
-
-    poll_input_universal();
-
-STEP 4: You can also remove the old init_ps2_mouse_hw() function completely
-        as it's replaced by the new driver.
-
-FEATURES:
-- Works on modern AMD64 systems with UEFI
-- Handles USB legacy mouse emulation
-- Proper PS/2 controller initialization with self-test
-- Extended timeouts for slow chipsets
-- Automatic fallback to legacy mode
-- Better packet validation and synchronization
-- Overflow handling
-- Sign extension for negative movement
-- Configurable sensitivity
-
-TESTED ON:
-- Physical AMD64 hardware
-- QEMU with -machine type=q35
-- VirtualBox
-- VMware
-- Real hardware with USB-PS/2 adapters
-*/
 
 void draw_cursor(int x, int y, uint32_t color) { for(int i=0;i<12;i++) put_pixel_back(x,y+i,color); for(int i=0;i<8;i++) put_pixel_back(x+i,y+i,color); for(int i=0;i<4;i++) put_pixel_back(x+i,y+(11-i),color); }
 
