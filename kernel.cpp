@@ -1213,6 +1213,8 @@ static bool init_ps2_mouse_hardware() {
 
 bool initialize_universal_mouse() {
     universal_mouse_state.initialized = false;
+    universal_mouse_state.synchronized = false;  // Add this
+    universal_mouse_state.packet_cycle = 0;      // Add this
     universal_mouse_state.x = fb_info.width / 2;
     universal_mouse_state.y = fb_info.height / 2;
     
@@ -1246,8 +1248,21 @@ bool initialize_universal_mouse() {
     wm.print_to_focused("Check BIOS: PS/2 mouse must be enabled.\n");
     return false;
 }
-
 static void process_universal_mouse_packet(uint8_t data) {
+    // If we're not synchronized, look for a valid first byte
+    if (!universal_mouse_state.synchronized) {
+        // First byte must have bit 3 set (always 1 in PS/2 protocol)
+        if (data & 0x08) {
+            universal_mouse_state.packet_buffer[0] = data;
+            universal_mouse_state.packet_cycle = 1;
+            universal_mouse_state.synchronized = true;
+            return;
+        } else {
+            // Invalid data, skip it
+            return;
+        }
+    }
+    
     universal_mouse_state.packet_buffer[universal_mouse_state.packet_cycle] = data;
     universal_mouse_state.packet_cycle++;
     
@@ -1259,98 +1274,78 @@ static void process_universal_mouse_packet(uint8_t data) {
         // Validate packet: bit 3 must always be set in first byte
         if (!(flags & 0x08)) {
             universal_mouse_state.synchronized = false;
-            // Clear buffer to resync
-            universal_mouse_state.packet_buffer[0] = 0;
-            universal_mouse_state.packet_buffer[1] = 0;
-            universal_mouse_state.packet_buffer[2] = 0;
             return;
         }
-        
-        universal_mouse_state.synchronized = true;
         
         // Extract button states
         universal_mouse_state.left_button = flags & 0x01;
         universal_mouse_state.right_button = flags & 0x02;
         universal_mouse_state.middle_button = flags & 0x04;
         
-        // Extract movement deltas with proper sign extension
-        int dx = universal_mouse_state.packet_buffer[1];
-        int dy = universal_mouse_state.packet_buffer[2];
+        // Extract movement deltas (8-bit signed values)
+        int8_t dx = (int8_t)universal_mouse_state.packet_buffer[1];
+        int8_t dy = (int8_t)universal_mouse_state.packet_buffer[2];
         
-        if (flags & 0x10) dx -= 256;  // X sign bit
-        if (flags & 0x20) dy -= 256;  // Y sign bit
+        // Apply sign extension from flags byte
+        if (flags & 0x10) {
+            // X is negative, already handled by int8_t cast
+        }
+        if (flags & 0x20) {
+            // Y is negative, already handled by int8_t cast
+        }
         
-        // Hardware-specific: Check for overflow and handle gracefully
+        // Check for overflow
         if (flags & 0x40) {
-            // X overflow - use previous delta or cap it
-            dx = (dx > 0) ? 20 : -20;
+            // X overflow - cap the value
+            dx = (dx > 0) ? 127 : -128;
         }
         if (flags & 0x80) {
-            // Y overflow
-            dy = (dy > 0) ? 20 : -20;
+            // Y overflow - cap the value
+            dy = (dy > 0) ? 127 : -128;
         }
         
-        // Hardware-specific: Adaptive sensitivity based on movement speed
-        // Slower movements = more precision, faster = acceleration
-        int abs_dx = (dx < 0) ? -dx : dx;
-        int abs_dy = (dy < 0) ? -dy : dy;
-        int speed = abs_dx + abs_dy;
-        
-        int sensitivity = 1;
-        if (speed > 20) sensitivity = 2;      // Fast movement
-        else if (speed > 40) sensitivity = 3; // Very fast movement
-        
-        dx *= sensitivity;
-        dy *= sensitivity;
+        // Apply sensitivity (adjust this value to change mouse speed)
+        const int SENSITIVITY = 2;
+        int move_x = dx * SENSITIVITY;
+        int move_y = dy * SENSITIVITY;
         
         // Apply movement (Y is inverted in PS/2 protocol)
-        universal_mouse_state.x += dx;
-        universal_mouse_state.y -= dy;
+        universal_mouse_state.x += move_x;
+        universal_mouse_state.y -= move_y;  // Note: minus for Y
         
-        // Clamp with boundary detection
+        // Clamp to screen bounds
         if (universal_mouse_state.x < 0) universal_mouse_state.x = 0;
         if (universal_mouse_state.y < 0) universal_mouse_state.y = 0;
         if (universal_mouse_state.x >= (int)fb_info.width) 
             universal_mouse_state.x = fb_info.width - 1;
         if (universal_mouse_state.y >= (int)fb_info.height) 
             universal_mouse_state.y = fb_info.height - 1;
+        
+        // Reset to synchronized state for next packet
+        universal_mouse_state.synchronized = true;
     }
 }
-
 void poll_input_universal() {
     last_key_press = 0;
     mouse_left_last_frame = mouse_left_down;
     
-    // Hardware-specific: Check controller status first
-    uint8_t status = inb(PS2_STATUS_PORT);
-    
-    // Timeout protection for hung controller
-    if (status == 0xFF) {
-        // Controller might be hung - skip this poll
-        return;
-    }
-    
-    // Process available data (hardware typically has less buffering)
-    int max_iterations = 12; // Sufficient for real hardware
-    
-    for (int iterations = 0; iterations < max_iterations; iterations++) {
-        status = inb(PS2_STATUS_PORT);
+    // Process all available data
+    for (int iterations = 0; iterations < 16; iterations++) {
+        uint8_t status = inb(PS2_STATUS_PORT);
         
+        // No more data available
         if (!(status & PS2_STATUS_OUTPUT_FULL)) {
             break;
         }
         
-        // Hardware-specific: Small delay before reading data
-        // Prevents race conditions on slower chipsets
-        io_wait_short();
-        
         uint8_t data = inb(PS2_DATA_PORT);
         
+        // Determine if this is mouse or keyboard data
         if (status & PS2_STATUS_AUX_DATA) {
             // Mouse data
             process_universal_mouse_packet(data);
         } else {
-            // Keyboard data (unchanged from your code)
+            // Keyboard data
             bool is_press = !(data & 0x80);
             uint8_t scancode = data & 0x7F;
             
@@ -1380,6 +1375,7 @@ void poll_input_universal() {
         }
     }
     
+    // Update global mouse state
     mouse_x = universal_mouse_state.x;
     mouse_y = universal_mouse_state.y;
     mouse_left_down = universal_mouse_state.left_button;
@@ -4947,7 +4943,9 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
     fb_info = { (uint32_t*)(uint64_t)mbi->framebuffer_addr, mbi->framebuffer_width, mbi->framebuffer_height, mbi->framebuffer_pitch };
     backbuffer = new uint32_t[fb_info.width * fb_info.height];
-    if (initialize_universal_mouse()) {
+    launch_new_terminal();
+
+	if (initialize_universal_mouse()) {
         wm.print_to_focused("Universal mouse driver initialized.\n");
     } else {
         wm.print_to_focused("WARNING: Mouse initialization failed.\n");
@@ -4956,7 +4954,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     disk_init();
     if(ahci_base) fat32_init();
     
-    launch_new_terminal();
 
     if(ahci_base) wm.print_to_focused("AHCI disk found.\n"); else wm.print_to_focused("AHCI disk NOT found.\n");
     if(current_directory_cluster) wm.print_to_focused("FAT32 FS initialized.\n"); else wm.print_to_focused("FAT32 init failed. Use 'formatfs' to create filesystem.\n");
