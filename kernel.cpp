@@ -143,12 +143,141 @@ int snprintf(char* buffer, size_t size, const char* fmt, ...) {
 // --- Basic Memory Allocator ---
 static uint8_t kernel_heap[1024 * 1024 * 8]; // 8MB heap
 static size_t heap_ptr = 0;
-void* operator new(size_t size) { if (heap_ptr + size > sizeof(kernel_heap)) return nullptr; void* addr = &kernel_heap[heap_ptr]; heap_ptr += size; return addr; }
-void* operator new[](size_t size) { return operator new(size); }
-void operator delete(void* ptr) noexcept {}
-void operator delete[](void* ptr) noexcept {}
-void operator delete(void* ptr, size_t size) noexcept { (void)ptr; (void)size; }
-void operator delete[](void* ptr, size_t size) noexcept { (void)ptr; (void)size; }
+// Forward declaration for placement new
+void* operator new(size_t, void* p) { return p; }
+
+class FreeListAllocator {
+public:
+    struct FreeBlock {
+        size_t size;
+        FreeBlock* next;
+    };
+
+private:
+    FreeBlock* freeListHead;
+
+public:
+    FreeListAllocator() : freeListHead(nullptr) {}
+
+    // Must be called once to initialize the heap
+    void init(void* heapStart, size_t heapSize) {
+        if (!heapStart || heapSize < sizeof(FreeBlock)) {
+            return;
+        }
+        freeListHead = static_cast<FreeBlock*>(heapStart);
+        freeListHead->size = heapSize;
+        freeListHead->next = nullptr;
+    }
+
+    void* allocate(size_t size) {
+        // Align size to be a multiple of the FreeBlock alignment
+        size_t required_size = (size + sizeof(size_t) + (alignof(FreeBlock) - 1)) & ~(alignof(FreeBlock) - 1);
+        if (required_size < sizeof(FreeBlock)) {
+            required_size = sizeof(FreeBlock);
+        }
+
+        FreeBlock* prev = nullptr;
+        FreeBlock* current = freeListHead;
+        while (current) {
+            if (current->size >= required_size) {
+                // Can we split the block?
+                if (current->size >= required_size + sizeof(FreeBlock)) {
+                    FreeBlock* newBlock = (FreeBlock*)((char*)current + required_size);
+                    newBlock->size = current->size - required_size;
+                    newBlock->next = current->next;
+
+                    if (prev) {
+                        prev->next = newBlock;
+                    } else {
+                        freeListHead = newBlock;
+                    }
+                } else { // Use the whole block
+                    required_size = current->size;
+                    if (prev) {
+                        prev->next = current->next;
+                    } else {
+                        freeListHead = current->next;
+                    }
+                }
+                
+                // Store the size of the allocation just before the returned pointer
+                *(size_t*)current = required_size;
+                return (char*)current + sizeof(size_t);
+            }
+            prev = current;
+            current = current->next;
+        }
+        return nullptr; // Out of memory
+    }
+
+    void deallocate(void* ptr) {
+        if (!ptr) return;
+
+        // Get the header from the pointer
+        FreeBlock* block_to_free = (FreeBlock*)((char*)ptr - sizeof(size_t));
+        size_t block_size = *(size_t*)block_to_free;
+        block_to_free->size = block_size;
+
+        // Insert into free list (sorted by address)
+        FreeBlock* prev = nullptr;
+        FreeBlock* current = freeListHead;
+        while (current && current < block_to_free) {
+            prev = current;
+            current = current->next;
+        }
+
+        if (prev) {
+            prev->next = block_to_free;
+        } else {
+            freeListHead = block_to_free;
+        }
+        block_to_free->next = current;
+
+        // Merge with next block
+        if (block_to_free->next && (char*)block_to_free + block_to_free->size == (char*)block_to_free->next) {
+            block_to_free->size += block_to_free->next->size;
+            block_to_free->next = block_to_free->next->next;
+        }
+
+        // Merge with previous block
+        if (prev && (char*)prev + prev->size == (char*)block_to_free) {
+            prev->size += block_to_free->size;
+            prev->next = block_to_free->next;
+        }
+    }
+};
+
+// Global allocator instance
+static FreeListAllocator g_allocator;
+
+// --- Replace existing new/delete operators with these ---
+void* operator new(size_t size) {
+    return g_allocator.allocate(size);
+}
+
+void* operator new[](size_t size) {
+    return operator new(size);
+}
+
+void operator delete(void* ptr) noexcept {
+    g_allocator.deallocate(ptr);
+}
+
+void operator delete[](void* ptr) noexcept {
+    operator delete(ptr);
+}
+
+void operator delete(void* ptr, size_t size) noexcept {
+    (void)size; // Size is unused in this model but required by the ABI
+    operator delete(ptr);
+}
+
+void operator delete[](void* ptr, size_t size) noexcept {
+    (void)size;
+    operator delete[](ptr);
+}
+
+
 
 
 void* memmove(void* dest, const void* src, size_t n) {
@@ -216,13 +345,6 @@ void put_pixel_back(int x, int y, uint32_t color) {
     }
 }
 
-void swap_buffers() {
-    for (uint32_t y = 0; y < fb_info.height; y++) {
-        memcpy(fb_info.ptr + y * (fb_info.pitch / 4), 
-               backbuffer + y * fb_info.width, 
-               fb_info.width * 4);
-    }
-}
 
 void draw_rect_filled(int x, int y, int w, int h, uint32_t color) {
     if (x < 0) { w += x; x = 0; }
@@ -4950,11 +5072,19 @@ void TerminalWindow::handle_command() {
     if(!in_editor) print_prompt();
 }
 
+void swap_buffers() {
+    if (fb_info.ptr && backbuffer) {
+        memcpy((void*)fb_info.ptr, backbuffer, fb_info.width * fb_info.height * 4);
+    }
+}
 // =============================================================================
 // SECTION 7: KERNEL MAIN
 // =============================================================================
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
-    multiboot_info* mbi = (multiboot_info*)multiboot_addr;
+    static uint8_t kernelheap[1024 * 1024 * 8]; // 8MB heap
+	g_allocator.init(kernelheap, sizeof(kernelheap));
+	
+	multiboot_info* mbi = (multiboot_info*)multiboot_addr;
     if (!(mbi->flags & (1 << 12))) return;
 
     fb_info = { (uint32_t*)(uint64_t)mbi->framebuffer_addr, mbi->framebuffer_width, mbi->framebuffer_height, mbi->framebuffer_pitch };
