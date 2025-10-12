@@ -217,16 +217,23 @@ void put_pixel_back(int x, int y, uint32_t color) {
 }
 
 void swap_buffers() {
-    if (!backbuffer) return;
     for (uint32_t y = 0; y < fb_info.height; y++) {
-        memcpy(fb_info.ptr + y * (fb_info.pitch / 4), backbuffer + y * fb_info.width, fb_info.width * 4);
+        memcpy(fb_info.ptr + y * (fb_info.pitch / 4), 
+               backbuffer + y * fb_info.width, 
+               fb_info.width * 4);
     }
 }
 
 void draw_rect_filled(int x, int y, int w, int h, uint32_t color) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > (int)fb_info.width) w = fb_info.width - x;
+    if (y + h > (int)fb_info.height) h = fb_info.height - y;
+    
     for (int j = y; j < y + h; j++) {
-        for (int i = x; i < x + w; i++) {
-            put_pixel_back(i, j, color);
+        uint32_t* row = &backbuffer[j * fb_info.width + x];
+        for (int i = 0; i < w; i++) {
+            row[i] = color;
         }
     }
 }
