@@ -821,7 +821,7 @@ static inline void io_delay_medium() {
 }
 
 static inline void io_delay_long() {
-    for (volatile int i = 0; i < 2000; i++) {
+    for (volatile int i = 0; i < 10000; i++) {  // 5x longer
         io_wait_short();
     }
 }
@@ -949,6 +949,7 @@ static inline void pci_write_config_dword(uint16_t bus, uint8_t device, uint8_t 
     outl(0xCF8, address);
     outl(0xCFC, value);
 }
+
 struct UniversalMouseState {
     int x;
     int y;
@@ -969,19 +970,21 @@ static UniversalMouseState universal_mouse_state = {400, 300, false, false, fals
 
 
 
-
 struct USBLegacyInfo {
     bool has_uhci;      // USB 1.1
     bool has_ehci;      // USB 2.0
     bool has_xhci;      // USB 3.0
     uint64_t legacy_base;
     bool ps2_emulation_active;
+    // ADD THESE THREE LINES:
+    uint16_t pci_bus;
+    uint8_t pci_device;
+    uint8_t pci_function;
 };
 
-static USBLegacyInfo usb_info = {false, false, false, 0, false};
+static USBLegacyInfo usb_info = {false, false, false, 0, false, 0, 0, 0}; // Update initializer
 
 static bool detect_usb_controllers() {
-    // Scan PCI for USB controllers
     for (uint16_t bus = 0; bus < 256; bus++) {
         for (uint8_t device = 0; device < 32; device++) {
             uint32_t class_code = pci_read_config_dword(bus, device, 0, 0x08);
@@ -989,79 +992,85 @@ static bool detect_usb_controllers() {
             uint8_t sub_class = (class_code >> 16) & 0xFF;
             uint8_t prog_if = (class_code >> 8) & 0xFF;
             
-            // Class 0x0C = Serial Bus Controller, Subclass 0x03 = USB
             if (base_class == 0x0C && sub_class == 0x03) {
-                if (prog_if == 0x00) usb_info.has_uhci = true;      // UHCI
-                else if (prog_if == 0x10) usb_info.has_uhci = true; // OHCI
-                else if (prog_if == 0x20) usb_info.has_ehci = true; // EHCI
-                else if (prog_if == 0x30) usb_info.has_xhci = true; // xHCI
+                if (prog_if == 0x20) usb_info.has_ehci = true;
+                else if (prog_if == 0x30) usb_info.has_xhci = true;
                 
-                // Get base address for legacy support
-                if (prog_if == 0x20 || prog_if == 0x30) { // EHCI or xHCI
-                    uint32_t bar0 = pci_read_config_dword(bus, device, 0, 0x10);
-                    usb_info.legacy_base = bar0 & 0xFFFFFFF0;
-                }
+                // STORE THE PCI COORDINATES
+                usb_info.pci_bus = bus;
+                usb_info.pci_device = device;
+                usb_info.pci_function = 0;
+                
+                uint32_t bar0 = pci_read_config_dword(bus, device, 0, 0x10);
+                usb_info.legacy_base = bar0 & 0xFFFFFFF0;
+                return true; // Found first USB controller
             }
         }
     }
-    
-    return usb_info.has_uhci || usb_info.has_ehci || usb_info.has_xhci;
+    return false;
 }
-
 static bool enable_usb_legacy_support() {
-    // For EHCI controllers (most common on older systems)
-    if (usb_info.has_ehci && usb_info.legacy_base) {
-        // Read EECP (Extended Capabilities Pointer) from capability registers
-        volatile uint32_t* cap_regs = (volatile uint32_t*)usb_info.legacy_base;
-        uint32_t hccparams = cap_regs[2]; // HCCPARAMS offset
+    if (usb_info.has_ehci) {
+        // Read EECP from stored PCI coordinates
+        uint32_t hccparams = pci_read_config_dword(
+            usb_info.pci_bus, 
+            usb_info.pci_device, 
+            usb_info.pci_function, 
+            0x08  // HCCPARAMS offset in capability registers
+        );
+        
         uint8_t eecp = (hccparams >> 8) & 0xFF;
         
         if (eecp >= 0x40) {
-            // Legacy support capability found
-            // Enable SMI handoff to OS
-            uint32_t legsup = pci_read_config_dword(0, 0, 0, eecp);
-            legsup |= (1 << 24); // OS Owned Semaphore
-            pci_write_config_dword(0, 0, 0, eecp, legsup);
+            // Read USBLEGSUP register
+            uint32_t legsup = pci_read_config_dword(
+                usb_info.pci_bus, 
+                usb_info.pci_device, 
+                usb_info.pci_function, 
+                eecp
+            );
             
-            // Wait for BIOS handoff
-            for (int i = 0; i < 1000; i++) {
-                legsup = pci_read_config_dword(0, 0, 0, eecp);
-                if (!(legsup & (1 << 16))) break; // BIOS Owned Semaphore cleared
-                io_delay_medium();
-            }
+            // Set OS Owned Semaphore
+            legsup |= (1 << 24);
+            pci_write_config_dword(
+                usb_info.pci_bus, 
+                usb_info.pci_device, 
+                usb_info.pci_function, 
+                eecp, 
+                legsup
+            );
             
-            usb_info.ps2_emulation_active = true;
-            return true;
-        }
-    }
-    
-    // For xHCI (USB 3.0) - similar process
-    if (usb_info.has_xhci && usb_info.legacy_base) {
-        volatile uint32_t* cap_regs = (volatile uint32_t*)usb_info.legacy_base;
-        uint32_t hccparams1 = cap_regs[4]; // xHCI HCCPARAMS1
-        
-        // Check for legacy support capability
-        uint16_t ext_cap = (hccparams1 >> 16) & 0xFFFF;
-        if (ext_cap) {
-            volatile uint32_t* ext_cap_ptr = (volatile uint32_t*)(usb_info.legacy_base + ext_cap);
-            uint32_t usblegsup = ext_cap_ptr[0];
-            
-            // Request OS ownership
-            usblegsup |= (1 << 24);
-            ext_cap_ptr[0] = usblegsup;
-            
-            // Wait for handoff
-            for (int i = 0; i < 1000; i++) {
-                usblegsup = ext_cap_ptr[0];
-                if (!(usblegsup & (1 << 16))) break;
+            // Wait for BIOS to release (with timeout)
+            for (int i = 0; i < 100; i++) {
                 io_delay_long();
+                legsup = pci_read_config_dword(
+                    usb_info.pci_bus, 
+                    usb_info.pci_device, 
+                    usb_info.pci_function, 
+                    eecp
+                );
+                if (!(legsup & (1 << 16))) break; // BIOS Owned cleared
             }
             
-            usb_info.ps2_emulation_active = true;
+            // Disable SMI interrupts
+            uint32_t usblegctlsts = pci_read_config_dword(
+                usb_info.pci_bus, 
+                usb_info.pci_device, 
+                usb_info.pci_function, 
+                eecp + 4
+            );
+            usblegctlsts &= 0xFFFF0000; // Clear all SMI enables
+            pci_write_config_dword(
+                usb_info.pci_bus, 
+                usb_info.pci_device, 
+                usb_info.pci_function, 
+                eecp + 4, 
+                usblegctlsts
+            );
+            
             return true;
         }
     }
-    
     return false;
 }
 
@@ -4951,7 +4960,16 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     fb_info = { (uint32_t*)(uint64_t)mbi->framebuffer_addr, mbi->framebuffer_width, mbi->framebuffer_height, mbi->framebuffer_pitch };
     backbuffer = new uint32_t[fb_info.width * fb_info.height];
     launch_new_terminal();
+	// Disable USB legacy first
+	enable_usb_legacy_support();
 
+	// Give hardware time to switch modes
+	for (int i = 0; i < 100000; i++) io_wait_short();
+
+	// Reset PS/2 controller
+	outb(0x64, 0xFF); // Reset command
+	io_delay_long();
+	ps2_flush_output_buffer();
 	if (initialize_universal_mouse()) {
         wm.print_to_focused("Universal mouse driver initialized.\n");
     } else {
