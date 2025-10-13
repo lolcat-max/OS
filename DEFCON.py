@@ -53,7 +53,7 @@ def compute_io_entropy(sequence):
 
 # Main realtime loop
 print("Starting realtime I/O monitoring... Press Ctrl+C to stop.")
-print("Monitoring for high-entropy patterns indicating Windows instrumentation targeting.")
+print("Monitoring for entropy patterns indicating cross process agents.")
 
 try:
     while True:
