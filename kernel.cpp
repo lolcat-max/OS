@@ -1758,7 +1758,7 @@ found:
 bool fat32_init() {
     if(!ahci_base) return false;
     char* buffer = new char[SECTOR_SIZE];
-    if (read_write_sectors(0, 0, 1, false, buffer) != 0) { delete[] buffer; return false; }
+    if (read_write_sectors(g_ahci_port, 0, 1, false, buffer) != 0) { delete[] buffer; return false; }
     memcpy(&bpb, buffer, sizeof(bpb));
     delete[] buffer;
     if (strncmp(bpb.fil_sys_type, "FAT32", 5) != 0) { current_directory_cluster = 0; return false; }
@@ -1790,7 +1790,7 @@ void from_83_format(const char* fat_name, char* out) {
 uint32_t read_fat_entry(uint32_t cluster) {
     uint8_t* fat_sector = new uint8_t[SECTOR_SIZE];
     uint32_t fat_offset = cluster * 4;
-    read_write_sectors(0, fat_start_sector + (fat_offset / SECTOR_SIZE), 1, false, fat_sector);
+    read_write_sectors(g_ahci_port, fat_start_sector + (fat_offset / SECTOR_SIZE), 1, false, fat_sector);
     uint32_t value = *(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) & 0x0FFFFFFF;
     delete[] fat_sector;
     return value;
@@ -1800,9 +1800,9 @@ bool write_fat_entry(uint32_t cluster, uint32_t value) {
     uint8_t* fat_sector = new uint8_t[SECTOR_SIZE];
     uint32_t fat_offset = cluster * 4;
     uint32_t sector_num = fat_start_sector + (fat_offset / SECTOR_SIZE);
-    read_write_sectors(0, sector_num, 1, false, fat_sector);
+    read_write_sectors(g_ahci_port, sector_num, 1, false, fat_sector);
     *(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) = (*(uint32_t*)(fat_sector + (fat_offset % SECTOR_SIZE)) & 0xF0000000) | (value & 0x0FFFFFFF);
-    bool success = read_write_sectors(0, sector_num, 1, true, fat_sector) == 0;
+    bool success = read_write_sectors(g_ahci_port, sector_num, 1, true, fat_sector) == 0;
     delete[] fat_sector;
     return success;
 }
@@ -1849,7 +1849,7 @@ bool read_data_from_clusters(uint32_t start_cluster, void* data, uint32_t size) 
         uint32_t to_read = (remaining > cluster_size) ? cluster_size : remaining;
         uint8_t* cluster_buf = new uint8_t[cluster_size];
         memset(cluster_buf, 0, cluster_size); // Clear buffer
-        if(read_write_sectors(0, cluster_to_lba(current_cluster), bpb.sec_per_clus, false, cluster_buf) != 0) { 
+        if(read_write_sectors(g_ahci_port, cluster_to_lba(current_cluster), bpb.sec_per_clus, false, cluster_buf) != 0) { 
             delete[] cluster_buf; 
             return false; 
         }
@@ -1875,7 +1875,7 @@ bool write_data_to_clusters(uint32_t start_cluster, const void* data, uint32_t s
         uint32_t to_write = (remaining > cluster_size) ? cluster_size : remaining;
         memset(cluster_buf, 0, cluster_size);
         memcpy(cluster_buf, data_ptr, to_write);
-        if (read_write_sectors(0, cluster_to_lba(current_cluster), bpb.sec_per_clus, true, cluster_buf) != 0) { 
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(current_cluster), bpb.sec_per_clus, true, cluster_buf) != 0) { 
             delete[] cluster_buf; 
             return false; 
         }
@@ -1900,7 +1900,7 @@ void fat32_list_files() {
         return;
     }
     uint8_t* buffer = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
-    if (read_write_sectors(0, cluster_to_lba(current_directory_cluster), bpb.sec_per_clus, false, buffer) != 0) {
+    if (read_write_sectors(g_ahci_port, cluster_to_lba(current_directory_cluster), bpb.sec_per_clus, false, buffer) != 0) {
         wm.print_to_focused("Read error\n");
         delete[] buffer;
         return;
@@ -1988,7 +1988,7 @@ int fat32_write_file(const char* filename, const void* data, uint32_t size) {
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
     for (uint8_t s = 0; s < bpb.sec_per_clus; s++) {
         uint64_t sector_lba = cluster_to_lba(current_directory_cluster) + s;
-        if (read_write_sectors(0, sector_lba, 1, false, dir_buf) != 0) continue;
+        if (read_write_sectors(g_ahci_port, sector_lba, 1, false, dir_buf) != 0) continue;
 
         for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
             fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
@@ -2001,7 +2001,7 @@ int fat32_write_file(const char* filename, const void* data, uint32_t size) {
                 entry->fst_clus_lo = first_cluster & 0xFFFF;
                 entry->fst_clus_hi = (first_cluster >> 16) & 0xFFFF;
                 
-                if (read_write_sectors(0, sector_lba, 1, true, dir_buf) == 0) {
+                if (read_write_sectors(g_ahci_port, sector_lba, 1, true, dir_buf) == 0) {
                     delete[] dir_buf;
                     return 0; // Success
                 } else {
@@ -2022,7 +2022,7 @@ char* fat32_read_file_as_string(const char* filename) {
     char target[11]; to_83_format(filename, target);
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
     for (uint8_t s = 0; s < bpb.sec_per_clus; s++) {
-        if (read_write_sectors(0, cluster_to_lba(current_directory_cluster) + s, 1, false, dir_buf) != 0) { delete[] dir_buf; return nullptr; }
+        if (read_write_sectors(g_ahci_port, cluster_to_lba(current_directory_cluster) + s, 1, false, dir_buf) != 0) { delete[] dir_buf; return nullptr; }
         for (uint16_t e = 0; e < SECTOR_SIZE / sizeof(fat_dir_entry_t); e++) {
             fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_buf + e * sizeof(fat_dir_entry_t));
             if (entry->name[0] == 0x00) { delete[] dir_buf; return nullptr; }
@@ -2049,7 +2049,7 @@ int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t*
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
     for(uint8_t s=0; s<bpb.sec_per_clus; ++s) {
         uint32_t current_sector = cluster_to_lba(current_directory_cluster) + s;
-        if(read_write_sectors(0, current_sector, 1, false, dir_buf) != 0) { 
+        if(read_write_sectors(g_ahci_port, current_sector, 1, false, dir_buf) != 0) { 
             delete[] dir_buf; 
             return -1; 
         }
@@ -2112,9 +2112,9 @@ int fat32_remove_file(const char* filename) {
     if(start_cluster != 0) free_cluster_chain(start_cluster);
     
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    read_write_sectors(0, sector, 1, false, dir_buf);
+    read_write_sectors(g_ahci_port, sector, 1, false, dir_buf);
     ((fat_dir_entry_t*)(dir_buf + offset))->name[0] = DELETED_ENTRY;
-    read_write_sectors(0, sector, 1, true, dir_buf);
+    read_write_sectors(g_ahci_port, sector, 1, true, dir_buf);
     delete[] dir_buf;
     return 0;
 }
@@ -2137,7 +2137,7 @@ int fat32_rename_file(const char* old_name, const char* new_name) {
     
     // 3. Read, modify, and write back the directory sector.
     uint8_t* dir_buf = new uint8_t[SECTOR_SIZE];
-    if (read_write_sectors(0, sector, 1, false, dir_buf) != 0) {
+    if (read_write_sectors(g_ahci_port, sector, 1, false, dir_buf) != 0) {
         delete[] dir_buf;
         return -1;
     }
@@ -2145,7 +2145,7 @@ int fat32_rename_file(const char* old_name, const char* new_name) {
     fat_dir_entry_t* target_entry = (fat_dir_entry_t*)(dir_buf + offset);
     to_83_format(new_name, target_entry->name);
     
-    if (read_write_sectors(0, sector, 1, true, dir_buf) != 0) {
+    if (read_write_sectors(g_ahci_port, sector, 1, true, dir_buf) != 0) {
         delete[] dir_buf;
         return -1;
     }
@@ -2192,7 +2192,7 @@ void fat32_format() {
 	
 	boot_sector_buffer[510] = 0x00; //dummy boot for testing
     boot_sector_buffer[511] = 0x00; //dummy boot for testing
-    if (read_write_sectors(0, 0, 1, true, boot_sector_buffer) != 0) {
+    if (read_write_sectors(g_ahci_port, 0, 1, true, boot_sector_buffer) != 0) {
         wm.print_to_focused("Error: Failed to write new boot sector.\n");
         delete[] boot_sector_buffer;
         return;
@@ -2207,13 +2207,13 @@ void fat32_format() {
     memset(zero_sector, 0, SECTOR_SIZE);
     wm.print_to_focused("Clearing FATs...\n");
     for (uint32_t i = 0; i < bpb.fat_sz32; ++i) {
-        read_write_sectors(0, fat_start_sector + i, 1, true, zero_sector); // FAT1
-        read_write_sectors(0, fat_start_sector + bpb.fat_sz32 + i, 1, true, zero_sector); // FAT2
+        read_write_sectors(g_ahci_port, fat_start_sector + i, 1, true, zero_sector); // FAT1
+        read_write_sectors(g_ahci_port, fat_start_sector + bpb.fat_sz32 + i, 1, true, zero_sector); // FAT2
     }
 
     wm.print_to_focused("Clearing root directory...\n");
     for (uint8_t i = 0; i < bpb.sec_per_clus; ++i) {
-        read_write_sectors(0, cluster_to_lba(bpb.root_clus) + i, 1, true, zero_sector);
+        read_write_sectors(g_ahci_port, cluster_to_lba(bpb.root_clus) + i, 1, true, zero_sector);
     }
     delete[] zero_sector;
 
@@ -2372,7 +2372,7 @@ bool scan_directory(uint32_t cluster, ChkdskStats& stats, bool fix, int depth = 
     stats.directories_checked++;
     
     uint8_t* buffer = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
-    if (read_write_sectors(0, cluster_to_lba(cluster), bpb.sec_per_clus, false, buffer) != 0) {
+    if (read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, false, buffer) != 0) {
         wm.print_to_focused("ERROR: Cannot read directory cluster");
         delete[] buffer;
         return false;
@@ -2427,7 +2427,7 @@ bool scan_directory(uint32_t cluster, ChkdskStats& stats, bool fix, int depth = 
     
     // ONLY write back if in fix mode AND something was modified
     if (fix && modified && working_buffer) {
-        read_write_sectors(0, cluster_to_lba(cluster), bpb.sec_per_clus, true, working_buffer);
+        read_write_sectors(g_ahci_port, cluster_to_lba(cluster), bpb.sec_per_clus, true, working_buffer);
     }
     
     delete[] buffer;
@@ -2480,8 +2480,8 @@ bool check_fat_consistency(ChkdskStats& stats, bool fix) {
     uint8_t* fat1 = new uint8_t[fat_size];
     uint8_t* fat2 = new uint8_t[fat_size];
     
-    read_write_sectors(0, fat_start_sector, bpb.fat_sz32, false, fat1);
-    read_write_sectors(0, fat_start_sector + bpb.fat_sz32, bpb.fat_sz32, false, fat2);
+    read_write_sectors(g_ahci_port, fat_start_sector, bpb.fat_sz32, false, fat1);
+    read_write_sectors(g_ahci_port, fat_start_sector + bpb.fat_sz32, bpb.fat_sz32, false, fat2);
     
     bool mismatch = false;
     for (uint32_t i = 0; i < fat_size; i++) {
@@ -2497,7 +2497,7 @@ bool check_fat_consistency(ChkdskStats& stats, bool fix) {
         
         if (fix) {
             wm.print_to_focused("FIXING: Copying FAT1 to FAT2...");
-            read_write_sectors(0, fat_start_sector + bpb.fat_sz32, bpb.fat_sz32, true, fat1);
+            read_write_sectors(g_ahci_port, fat_start_sector + bpb.fat_sz32, bpb.fat_sz32, true, fat1);
             stats.errors_fixed++;
             wm.print_to_focused("FIXED: FAT tables synchronized");
         }
@@ -2669,7 +2669,7 @@ void chkdsk_full_scan(bool fix = false) {
     uint32_t total_sectors = bpb.tot_sec32;
     
     for (uint32_t sector = 0; sector < total_sectors; sector += 1000) {
-        if (read_write_sectors(0, sector, 1, false, test_buffer) != 0) {
+        if (read_write_sectors(g_ahci_port, sector, 1, false, test_buffer) != 0) {
             bad_sectors++;
             
             char msg[80];
@@ -5080,6 +5080,32 @@ void swap_buffers() {
 // =============================================================================
 // SECTION 7: KERNEL MAIN
 // =============================================================================
+
+// ============================================================================
+// SECTION 8: TIMER-DRIVEN SCREEN UPDATES (BOOT-SAFE VERSION)
+// ============================================================================
+
+// --- Global event flags for screen updates ---
+static volatile bool g_evt_timer = false;    // Timer tick for periodic redraws
+static volatile bool g_evt_input = false;    // Input event (keyboard/mouse)
+static volatile bool g_evt_dirty = true;     // Screen needs repaint
+static volatile uint32_t g_timer_ticks = 0;  // Software timer counter
+
+// --- Event signal functions (call from ISRs when wired, or increment counter) ---
+extern "C" void idle_signal_timer() { g_evt_timer = true; g_timer_ticks++; }
+extern "C" void idle_signal_input() { g_evt_input = true; }
+extern "C" void mark_screen_dirty() { g_evt_dirty = true; }
+
+// --- Timer configuration for screen refresh rate ---
+// Configure PIT channel 0 for desired refresh rate (e.g., 30 Hz = ~33ms)
+// Note: outb is already defined earlier in the kernel
+static void init_screen_timer(uint16_t hz) {
+    uint16_t divisor = 1193182 / hz;
+    outb(0x43, 0x36);  // Channel 0, lobyte/hibyte, rate generator
+    outb(0x40, divisor & 0xFF);
+    outb(0x40, (divisor >> 8) & 0xFF);
+}
+
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     static uint8_t kernelheap[1024 * 1024 * 8]; // 8MB heap
 	g_allocator.init(kernelheap, sizeof(kernelheap));
@@ -5113,14 +5139,67 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     if(ahci_base) wm.print_to_focused("AHCI disk found.\n"); else wm.print_to_focused("AHCI disk NOT found.\n");
     if(current_directory_cluster) wm.print_to_focused("FAT32 FS initialized.\n"); else wm.print_to_focused("FAT32 init failed. Use 'formatfs' to create filesystem.\n");
 
-    while (true) {
-        wm.cleanup_closed_windows();
+    
+    // Configure 30 Hz screen refresh timer
+    init_screen_timer(30);
+
+    uint32_t last_paint_tick = 0;
+    const uint32_t TICKS_PER_FRAME = 1;  // Paint every N ticks (30 Hz with timer)
+
+    // Track previous mouse position to detect movement
+    int prev_mouse_x = mouse_x;
+    int prev_mouse_y = mouse_y;
+
+    // Main loop with timer-gated redraws (NO HLT - safe for initial boot)
+    for (;;) {
+        // Poll input (safe fallback)
         poll_input_universal();
-        bool mouse_clicked_this_frame = mouse_left_down && !mouse_left_last_frame;
-        wm.handle_input(last_key_press, mouse_x, mouse_y, mouse_left_down, mouse_clicked_this_frame);
-        draw_rect_filled(0, 0, fb_info.width, fb_info.height, 0x000000); // Clear backbuffer
-        wm.update_all();
-        draw_cursor(mouse_x, mouse_y, 0xFFFFFF);
-        swap_buffers();
+
+        // Detect ANY input change: keyboard, mouse movement, or button state
+        bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
+        bool button_changed = (mouse_left_down != mouse_left_last_frame);
+        bool key_pressed = (last_key_press != 0);
+
+        if (key_pressed || button_changed || mouse_moved) {
+            g_evt_input = true;
+            prev_mouse_x = mouse_x;
+            prev_mouse_y = mouse_y;
+        }
+
+        // Simulate timer tick if no ISR wired yet (software throttle)
+        // Remove this block after wiring timer ISR
+        static uint32_t poll_counter = 0;
+        if (++poll_counter >= 50000) {  // Rough 30 Hz throttle via polling
+            poll_counter = 0;
+            g_evt_timer = true;
+            g_timer_ticks++;
+        }
+
+        // Handle input events
+        if (g_evt_input) {
+            g_evt_input = false;
+            bool mouseClickedThisFrame = mouse_left_down && !mouse_left_last_frame;
+            wm.handle_input(last_key_press, mouse_x, mouse_y, mouse_left_down, mouseClickedThisFrame);
+            g_evt_dirty = true;
+        }
+
+        // Periodic cleanup
+        wm.cleanup_closed_windows();
+
+        // Redraw screen only every N timer ticks AND if dirty
+        if (g_evt_timer && (g_timer_ticks - last_paint_tick) >= TICKS_PER_FRAME) {
+            if (g_evt_dirty) {
+                last_paint_tick = g_timer_ticks;
+                g_evt_dirty = false;
+
+                // Full screen redraw into backbuffer
+                draw_rect_filled(0, 0, fb_info.width, fb_info.height, 0x000000);
+                wm.update_all();
+                draw_cursor(mouse_x, mouse_y, 0xFFFFFF);
+                swap_buffers();
+            }
+            g_evt_timer = false;
+        }
     }
+
 }
