@@ -743,7 +743,7 @@ public:
 
 class WindowManager {
 private:
-    Window* windows[10];
+    Window* windows[255];
     int num_windows;
     int focused_idx;
     int dragging_idx;
@@ -4951,17 +4951,30 @@ private:
 
     // --- END OF MODULE ---
 
+    // This function scrolls the entire terminal buffer up by one line.
     void scroll() {
-        memmove(buffer[0], buffer[1], 37 * 120);
-        memset(buffer[35], 0, 120);
+        // Use memmove to shift the content of all lines (except the top one) upwards.
+        // This copies the content of rows 1-37 into the memory space of rows 0-36.
+        // The original top line (buffer[0]) is effectively discarded.
+        memmove(buffer[0], buffer[1], (TERM_HEIGHT - 1) * TERM_WIDTH);
+
+        // After shifting, the last row's content is a duplicate of the one above it.
+        // We must clear it to make room for the new line of text.
+        memset(buffer[TERM_HEIGHT - 1], 0, TERM_WIDTH);
     }
-    
+
+    // This function adds a new string to the terminal's buffer.
     void push_line(const char* s) {
-        if (line_count >= 35) {
+        // Check if the buffer is full.
+        if (line_count >= TERM_HEIGHT) {
+            // If full, scroll the existing content up by one line.
             scroll();
-            strncpy(buffer[35], s, 119);
+            // The new line is then placed in the now-empty bottom row.
+            strncpy(buffer[TERM_HEIGHT - 1], s, TERM_WIDTH - 1);
         } else {
-            strncpy(buffer[line_count++], s, 119);
+            // If there is space, simply add the new line to the next available slot.
+            strncpy(buffer[line_count], s, TERM_WIDTH - 1);
+            line_count++; // Increment the count of used lines.
         }
     }
     void print_prompt() { 
@@ -5205,7 +5218,7 @@ public:
 
         if (!in_editor) {
     for (int i = 0; i < line_count && i < 38; i++) {
-        draw_string(buffer[i], x + 5, y + 30 + i * 10, ColorPalette::TEXT_GREEN);
+        draw_string(buffer[i], x + 5, y + 30 + i * 10, ColorPalette::TEXT_WHITE);
     }
 } else {
     // Editor surface
