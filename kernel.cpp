@@ -40,13 +40,22 @@ namespace __cxxabiv1 {
 // --- Forward Declarations ---
 class Window;
 class TerminalWindow;
+class FileExplorerWindow; // New
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr);
 void launch_new_terminal();
+void launch_new_explorer(); // New
+void launch_terminal_with_command(const char* command); // ADD THIS LINE
+
 int fat32_write_file(const char* filename, const void* data, uint32_t size);
 int fat32_remove_file(const char* filename);
 char* fat32_read_file_as_string(const char* filename);
 void fat32_list_files();
+typedef struct { char name[11]; uint8_t attr; uint8_t ntres; uint8_t crt_time_tenth; uint16_t crt_time, crt_date, lst_acc_date, fst_clus_hi; uint16_t wrt_time, wrt_date, fst_clus_lo; uint32_t file_size; } __attribute__((packed)) fat_dir_entry_t;
+int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entries); // Modified
 bool fat32_init();
+
+// --- Global Clipboard ---
+static char g_clipboard_buffer[1024] = {0}; // New
 
 // --- Low-level I/O functions ---
 static inline void outb(uint16_t port, uint8_t val) { asm volatile ("outb %0, %1" : : "a"(val), "d"(port)); }
@@ -58,7 +67,37 @@ static inline uint32_t pci_read_config_dword(uint16_t bus, uint8_t device, uint8
     outl(0xCF8, address);
     return inl(0xCFC);
 }
+// =============================================================================
+//  CENTRAL DEFINITIONS & FORWARD DECLARATIONS
+// =============================================================================
 
+// --- Type Definitions for FAT32 ---
+// Moved here to be visible to all classes and functions
+
+
+// --- Global State Variables ---
+// Moved here to be visible to all classes
+static volatile uint32_t g_timer_ticks = 0;
+
+// --- Forward Declarations ---
+class Window;
+class TerminalWindow;
+class FileExplorerWindow;
+
+// Kernel Entry
+extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr);
+
+// App Launchers
+void launch_new_terminal();
+void launch_new_explorer();
+
+// FAT32 Function Prototypes
+int fat32_write_file(const char* filename, const void* data, uint32_t size);
+int fat32_remove_file(const char* filename);
+char* fat32_read_file_as_string(const char* filename);
+void fat32_list_files();
+bool fat32_init();
+void fat32_get_fne_from_entry(fat_dir_entry_t* entry, char* out); // New helper
 // --- Minimal Standard Library ---
 size_t strlen(const char* str) { size_t len = 0; while (str[len]) len++; return len; }
 void* memset(void* ptr, int value, size_t num) { uint8_t* p = (uint8_t*)ptr; for (size_t i = 0; i < num; i++) p[i] = (uint8_t)value; return ptr; }
@@ -67,6 +106,7 @@ int memcmp(const void* ptr1, const void* ptr2, size_t n) { const uint8_t* p1 = (
 int strcmp(const char* s1, const char* s2) { while(*s1 && (*s1 == *s2)) { s1++; s2++; } return *(const unsigned char*)s1 - *(const unsigned char*)s2; }
 int strncmp(const char* s1, const char* s2, size_t n) { if (n == 0) return 0; do { if (*s1 != *s2++) return *(unsigned const char*)s1 - *(unsigned const char*)--s2; if (*s1++ == 0) break; } while (--n != 0); return 0; }
 char* strchr(const char* s, int c) { while (*s != (char)c) if (!*s++) return nullptr; return (char*)s; }
+char* strrchr(const char* s, int c) { const char* last = nullptr; do { if (*s == (char)c) last = s; } while (*s++); return (char*)last; } // New for finding extensions
 char* strcpy(char *dest, const char *src) { char *ret = dest; while ((*dest++ = *src++)); return ret; }
 char* strncpy(char* dest, const char* src, size_t n) { size_t i; for (i = 0; i < n && src[i] != '\0'; i++) dest[i] = src[i]; for ( ; i < n; i++) dest[i] = '\0'; return dest; }
 char* strcat(char* dest, const char* src) {
@@ -336,6 +376,7 @@ namespace ColorPalette {
     constexpr uint32_t WINDOW_BORDER     = 0xC0C0C0;
     constexpr uint32_t TITLEBAR_ACTIVE   = 0x000080;
     constexpr uint32_t TITLEBAR_INACTIVE = 0x808080;
+    constexpr uint32_t FILE_EXPLORER_BG  = 0xFFFFFF; // New
     
     // Button colors
     constexpr uint32_t BUTTON_FACE       = 0xC0C0C0;
@@ -351,6 +392,12 @@ namespace ColorPalette {
     
     // Cursor color
     constexpr uint32_t CURSOR_WHITE      = 0xFFFFFF;
+
+    // Icon Colors
+    constexpr uint32_t ICON_FILE_FILL    = 0xFFF1B5; // Light yellow
+    constexpr uint32_t ICON_FILE_OUTLINE = 0x808080;
+    constexpr uint32_t ICON_FOLDER_FILL  = 0xFFD3A1; // Light orange
+    constexpr uint32_t ICON_SHORTCUT_ARROW = 0x0000FF; // Blue
 }
 
 // =============================================================================
@@ -587,7 +634,7 @@ void draw_rect_filled(int x, int y, int w, int h, uint32_t color) {
         }
     }
 }
-
+#define FAT_ATTR_DIRECTORY 0x10
 // =============================================================================
 // PS/2 AND INPUT SYSTEM (Abbreviated - full implementation as before)
 // =============================================================================
@@ -643,6 +690,8 @@ bool is_ctrl_pressed = false;
 int mouse_x = 400, mouse_y = 300;
 bool mouse_left_down = false;
 bool mouse_left_last_frame = false;
+bool mouse_right_down = false;       // New
+bool mouse_right_last_frame = false; // New
 char last_key_press = 0;
 
 struct UniversalMouseState {
@@ -720,6 +769,35 @@ static void process_universal_mouse_packet(uint8_t data) {
 // WINDOW SYSTEM
 // =============================================================================
 
+// New: Icon drawing functions
+void draw_icon_file(int x, int y, bool is_shortcut) {
+    draw_rect_filled(x, y, 32, 32, ColorPalette::ICON_FILE_FILL);
+    draw_rect_filled(x, y, 32, 1, ColorPalette::ICON_FILE_OUTLINE);
+    draw_rect_filled(x + 31, y, 1, 32, ColorPalette::ICON_FILE_OUTLINE);
+    draw_rect_filled(x, y + 31, 32, 1, ColorPalette::ICON_FILE_OUTLINE);
+    draw_rect_filled(x, y, 1, 32, ColorPalette::ICON_FILE_OUTLINE);
+    if(is_shortcut) {
+        draw_rect_filled(x + 4, y + 22, 10, 6, ColorPalette::ICON_SHORTCUT_ARROW);
+        put_pixel_back(x+8, y+20, ColorPalette::ICON_SHORTCUT_ARROW);
+        put_pixel_back(x+9, y+21, ColorPalette::ICON_SHORTCUT_ARROW);
+    }
+}
+
+void draw_icon_folder(int x, int y) {
+    draw_rect_filled(x, y + 5, 32, 27, ColorPalette::ICON_FOLDER_FILL);
+    draw_rect_filled(x, y, 14, 8, ColorPalette::ICON_FOLDER_FILL);
+    draw_rect_filled(x, y + 31, 32, 1, ColorPalette::ICON_FILE_OUTLINE);
+}
+
+// New: Desktop items structure
+enum IconType { ICON_FILE, ICON_DIR, ICON_SHORTCUT, ICON_APP };
+struct DesktopItem {
+    char name[32];
+    char path[128];
+    int x, y;
+    IconType type;
+};
+
 class Window {
 public:
     int x, y, w, h;
@@ -733,6 +811,9 @@ public:
 
     virtual void draw() = 0;
     virtual void on_key_press(char c) = 0;
+    virtual void on_mouse_click(int mx, int my) {} // New
+	virtual void on_mouse_right_click(int mx, int my) {} // ADD THIS LINE
+
     virtual void update() = 0;
     virtual void console_print(const char* s) {}
 
@@ -743,17 +824,73 @@ public:
 
 class WindowManager {
 private:
-    Window* windows[255];
+    Window* windows[16];
     int num_windows;
     int focused_idx;
     int dragging_idx;
     int drag_offset_x, drag_offset_y;
 
+    // New: Desktop & Context Menu management
+    DesktopItem desktop_items[64];
+    int num_desktop_items;
+    int dragging_icon_idx;
+
+    bool context_menu_active;
+    int context_menu_x, context_menu_y;
+	const char* context_menu_items[8];
+    int num_context_menu_items;
+    enum ContextType { CTX_DESKTOP, CTX_ICON, CTX_EXPLORER_ITEM }; // ADD CTX_EXPLORER_ITEM
+    ContextType current_context;
+    int context_icon_idx;
+    char context_file_path[128]; // ADD THIS to store the file path    int num_context_menu_items;
+    
+
 public:
-    WindowManager() : num_windows(0), focused_idx(-1), dragging_idx(-1) {}
+    WindowManager() : num_windows(0), focused_idx(-1), dragging_idx(-1), 
+                      num_desktop_items(0), dragging_icon_idx(-1), 
+                      context_menu_active(false) {}
+    void show_file_context_menu(int mx, int my, const char* filename) {
+        context_menu_active = true;
+        context_menu_x = mx;
+        context_menu_y = my;
+        current_context = CTX_EXPLORER_ITEM;
+        strncpy(context_file_path, filename, 127); // Store the filename for the action
+        num_context_menu_items = 0;
+        
+        if (strstr(filename, ".obj") != nullptr || strstr(filename, ".OBJ") != nullptr) {
+            context_menu_items[num_context_menu_items++] = "Run";
+        }
+        context_menu_items[num_context_menu_items++] = "Create Shortcut";
+        context_menu_items[num_context_menu_items++] = "Copy";
+        context_menu_items[num_context_menu_items++] = "Delete";
+    }
+    // New: Load desktop items from filesystem
+    // In WindowManager class
+void load_desktop_items() {
+    num_desktop_items = 0;
+
+    // Load items from the root directory
+    static fat_dir_entry_t file_list[64]; // Max 64 files on desktop
+    int num_files = fat32_list_directory("/", file_list, 64);
+
+    for (int i = 0; i < num_files && num_desktop_items < 64; ++i) {
+        fat32_get_fne_from_entry(&file_list[i], desktop_items[num_desktop_items].name);
+        strcpy(desktop_items[num_desktop_items].path, desktop_items[num_desktop_items].name);
+        
+        desktop_items[num_desktop_items].x = 30 + (num_desktop_items % 10) * 70;
+        desktop_items[num_desktop_items].y = 30 + (num_desktop_items / 10) * 80;
+        
+        if (file_list[i].attr & FAT_ATTR_DIRECTORY) {
+            desktop_items[num_desktop_items].type = ICON_DIR;
+        } else {
+            desktop_items[num_desktop_items].type = ICON_FILE;
+        }
+        num_desktop_items++;
+    }
+}
 
     void add_window(Window* win) {
-        if (num_windows < 10) {
+        if (num_windows < 16) {
             if (focused_idx != -1 && focused_idx < num_windows) windows[focused_idx]->has_focus = false;
             windows[num_windows] = win;
             focused_idx = num_windows;
@@ -813,20 +950,26 @@ public:
         int btn_x = 4, btn_y = fb_info.height - 36;
         int btn_w = 77, btn_h = 32;
         
-        // Button highlight (top-left)
         draw_rect_filled(btn_x, btn_y, btn_w, 1, BUTTON_HIGHLIGHT);
         draw_rect_filled(btn_x, btn_y, 1, btn_h, BUTTON_HIGHLIGHT);
-        
-        // Button shadow (bottom-right)
         draw_rect_filled(btn_x + 1, btn_y + btn_h - 1, btn_w - 1, 1, BUTTON_SHADOW);
         draw_rect_filled(btn_x + btn_w - 1, btn_y + 1, 1, btn_h - 1, BUTTON_SHADOW);
-        
-        // Button face
         draw_rect_filled(btn_x + 1, btn_y + 1, btn_w - 2, btn_h - 2, BUTTON_FACE);
-        
-        // Button text
         draw_string("Terminal", btn_x + 10, btn_y + 12, TEXT_BLACK);
+
+        // Draw desktop icons
+        for (int i = 0; i < num_desktop_items; ++i) {
+            bool is_shortcut = strstr(desktop_items[i].name, ".lnk") != nullptr;
+            if (desktop_items[i].type == ICON_APP) {
+                draw_icon_folder(desktop_items[i].x, desktop_items[i].y);
+            } else {
+                draw_icon_file(desktop_items[i].x, desktop_items[i].y, is_shortcut);
+            }
+            draw_string(desktop_items[i].name, desktop_items[i].x, desktop_items[i].y + 35, TEXT_WHITE);
+        }
     }
+
+    void execute_context_menu_action(int item_index); // New
 
     // =============================================================================
     // STATE-BASED WINDOW MANAGER UPDATE - ATOMIC FRAME RENDERING
@@ -846,7 +989,7 @@ public:
             g_render_state.renderPhase = 2;
         }
         
-        // Phase 2: Draw desktop
+        // Phase 2: Draw desktop and icons
         if (g_render_state.renderPhase == 2) {
             draw_desktop();
             g_render_state.renderPhase = 3;
@@ -854,13 +997,28 @@ public:
         
         // Phase 3: Draw windows (all at once to prevent tearing)
         if (g_render_state.renderPhase == 3) {
-            // Draw all windows in single pass
             for (int i = 0; i < num_windows; i++) {
                 if (windows[i] && !windows[i]->is_closed) {
                     windows[i]->draw();
                 }
             }
             g_render_state.renderPhase = 4;
+        }
+
+        // New Phase 3.5: Draw context menu on top of everything
+        if (context_menu_active) {
+            int menu_width = 150;
+            int item_height = 20;
+            int menu_height = num_context_menu_items * item_height;
+            draw_rect_filled(context_menu_x, context_menu_y, menu_width, menu_height, ColorPalette::BUTTON_FACE);
+            draw_rect_filled(context_menu_x, context_menu_y, menu_width, 1, ColorPalette::BUTTON_HIGHLIGHT);
+            draw_rect_filled(context_menu_x, context_menu_y, 1, menu_height, ColorPalette::BUTTON_HIGHLIGHT);
+            draw_rect_filled(context_menu_x+menu_width-1, context_menu_y, 1, menu_height, ColorPalette::BUTTON_SHADOW);
+            draw_rect_filled(context_menu_x, context_menu_y+menu_height-1, menu_width, 1, ColorPalette::BUTTON_SHADOW);
+
+            for (int i = 0; i < num_context_menu_items; ++i) {
+                draw_string(context_menu_items[i], context_menu_x + 5, context_menu_y + 5 + i * item_height, ColorPalette::TEXT_BLACK);
+            }
         }
         
         // Phase 4: Update logic
@@ -881,11 +1039,12 @@ public:
         }
     }
 
-    void handle_input(char key, int mx, int my, bool left_down, bool left_clicked);
+    void handle_input(char key, int mx, int my, bool left_down, bool left_clicked, bool right_clicked); // Modified
     void print_to_focused(const char* s);
 };
 
 WindowManager wm;
+
 
 // =============================================================================
 // I/O WAIT AND PS/2 FUNCTIONS
@@ -1279,7 +1438,7 @@ bool initialize_universal_mouse() {
 }
 void poll_input_universal() {
     last_key_press = 0;
-    mouse_left_last_frame = mouse_left_down;
+    // Last frame state is now handled in kernel_main loop
 
     for (int iterations = 0; iterations < 16; iterations++) {
         uint8_t status = inb(PS2_STATUS_PORT);
@@ -1287,14 +1446,9 @@ void poll_input_universal() {
 
         uint8_t data = inb(PS2_DATA_PORT);
 
-        // CORRECTED LOGIC:
-        // Rely *only* on the hardware status bit to determine the data's source.
-        // This is the only way to prevent race conditions between the keyboard and mouse.
         if (status & PS2_STATUS_AUX_DATA) {
-            // If bit 5 (AUX_DATA) is set, the byte is from the mouse.
             process_universal_mouse_packet(data);
         } else {
-            // Otherwise, the byte is from the keyboard.
             bool is_press = !(data & 0x80);
             uint8_t scancode = data & 0x7F;
 
@@ -1328,16 +1482,13 @@ void poll_input_universal() {
     mouse_x = universal_mouse_state.x;
     mouse_y = universal_mouse_state.y;
     mouse_left_down = universal_mouse_state.left_button;
+    mouse_right_down = universal_mouse_state.right_button; // New
 }
 void draw_cursor(int x, int y, uint32_t color) { 
     for(int i=0;i<12;i++) put_pixel_back(x,y+i,color); 
     for(int i=0;i<8;i++) put_pixel_back(x+i,y+i,color); 
     for(int i=0;i<4;i++) put_pixel_back(x+i,y+(11-i),color); 
 }
-
-
-
-
 
 
 
@@ -1361,6 +1512,13 @@ void draw_cursor(int x, int y, uint32_t color) {
 #define ATTR_ARCHIVE 0x20
 #define FAT_FREE_CLUSTER 0x00000000
 #define FAT_END_OF_CHAIN 0x0FFFFFFF
+
+// =============================================================================
+// FILE EXPLORER WINDOW IMPLEMENTATION (New)
+// =============================================================================
+
+
+
 // Add these definitions near the other AHCI/FAT32 structs
 typedef volatile struct {
     uint32_t clb;         // 0x00, command list base address, 1K-byte aligned
@@ -1420,12 +1578,13 @@ uint8_t lfn_checksum(const unsigned char *p_fname) {
     }
     return sum;
 }
+
 static int g_ahci_port = -1; // Will store the first active port number
 typedef struct { uint8_t cfl:5, a:1, w:1, p:1, r:1, b:1, c:1, res0:1; uint16_t prdtl; volatile uint32_t prdbc; uint64_t ctba; uint32_t res1[4]; } __attribute__((packed)) HBA_CMD_HEADER;
 typedef struct { uint64_t dba; uint32_t res0; uint32_t dbc:22, res1:9, i:1; } __attribute__((packed)) HBA_PRDT_ENTRY;
 typedef struct { uint8_t fis_type, pmport:4, res0:3, c:1, command, featurel; uint8_t lba0, lba1, lba2, device; uint8_t lba3, lba4, lba5, featureh; uint8_t countl, counth, icc, control; uint8_t res1[4]; } __attribute__((packed)) FIS_REG_H2D;
 typedef struct { uint8_t jmp[3]; char oem[8]; uint16_t bytes_per_sec; uint8_t sec_per_clus; uint16_t rsvd_sec_cnt; uint8_t num_fats; uint16_t root_ent_cnt; uint16_t tot_sec16; uint8_t media; uint16_t fat_sz16; uint16_t sec_per_trk; uint16_t num_heads; uint32_t hidd_sec; uint32_t tot_sec32; uint32_t fat_sz32; uint16_t ext_flags; uint16_t fs_ver; uint32_t root_clus; uint16_t fs_info; uint16_t bk_boot_sec; uint8_t res[12]; uint8_t drv_num; uint8_t res1; uint8_t boot_sig; uint32_t vol_id; char vol_lab[11]; char fil_sys_type[8]; } __attribute__((packed)) fat32_bpb_t;
-typedef struct { char name[11]; uint8_t attr; uint8_t ntres; uint8_t crt_time_tenth; uint16_t crt_time, crt_date, lst_acc_date, fst_clus_hi; uint16_t wrt_time, wrt_date, fst_clus_lo; uint32_t file_size; } __attribute__((packed)) fat_dir_entry_t;
+
 
 static uint64_t ahci_base = 0;
 static HBA_CMD_HEADER* cmd_list;
@@ -1590,6 +1749,7 @@ bool fat32_init() {
 }
 uint64_t cluster_to_lba(uint32_t cluster) { return data_start_sector + (cluster - 2) * bpb.sec_per_clus; }
 void to_83_format(const char* filename, char* out) { memset(out, ' ', 11); int i = 0, j = 0; while (filename[i] && filename[i] != '.' && j < 8) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } if(filename[i] == '.') i++; j=8; while(filename[i] && j<11) { out[j++] = (filename[i] >= 'a' && filename[i] <= 'z') ? (filename[i]-32) : filename[i]; i++; } }
+
 void from_83_format(const char* fat_name, char* out) {
     int i, j = 0;
     // Process the name part (before the extension)
@@ -1608,6 +1768,11 @@ void from_83_format(const char* fat_name, char* out) {
     }
     out[j] = '\0';
 }
+
+void fat32_get_fne_from_entry(fat_dir_entry_t* entry, char* out) {
+    from_83_format(entry->name, out);
+}
+
 uint32_t read_fat_entry(uint32_t cluster) {
     uint8_t* fat_sector = new uint8_t[SECTOR_SIZE];
     uint32_t fat_offset = cluster * 4;
@@ -1924,7 +2089,36 @@ int fat32_find_entry(const char* filename, fat_dir_entry_t* entry_out, uint32_t*
     delete[] dir_buf;
     return -1;
 }
+int fat32_list_directory(const char* path, fat_dir_entry_t* buffer, int max_entries) {
+    // This implementation ignores 'path' and lists the current directory for simplicity.
+    if (!ahci_base || !current_directory_cluster || !buffer) {
+        return 0;
+    }
 
+    uint8_t* dir_sector_buf = new uint8_t[bpb.sec_per_clus * SECTOR_SIZE];
+    if (read_write_sectors(g_ahci_port, cluster_to_lba(current_directory_cluster), bpb.sec_per_clus, false, dir_sector_buf) != 0) {
+        delete[] dir_sector_buf;
+        return 0; // Read error
+    }
+
+    int count = 0;
+    for (uint32_t i = 0; i < (bpb.sec_per_clus * SECTOR_SIZE); i += sizeof(fat_dir_entry_t)) {
+        if (count >= max_entries) break;
+
+        fat_dir_entry_t* entry = (fat_dir_entry_t*)(dir_sector_buf + i);
+
+        if (entry->name[0] == 0x00) break; // End of directory
+        if ((uint8_t)entry->name[0] == DELETED_ENTRY) continue; // Skip deleted entries
+        if (entry->attr == ATTR_LONG_NAME || (entry->attr & ATTR_VOLUME_ID)) continue; // Skip LFN and Volume ID
+        
+        // This is a valid file or directory, so copy it to the output buffer
+        memcpy(&buffer[count], entry, sizeof(fat_dir_entry_t));
+        count++;
+    }
+
+    delete[] dir_sector_buf;
+    return count;
+}
 int fat32_remove_file(const char* filename) {
     fat_dir_entry_t entry;
     uint32_t sector, offset;
@@ -1939,7 +2133,39 @@ int fat32_remove_file(const char* filename) {
     delete[] dir_buf;
     return 0;
 }
+// ADD THIS NEW FUNCTION after fat32_rename_file
+int fat32_copy_file(const char* src_path, const char* dest_path) {
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
 
+    // 1. Find the source file and get its info
+    if (fat32_find_entry(src_path, &entry, &sector, &offset) != 0) {
+        return -1; // Source file not found
+    }
+
+    if (entry.file_size == 0) {
+        // Handle zero-byte files
+        return fat32_write_file(dest_path, nullptr, 0);
+    }
+    
+    // 2. Allocate memory and read the source file's content
+    uint8_t* content_buffer = new uint8_t[entry.file_size];
+    if (!content_buffer) {
+        return -2; // Out of memory
+    }
+
+    uint32_t start_cluster = (entry.fst_clus_hi << 16) | entry.fst_clus_lo;
+    if (!read_data_from_clusters(start_cluster, content_buffer, entry.file_size)) {
+        delete[] content_buffer;
+        return -3; // Failed to read source file
+    }
+
+    // 3. Write the content to the destination file
+    int result = fat32_write_file(dest_path, content_buffer, entry.file_size);
+    
+    delete[] content_buffer;
+    return (result == 0) ? 0 : -4; // Return 0 on success, else write error
+}
 int fat32_rename_file(const char* old_name, const char* new_name) {
     fat_dir_entry_t entry;
     uint32_t sector, offset;
@@ -2050,9 +2276,122 @@ void fat32_format() {
         wm.print_to_focused("FAT32 FS re-initialization failed.\n");
     }
 }
+class FileExplorerWindow : public Window {
+private:
+    char current_path[256];
+    fat_dir_entry_t file_list[128];
+    int num_files;
+    int scroll_offset;
+    int selected_index;
 
-// Add after line 1920 (after the FAT32 functions in kernel.cpp)
+public:
+    FileExplorerWindow(int x, int y, const char* path) 
+        : Window(x, y, 400, 300, "File Explorer"), num_files(0), scroll_offset(0), selected_index(-1) {
+        strncpy(current_path, path, 255);
+        current_path[255] = '\0';
+        refresh_contents();
+    }
 
+    void refresh_contents() {
+        num_files = fat32_list_directory(current_path, file_list, 128);
+    }
+
+    void draw() override {
+        if (is_closed) return;
+        using namespace ColorPalette;
+        
+        uint32_t titlebar_color = has_focus ? TITLEBAR_ACTIVE : TITLEBAR_INACTIVE;
+        draw_rect_filled(x, y, w, 25, titlebar_color);
+        draw_string(title, x + 5, y + 8, TEXT_WHITE);
+        draw_string(current_path, x+100, y+8, TEXT_WHITE);
+
+        draw_rect_filled(x + w - 22, y + 4, 18, 18, BUTTON_CLOSE);
+        draw_string("X", x + w - 17, y + 8, TEXT_WHITE);
+        
+        // Main content area
+        draw_rect_filled(x, y + 25, w, h - 25, FILE_EXPLORER_BG);
+        
+        // Draw borders
+        for (int i = 0; i < w; i++) put_pixel_back(x + i, y, WINDOW_BORDER);
+        for (int i = 0; i < w; i++) put_pixel_back(x + i, y + h - 1, WINDOW_BORDER);
+        for (int i = 0; i < h; i++) put_pixel_back(x, y + i, WINDOW_BORDER);
+        for (int i = 0; i < h; i++) put_pixel_back(x + w - 1, y + i, WINDOW_BORDER);
+
+        // Draw file list
+        int max_visible_items = (h - 35) / 10;
+        for (int i = 0; i < max_visible_items; ++i) {
+            int file_idx = scroll_offset + i;
+            if (file_idx >= num_files) break;
+            
+            int item_y = y + 30 + i * 10;
+            char filename[13];
+            fat32_get_fne_from_entry(&file_list[file_idx], filename);
+
+            if (file_idx == selected_index) {
+                draw_rect_filled(x + 2, item_y, w - 4, 10, TITLEBAR_ACTIVE);
+            }
+
+            if (file_list[file_idx].attr & FAT_ATTR_DIRECTORY) {
+                draw_icon_folder(x + 5, item_y - 2);
+            } else {
+                bool is_shortcut = strstr(filename, ".LNK") != nullptr;
+                draw_icon_file(x + 5, item_y - 2, is_shortcut);
+            }
+
+            draw_string(filename, x + 40, item_y, TEXT_BLACK);
+        }
+    }
+
+    void on_key_press(char c) override {
+        // Handle keyboard navigation later
+    }
+void on_mouse_right_click(int mx, int my) {
+        int content_y = my - (y + 30);
+        if (content_y < 0) return;
+        int clicked_idx = scroll_offset + (content_y / 10);
+
+        if (clicked_idx < num_files) {
+            selected_index = clicked_idx;
+            char filename[13];
+            fat32_get_fne_from_entry(&file_list[clicked_idx], filename);
+
+            // Tell the window manager to show the context menu for this file
+            wm.show_file_context_menu(mx, my, filename);
+        }
+    }
+    void on_mouse_click(int mx, int my) override {
+        int content_y = my - (y + 30);
+        if (content_y < 0) return;
+        int clicked_idx = scroll_offset + (content_y / 10);
+        
+        if(clicked_idx < num_files) {
+            selected_index = clicked_idx;
+            // Basic double-click simulation
+            static int last_click_idx = -1;
+            static uint32_t last_click_tick = 0;
+            if(clicked_idx == last_click_idx && (g_timer_ticks - last_click_tick) < 20) {
+                // Double click!
+                char filename[13];
+                fat32_get_fne_from_entry(&file_list[clicked_idx], filename);
+
+                // --- ADD THIS LOGIC ---
+                // Check if it's an executable object file
+                if (strstr(filename, ".obj") != nullptr || strstr(filename, ".OBJ") != nullptr) {
+                    char command_buffer[128];
+                    snprintf(command_buffer, 128, "run %s", filename);
+                    launch_terminal_with_command(command_buffer);
+                }
+                // --- END ADDITION ---
+
+                // Handle opening file/dir (can be expanded for directories later)
+            }
+            last_click_idx = clicked_idx;
+            last_click_tick = g_timer_ticks;
+        }
+    }
+
+    void update() override {}
+};
 // ==================== CHKDSK IMPLEMENTATION ====================
 
 struct ChkdskStats {
@@ -2489,7 +2828,7 @@ void chkdsk_full_scan(bool fix = false) {
     uint32_t bad_sectors = 0;
     uint32_t total_sectors = bpb.tot_sec32;
     
-    for (uint32_t sector = 0; sector < total_sectors; sector += 1000) {
+    for (uint32_t sector = 0; sector < total_sectors; sector += 1) {
         if (read_write_sectors(g_ahci_port, sector, 1, false, test_buffer) != 0) {
             bad_sectors++;
             
@@ -4707,11 +5046,9 @@ char* get_arg(char* args, int n) {
 
 
 
-
 // =============================================================================
 // TERMINAL WINDOW IMPLEMENTATION
 // =============================================================================
-static volatile uint32_t g_timer_ticks = 0;
 static constexpr int TERM_HEIGHT = 35;
 static constexpr int TERM_WIDTH  = 120;
 char prompt_buffer[TERM_WIDTH];
@@ -4736,9 +5073,9 @@ private:
     // Prompt visual state for multi-line input
     int prompt_visual_lines;
 // Editor viewport settings
-static constexpr int EDIT_ROWS = 35;        // rows visible in the editor area
-static constexpr int EDIT_COL_PIX = 8;      // font width
-static constexpr int EDIT_LINE_PIX = 10;    // line height
+static constexpr int EDIT_ROWS = 35;       // rows visible in the editor area
+static constexpr int EDIT_COL_PIX = 8;     // font width
+static constexpr int EDIT_LINE_PIX = 10;   // line height
 
 void editor_clamp_cursor_to_line() {
     if (edit_current_line < 0) edit_current_line = 0;
@@ -4766,27 +5103,22 @@ private:
     void editor_insert_line_at(int index, const char* text) {
         if (index < 0 || index > edit_line_count) return;
 
-        // Allocate a new, larger array for the line pointers.
         char** new_lines = new char*[edit_line_count + 1];
 
-        // 1. Copy pointers for lines before the insertion point.
         for (int i = 0; i < index; ++i) {
             new_lines[i] = edit_lines[i];
         }
 
-        // 2. Allocate a new buffer for the new line's text and copy it.
         new_lines[index] = new char[TERM_WIDTH];
         memset(new_lines[index], 0, TERM_WIDTH);
         if (text) {
             strncpy(new_lines[index], text, TERM_WIDTH - 1);
         }
 
-        // 3. Copy pointers for lines after the insertion point.
         for (int i = index; i < edit_line_count; ++i) {
             new_lines[i + 1] = edit_lines[i];
         }
 
-        // 4. Free the old array of pointers and update the class members.
         if (edit_lines) {
             delete[] edit_lines;
         }
@@ -4798,23 +5130,18 @@ private:
     void editor_delete_line_at(int index) {
         if (index < 0 || index >= edit_line_count || edit_line_count <= 1) return;
 
-        // Free the memory for the text buffer of the line being removed.
         delete[] edit_lines[index];
 
-        // Allocate a new, smaller array for the pointers.
         char** new_lines = new char*[edit_line_count - 1];
         
-        // 1. Copy pointers for lines before the deleted one.
         for (int i = 0; i < index; ++i) {
             new_lines[i] = edit_lines[i];
         }
 
-        // 2. Copy pointers for lines after the deleted one.
         for (int i = index + 1; i < edit_line_count; ++i) {
             new_lines[i - 1] = edit_lines[i];
         }
 
-        // 3. Free the old array of pointers and update the class members.
         delete[] edit_lines;
         edit_lines = new_lines;
         edit_line_count--;
@@ -4936,8 +5263,8 @@ private:
                     seg[take] = '\0';
 
                     int trim = (int)strlen(seg);
-                     while (trim > 0 && (seg[trim-1] == ' ' || seg[trim-1] == '\t')) {
-                        seg[--trim] = '\0';
+                        while (trim > 0 && (seg[trim-1] == ' ' || seg[trim-1] == '\t')) {
+                            seg[--trim] = '\0';
                     }
 
                     push_line(seg);
@@ -4951,75 +5278,60 @@ private:
 
     // --- END OF MODULE ---
 
-    // This function scrolls the entire terminal buffer up by one line.
     void scroll() {
-        // Use memmove to shift the content of all lines (except the top one) upwards.
-        // This copies the content of rows 1-37 into the memory space of rows 0-36.
-        // The original top line (buffer[0]) is effectively discarded.
         memmove(buffer[0], buffer[1], (TERM_HEIGHT - 1) * TERM_WIDTH);
-
-        // After shifting, the last row's content is a duplicate of the one above it.
-        // We must clear it to make room for the new line of text.
         memset(buffer[TERM_HEIGHT - 1], 0, TERM_WIDTH);
     }
 
-    // This function adds a new string to the terminal's buffer.
     void push_line(const char* s) {
-        // Check if the buffer is full.
         if (line_count >= TERM_HEIGHT) {
-            // If full, scroll the existing content up by one line.
             scroll();
-            // The new line is then placed in the now-empty bottom row.
             strncpy(buffer[TERM_HEIGHT - 1], s, TERM_WIDTH - 1);
         } else {
-            // If there is space, simply add the new line to the next available slot.
             strncpy(buffer[line_count], s, TERM_WIDTH - 1);
-            line_count++; // Increment the count of used lines.
+            line_count++;
         }
     }
     void print_prompt() { 
         snprintf(prompt_buffer, TERM_WIDTH, "> %s", current_line);
-        // This doesn't add a new line, it just updates the last line
         if (line_count > 0) {
             strncpy(buffer[line_count-1], prompt_buffer, TERM_WIDTH - 1);
         } else {
             push_line(prompt_buffer);
         }
     }
-	
-	
+    
+char startup_command_buffer[256];
+
 // --- Terminal command handler ---
 void handle_command() {
-	int selected_port = 0;
+    int selected_port = 0;
     char cmd_line[120];
     strncpy(cmd_line, current_line, 119);
     cmd_line[119] = '\0';
 
-    // 1. Trim leading whitespace
     char* command = cmd_line;
     while (*command && *command == ' ') {
         command++;
     }
 
-    if (*command == '\0') { // Handle empty or whitespace-only lines
+    if (*command == '\0') {
         if (!in_editor) print_prompt();
         return;
     }
 
-    // 2. Isolate the command word and get a pointer to the arguments string
     char* args = command;
     while (*args && *args != ' ') {
         args++;
     }
-    if (*args) { // If we found a space (i.e., there are arguments)
-        *args = '\0'; // Null-terminate the command word
-        args++;      // Move pointer to the start of the arguments
+    if (*args) {
+        *args = '\0'; 
+        args++;       
         while (*args && *args == ' ') {
-            args++; // Skip any extra spaces
+            args++;
         }
     }
 
-    // 3. Now, `command` is the clean first word, and `args` is the rest.
     if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
     if (strcmp(command, "compile") == 0) {
         cmd_compile(ahci_base, selected_port, get_arg(args, 0));
@@ -5028,7 +5340,7 @@ void handle_command() {
     } else if (strcmp(command, "exec") == 0) {
         cmd_exec(get_arg(args, 0));
     }
-	else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
+    else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
     else if (strcmp(command, "edit") == 0) {
         char* filename = get_arg(args, 0);
@@ -5039,7 +5351,6 @@ void handle_command() {
             edit_current_line = 0;
             edit_cursor_col = 0;
             edit_scroll_offset = 0;
-            // ... (rest of edit logic is unchanged)
             char* content = fat32_read_file_as_string(filename);
             if (content) {
                 int line_count_temp = 1;
@@ -5076,7 +5387,7 @@ void handle_command() {
             console_print("Usage: edit \"<filename>\"\n");
         }
     }
-   
+    
     else if (strcmp(command, "rm") == 0) { 
         char* filename = get_arg(args, 0); 
         if(filename) { 
@@ -5139,31 +5450,30 @@ void handle_command() {
         }
     }
     else if (strcmp(command, "formatfs") == 0) { fat32_format(); }
-	else if (strcmp(command, "chkdsk") == 0) {
-		char* args_copy = new char[120];
-		strncpy(args_copy, args, 119);
-		args_copy[119] = '\0';
-		
-		bool fix = false;
-		bool fullscan = false;
-		
-		// Parse arguments
-		if (strstr(args_copy, "/f") || strstr(args_copy, "/F")) {
-			fix = true;
-		}
-		if (strstr(args_copy, "/r") || strstr(args_copy, "/R")) {
-			fix = true;
-			fullscan = true;
-		}
-		
-		chkdsk(fix, true);
-		
-		if (fullscan) {
-			chkdsk_full_scan(fix);
-		}
-		
-		delete[] args_copy;
-	}
+    else if (strcmp(command, "chkdsk") == 0) {
+        char* args_copy = new char[120];
+        strncpy(args_copy, args, 119);
+        args_copy[119] = '\0';
+        
+        bool fix = false;
+        bool fullscan = false;
+        
+        if (strstr(args_copy, "/f") || strstr(args_copy, "/F")) {
+            fix = true;
+        }
+        if (strstr(args_copy, "/r") || strstr(args_copy, "/R")) {
+            fix = true;
+            fullscan = true;
+        }
+        
+        chkdsk(fix, true);
+        
+        if (fullscan) {
+            chkdsk_full_scan(fix);
+        }
+        
+        delete[] args_copy;
+    }
     else if (strcmp(command, "time") == 0) { 
         RTC_Time t = read_rtc(); 
         char buf[64]; 
@@ -5178,15 +5488,22 @@ void handle_command() {
     if(!in_editor) print_prompt();
 }
     
-	
+    
 
 public:
-    TerminalWindow(int x, int y) : Window(x, y, 640, 400, "Terminal"), line_count(0), line_pos(0), in_editor(false), 
+    TerminalWindow(int x, int y, const char* startup_command = nullptr) : Window(x, y, 640, 400, "Terminal"), line_count(0), line_pos(0), in_editor(false), 
         edit_lines(nullptr), edit_line_count(0), edit_current_line(0), edit_cursor_col(0), edit_scroll_offset(0),
         prompt_visual_lines(0) {
         memset(buffer, 0, sizeof(buffer));
         current_line[0] = '\0';
-        update_prompt_display(); // Initial prompt
+        startup_command_buffer[0] = '\0'; // Ensure buffer is empty by default
+
+        if (startup_command) {
+            // Save the command to be run on the first update cycle
+            strncpy(startup_command_buffer, startup_command, 127);
+        }
+        
+        update_prompt_display(); // Show the initial prompt
     }
     
     ~TerminalWindow() { 
@@ -5197,7 +5514,6 @@ public:
     }
 
     void draw() override {
-        // Drawing logic remains the same
         if (!has_focus && is_closed) return;
 
         using namespace ColorPalette;
@@ -5221,25 +5537,18 @@ public:
         draw_string(buffer[i], x + 5, y + 30 + i * 10, ColorPalette::TEXT_WHITE);
     }
 } else {
-    // Editor surface
-    // Draw visible lines with a highlight bar on the current line
     for (int row = 0; row < EDIT_ROWS; ++row) {
         int line_idx = edit_scroll_offset + row;
         int y_line = y + 30 + row * EDIT_LINE_PIX;
 
         if (line_idx < edit_line_count) {
             if (line_idx == edit_current_line) {
-                // highlight current line background
                 draw_rect_filled(x + 2, y_line, w - 4, EDIT_LINE_PIX, ColorPalette::TEXT_GRAY);
             }
             draw_string(edit_lines[line_idx], x + 5, y_line, ColorPalette::TEXT_WHITE);
-        } else {
-            // clear area for lines beyond EOF
-            // optional: nothing to draw
         }
     }
 
-    // Blinking cursor (block cursor)
     if ((g_timer_ticks / 15) % 2 == 0 && edit_current_line >= edit_scroll_offset &&
         edit_current_line < edit_scroll_offset + EDIT_ROWS) {
         int visible_row = edit_current_line - edit_scroll_offset;
@@ -5252,13 +5561,12 @@ public:
 
     void on_key_press(char c) override {
         if (in_editor) {
-            if (!edit_lines || edit_current_line >= edit_line_count) return; // Safety check
+            if (!edit_lines || edit_current_line >= edit_line_count) return;
 
             char* current_line_ptr = edit_lines[edit_current_line];
             size_t current_len = strlen(current_line_ptr);
 
             if (c == 17 || c == 27) { // Ctrl+Q or ESC to save and exit
-                // ... (save logic remains the same) ...
                 int total_len = 0;
                 for (int i = 0; i < edit_line_count; i++) {
                     total_len += strlen(edit_lines[i]) + 1;
@@ -5286,20 +5594,16 @@ public:
             } else if (c == KEY_RIGHT) {
                 if (edit_cursor_col < current_len) edit_cursor_col++;
             } else if (c == '\n') { // Enter key
-                // Get text to the right of the cursor
                 const char* right_part_text = &current_line_ptr[edit_cursor_col];
-                // Insert a new line below the current one with that text
                 editor_insert_line_at(edit_current_line + 1, right_part_text);
-                // Truncate the current line at the cursor
                 current_line_ptr[edit_cursor_col] = '\0';
-                // Move cursor to the new line
                 edit_current_line++;
                 edit_cursor_col = 0;
             } else if (c == '\b') { // Backspace
-                if (edit_cursor_col > 0) { // Backspace within a line
+                if (edit_cursor_col > 0) {
                     memmove(&current_line_ptr[edit_cursor_col - 1], &current_line_ptr[edit_cursor_col], current_len - edit_cursor_col + 1);
                     edit_cursor_col--;
-                } else if (edit_current_line > 0) { // Backspace at start of line (join)
+                } else if (edit_current_line > 0) {
                     int prev_line_idx = edit_current_line - 1;
                     char* prev_line_ptr = edit_lines[prev_line_idx];
                     int prev_len = strlen(prev_line_ptr);
@@ -5317,11 +5621,9 @@ public:
                     edit_cursor_col++;
                 }
             }
-            // Clamp cursor and ensure it's visible after any operation
             editor_clamp_cursor_to_line();
             editor_ensure_cursor_visible();
         } else {
-            // ... (non-editor terminal logic remains the same) ...
             if (c == '\n') {
                 prompt_visual_lines = 0;
                 handle_command();
@@ -5342,7 +5644,26 @@ public:
         }
     }
 
-    void update() override {}
+     // --- THIS IS THE CORRECTED UPDATE METHOD ---
+    void update() override {
+        // Check if there is a startup command waiting to be executed
+        if (startup_command_buffer[0] != '\0') {
+            // Copy the command to the current line to be processed
+            strncpy(current_line, startup_command_buffer, TERM_WIDTH - 1);
+            
+            // Clear the startup command so this only runs ONCE
+            startup_command_buffer[0] = '\0'; 
+
+            push_line(current_line);  // Display the command being run
+            handle_command();         // Execute it
+            
+            // Reset the input line for the user
+            line_pos = 0;
+            current_line[0] = '\0';
+            update_prompt_display();
+        }
+    }
+
 
     void console_print(const char* s) override {
         if (!s || in_editor) return;
@@ -5358,44 +5679,253 @@ public:
     }
 };
 
-void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool left_clicked) {
-    if (dragging_idx != -1) {
-        if (left_down) { 
-            windows[dragging_idx]->x = mx - drag_offset_x; 
-            windows[dragging_idx]->y = my - drag_offset_y; 
+void WindowManager::execute_context_menu_action(int item_index) {
+    if (item_index < 0 || item_index >= num_context_menu_items) return;
+    const char* action = context_menu_items[item_index];
+
+    if (current_context == CTX_DESKTOP) {
+        if (strcmp(action, "New Shortcut") == 0) {
+            // Creates a file named new.lnk containing "run program.elf"
+            fat32_write_file("/desktop/new.lnk", "run program.obj", 15);
+            load_desktop_items(); // Reloads desktop to show the new icon
+        } if (strcmp(action, "File Explorer") == 0) {
+            launch_new_explorer();
+        } else if (strcmp(action, "New Shortcut") == 0) {
+            fat32_write_file("shortcut.lnk", "run program.obj", 15); // Create in root
+            load_desktop_items(); // Refresh desktop
+        } else if (strcmp(action, "Paste") == 0) {
+            if (g_clipboard_buffer[0] != '\0') {
+                const char* src_path = g_clipboard_buffer;
+                const char* filename = strrchr(src_path, '/');
+                filename = filename ? filename + 1 : src_path; // Get filename from path
+                
+                char new_name[32] = "copy_of_";
+                strncat(new_name, filename, 22); // Create a new name for the copy
+
+                fat32_copy_file(src_path, new_name); // Copy to root
+                load_desktop_items(); // Refresh desktop
+            }
         }
-        else dragging_idx = -1;
+    }// In WindowManager::execute_context_menu_action
+		else if (current_context == CTX_ICON) {
+        DesktopItem& item = desktop_items[context_icon_idx];
+        
+        // --- ADD THIS BLOCK ---
+        if (strcmp(action, "Run") == 0) {
+            char command_buffer[128];
+            snprintf(command_buffer, 128, "run %s", item.name);
+            launch_terminal_with_command(command_buffer);
+        } 
+        // --- END ADDITION ---
+else if (current_context == CTX_EXPLORER_ITEM) {
+        const char* filename = context_file_path;
+
+        if (strcmp(action, "Create Shortcut") == 0) {
+            char shortcut_name[32];
+            char shortcut_content[128];
+            
+            // Create shortcut name (e.g., "myprog.lnk")
+            strncpy(shortcut_name, filename, 27);
+            char* dot = strrchr(shortcut_name, '.');
+            if (dot) *dot = '\0'; // Remove original extension
+            strcat(shortcut_name, ".lnk");
+
+            // Create shortcut content (e.g., "run myprog.obj")
+            snprintf(shortcut_content, 128, "run %s", filename);
+
+            fat32_write_file(shortcut_name, shortcut_content, strlen(shortcut_content));
+            load_desktop_items(); // Refresh desktop to show the new shortcut
+        } 
+        else if (strcmp(action, "Run") == 0) {
+             char command_buffer[128];
+             snprintf(command_buffer, 128, "run %s", filename);
+             launch_terminal_with_command(command_buffer);
+        }
+        // Add Copy/Delete logic for explorer items here if desired
+    }
+        else if (strcmp(action, "Copy") == 0) {
+            strncpy(g_clipboard_buffer, item.path, 1023);
+        } else if (strcmp(action, "Delete") == 0) {
+            fat32_remove_file(item.path);
+            load_desktop_items(); // Reload icons
+        }
+    }
+
+    context_menu_active = false;
+}
+
+
+void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool left_clicked, bool right_clicked) {
+    // --- Static variables to track double-clicks ---
+    static uint32_t last_click_tick = 0;
+    static int last_click_icon_idx = -1;
+    const uint32_t DOUBLE_CLICK_SPEED = 20; // Ticks to wait for a double click
+
+    // --- 1. Handle Context Menu Clicks ---
+    if (context_menu_active && left_clicked) {
+        int menu_width = 150;
+        int item_height = 20;
+        if (mx > context_menu_x && mx < context_menu_x + menu_width) {
+            int item_index = (my - context_menu_y) / item_height;
+            if (item_index >= 0 && item_index < num_context_menu_items) {
+                execute_context_menu_action(item_index);
+                return; // Action taken, end input handling
+            }
+        }
+        context_menu_active = false; // Clicked outside, close menu
+    }
+
+    if (context_menu_active && right_clicked) {
+        context_menu_active = false;
         return;
     }
-    if (left_clicked) {
-        for (int i = num_windows - 1; i >= 0; i--) { 
-            if (windows[i]->is_in_close_button(mx, my)) { 
-                windows[i]->close(); 
-                return; 
-            } 
+
+    // --- 2. Handle Dragging ---
+    if (dragging_idx != -1) { // Dragging a window
+        if (left_down) {
+            windows[dragging_idx]->x = mx - drag_offset_x;
+            windows[dragging_idx]->y = my - drag_offset_y;
+        } else {
+            dragging_idx = -1;
         }
-        for (int i = num_windows - 1; i >= 0; i--) { 
-            if (windows[i]->is_in_titlebar(mx, my)) { 
-                set_focus(i); 
-                dragging_idx = focused_idx; 
-                drag_offset_x = mx - windows[dragging_idx]->x; 
-                drag_offset_y = my - windows[dragging_idx]->y; 
-                return; 
-            } 
-        }
-        for (int i = num_windows - 1; i >= 0; i--) { 
-            if (mx >= windows[i]->x && mx < windows[i]->x + windows[i]->w && 
-                my >= windows[i]->y && my < windows[i]->y + windows[i]->h) { 
-                set_focus(i); 
-                return; 
-            } 
-        }
-        if (mx >= 5 && mx <= 80 && my >= (int)fb_info.height - 35 && my <= (int)fb_info.height - 5) { 
-            launch_new_terminal(); 
-            return; 
-        }
+        return;
     }
-    if (key != 0 && focused_idx != -1 && focused_idx < num_windows) 
+    if (dragging_icon_idx != -1) { // Dragging an icon
+        if (left_down) {
+            desktop_items[dragging_icon_idx].x = mx - drag_offset_x;
+            desktop_items[dragging_icon_idx].y = my - drag_offset_y;
+        } else {
+            dragging_icon_idx = -1;
+        }
+        return;
+    }
+    
+    // --- 3. Handle Right Clicks (Opening Context Menu) ---
+    // --- 3. Handle Right Clicks (Opening Context Menu) ---
+    if (right_clicked) {
+		if (focused_idx != -1) {
+            Window* win = windows[focused_idx];
+            if (mx >= win->x && mx < win->x + win->w && my >= win->y && my < win->y + win->h) {
+                win->on_mouse_right_click(mx, my);
+                return; // The window handled the click
+            }
+        }
+        // First, check if a click happened on a desktop icon
+        int clicked_icon_index = -1;
+        for (int i = num_desktop_items - 1; i >= 0; --i) {
+            if (mx >= desktop_items[i].x && mx < desktop_items[i].x + 40 &&
+                my >= desktop_items[i].y && my < desktop_items[i].y + 50) {
+                clicked_icon_index = i; // Save the index of the clicked icon
+                break; // Found it, no need to check others
+            }
+        }
+
+        if (clicked_icon_index != -1) {
+            // A desktop icon was right-clicked
+            context_menu_active = true;
+            context_menu_x = mx;
+            context_menu_y = my;
+            current_context = CTX_ICON;
+            context_icon_idx = clicked_icon_index; // Use the saved index
+            num_context_menu_items = 0;
+
+            // Check if it's an executable
+            if (strstr(desktop_items[clicked_icon_index].name, ".obj") != nullptr || strstr(desktop_items[clicked_icon_index].name, ".OBJ") != nullptr) {
+                context_menu_items[num_context_menu_items++] = "Run";
+            }
+            
+            context_menu_items[num_context_menu_items++] = "Copy";
+            context_menu_items[num_context_menu_items++] = "Delete";
+
+        } else {
+            // No icon was clicked, this is a right-click on the desktop itself
+            context_menu_active = true;
+            context_menu_x = mx;
+            context_menu_y = my;
+            current_context = CTX_DESKTOP;
+            num_context_menu_items = 0;
+            context_menu_items[num_context_menu_items++] = "File Explorer";
+            context_menu_items[num_context_menu_items++] = "Paste";
+        }
+        return;
+    }
+
+    // --- 4. Handle Left Clicks (Dragging, Opening, Focusing) ---
+    if (left_clicked) {
+        // Check window interactions first (top to bottom)
+        for (int i = num_windows - 1; i >= 0; i--) {
+            if (mx >= windows[i]->x && mx < windows[i]->x + windows[i]->w &&
+                my >= windows[i]->y && my < windows[i]->y + windows[i]->h) {
+                
+                set_focus(i);
+                if (windows[i]->is_in_close_button(mx, my)) {
+                    windows[i]->close();
+                } else if (windows[i]->is_in_titlebar(mx, my)) {
+                    dragging_idx = focused_idx;
+                    drag_offset_x = mx - windows[dragging_idx]->x;
+                    drag_offset_y = my - windows[dragging_idx]->y;
+                } else {
+                    windows[i]->on_mouse_click(mx, my);
+                }
+                return;
+            }
+        }
+
+        // Check icon interactions (double-click and drag start)
+        for (int i = num_desktop_items - 1; i >= 0; --i) {
+            if (mx >= desktop_items[i].x && mx < desktop_items[i].x + 32 &&
+                my >= desktop_items[i].y && my < desktop_items[i].y + 45) {
+
+                // Check for a double-click
+                // Check for a double-click
+                if (last_click_icon_idx == i && (g_timer_ticks - last_click_tick) < DOUBLE_CLICK_SPEED) {
+                    // Double-click detected!
+                    DesktopItem& item = desktop_items[i]; // Use a reference for cleaner code
+
+                    // In WindowManager::handle_input, inside the double-click check
+					if (strcmp(item.path, "explorer.app") == 0) {
+						launch_new_explorer();
+					} 
+					// This part handles executing .obj files
+					else if (strstr(item.name, ".obj") != nullptr || strstr(item.name, ".OBJ") != nullptr) {
+						char command_buffer[128];
+						snprintf(command_buffer, 128, "run %s", item.name);
+						launch_terminal_with_command(command_buffer);
+					}
+                    // ADD THIS LOGIC FOR .obj FILES
+                    else if (strstr(item.name, ".obj") != nullptr || strstr(item.name, ".OBJ") != nullptr) {
+                        char command_buffer[128];
+                        snprintf(command_buffer, 128, "run %s", item.name);
+                        launch_terminal_with_command(command_buffer);
+                    }
+                    
+                    // Reset double-click tracking
+                    last_click_tick = 0;
+                    last_click_icon_idx = -1;
+                } else {
+                    // This is a first click, start dragging and set up for double-click
+                    dragging_icon_idx = i;
+                    drag_offset_x = mx - desktop_items[i].x;
+                    drag_offset_y = my - desktop_items[i].y;
+                    last_click_icon_idx = i;
+                    last_click_tick = g_timer_ticks;
+                }
+                return;
+            }
+        }
+
+        // Check taskbar button clicks
+        if (mx >= 5 && mx <= 80 && my >= (int)fb_info.height - 35 && my <= (int)fb_info.height - 5) {
+            launch_new_terminal();
+            return;
+        }
+
+        // If nothing was clicked, reset double-click tracking
+        last_click_icon_idx = -1;
+    }
+
+    // --- 5. Handle Keyboard Input ---
+    if (key != 0 && focused_idx != -1 && focused_idx < num_windows)
         windows[focused_idx]->on_key_press(key);
 }
 
@@ -5409,6 +5939,16 @@ void launch_new_terminal() {
     wm.add_window(new TerminalWindow(100 + (win_count++ % 10) * 30, 50 + (win_count % 10) * 30));
 }
 
+void launch_new_explorer() {
+    static int win_count = 0;
+    wm.add_window(new FileExplorerWindow(120 + (win_count++ % 10) * 30, 70 + (win_count % 10) * 30, "/"));
+}
+
+// ADD THIS NEW FUNCTION
+void launch_terminal_with_command(const char* command) {
+    static int win_count = 0;
+    wm.add_window(new TerminalWindow(150 + (win_count++ % 10) * 30, 90 + (win_count % 10) * 30, command));
+}
 void swap_buffers() {
     if (fb_info.ptr && backbuffer) {
         uint32_t* dest = fb_info.ptr;
@@ -5463,19 +6003,14 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     
     backbuffer = new uint32_t[fb_info.width * fb_info.height];
     
-    // FIXED: Initialize graphics driver for standard RGB, not BGR.
-    // This corrects the red/blue color issue.
     g_gfx.init(false);
     
     launch_new_terminal();
     
-    // Disable USB legacy first
     enable_usb_legacy_support();
 
-    // Give hardware time to switch modes
     for (int i = 0; i < 100000; i++) io_wait_short();
 
-    // Reset PS/2 controller
     outb(0x64, 0xFF);
     io_delay_long();
     ps2_flush_output_buffer();
@@ -5486,26 +6021,26 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         wm.print_to_focused("WARNING: Mouse initialization failed.\n");
     }
 
-    disk_init(); // Assuming disk_init and ahci_base are defined elsewhere
+    disk_init();
     if(ahci_base) fat32_init();
     
     if(ahci_base) 
         wm.print_to_focused("AHCI disk found.\n"); 
     else 
         wm.print_to_focused("AHCI disk NOT found.\n");
-     
-    if(current_directory_cluster) 
+    
+    if(current_directory_cluster) {
         wm.print_to_focused("FAT32 FS initialized.\n"); 
+        wm.load_desktop_items(); // New
+    }
     else 
         wm.print_to_focused("FAT32 init failed.\n");
 
-    // Configure 30 Hz screen refresh timer
     init_screen_timer(30);
 
     uint32_t last_paint_tick = 0;
     const uint32_t TICKS_PER_FRAME = 1;
 
-    // Track previous mouse position to detect movement
     int prev_mouse_x = mouse_x;
     int prev_mouse_y = mouse_y;
     
@@ -5515,22 +6050,20 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // MAIN LOOP - ATOMIC FRAME RENDERING WITH STATE MACHINE
     // =============================================================================
     for (;;) {
-        // Poll input
         poll_input_universal();
 
-        // Detect ANY input change
         bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
-        bool button_changed = (mouse_left_down != mouse_left_last_frame);
+        bool l_button_changed = (mouse_left_down != mouse_left_last_frame);
+        bool r_button_changed = (mouse_right_down != mouse_right_last_frame); // New
         bool key_pressed = (last_key_press != 0);
 
-        if (key_pressed || button_changed || mouse_moved) {
+        if (key_pressed || l_button_changed || r_button_changed || mouse_moved) {
             g_evt_input = true;
             g_input_state.hasNewInput = true;
             prev_mouse_x = mouse_x;
             prev_mouse_y = mouse_y;
         }
 
-        // Simulate timer tick (software throttle)
         static uint32_t poll_counter = 0;
         if (++poll_counter >= 500) {
             poll_counter = 0;
@@ -5538,18 +6071,16 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             g_timer_ticks++;
         }
 
-        // Handle input events
         if (g_evt_input) {
             g_evt_input = false;
-            bool mouseClickedThisFrame = mouse_left_down && !mouse_left_last_frame;
-            wm.handle_input(last_key_press, mouse_x, mouse_y, mouse_left_down, mouseClickedThisFrame);
+            bool leftClickedThisFrame = mouse_left_down && !mouse_left_last_frame;
+            bool rightClickedThisFrame = mouse_right_down && !mouse_right_last_frame; // New
+            wm.handle_input(last_key_press, mouse_x, mouse_y, mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
             g_evt_dirty = true;
         }
 
-        // Periodic cleanup
         wm.cleanup_closed_windows();
 
-        // Redraw screen only every N timer ticks AND if dirty
         if (g_evt_timer && (g_timer_ticks - last_paint_tick) >= TICKS_PER_FRAME) {
             if (g_evt_dirty || g_input_state.hasNewInput) {
                 last_paint_tick = g_timer_ticks;
@@ -5562,18 +6093,18 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                 
                 g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
                 
-                // Step 2: Render complete frame using state machine (ATOMIC)
                 wm.update_all();
                 
-                // Step 3: Draw cursor on top (ATOMIC)
                 draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
                 
-                // Step 4: Atomic buffer swap (fast assembly copy)
                 swap_buffers();
                 
-                // Frame complete - state machine resets for next frame
             }
             g_evt_timer = false;
         }
+
+        // Update last frame states at the END of the loop
+        mouse_left_last_frame = mouse_left_down;
+        mouse_right_last_frame = mouse_right_down;
     }
 }
