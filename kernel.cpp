@@ -2551,7 +2551,7 @@ static volatile char* const VGA_BUFFER = (volatile char* const)0xB8000;
 static int vga_row = 0;
 static int vga_col = 0;
 static const int VGA_WIDTH = 80;
-static const int VGA_HEIGHT = 25;
+static const int VGA_HEIGHT = 23;
 void vga_print_char(char c) {
     if (c == '\n') {
         vga_col = 0;
@@ -4712,16 +4712,16 @@ char* get_arg(char* args, int n) {
 // TERMINAL WINDOW IMPLEMENTATION
 // =============================================================================
 static volatile uint32_t g_timer_ticks = 0;
-static constexpr int TERM_HEIGHT = 38;
+static constexpr int TERM_HEIGHT = 35;
 static constexpr int TERM_WIDTH  = 120;
 char prompt_buffer[TERM_WIDTH];
 
 class TerminalWindow : public Window {
 private:
     // Terminal state
-    char buffer[38][120];
+    char buffer[TERM_HEIGHT][TERM_WIDTH];
     int line_count;
-    char current_line[120];
+    char current_line[TERM_WIDTH];
     int line_pos;
 
     // Editor state
@@ -4761,40 +4761,64 @@ void editor_ensure_cursor_visible() {
         edit_scroll_offset = edit_current_line - (EDIT_ROWS - 1);
     }
 }
+private:
+    // Insert a new line at a given index, copying the provided text into it.
+    void editor_insert_line_at(int index, const char* text) {
+        if (index < 0 || index > edit_line_count) return;
 
-// Insert a new line at index with content (clamped to TERM_WIDTH-1)
-void editor_insert_line_at(int index, const char* text) {
-    if (index < 0) index = 0;
-    if (index > edit_line_count) index = edit_line_count;
-    char** nl = new char*[edit_line_count + 1];
-    for (int i = 0; i < index; ++i) nl[i] = edit_lines[i];
+        // Allocate a new, larger array for the line pointers.
+        char** new_lines = new char*[edit_line_count + 1];
 
-    nl[index] = new char[TERM_WIDTH];
-    memset(nl[index], 0, TERM_WIDTH);
-    if (text) {
-        strncpy(nl[index], text, TERM_WIDTH - 1);
+        // 1. Copy pointers for lines before the insertion point.
+        for (int i = 0; i < index; ++i) {
+            new_lines[i] = edit_lines[i];
+        }
+
+        // 2. Allocate a new buffer for the new line's text and copy it.
+        new_lines[index] = new char[TERM_WIDTH];
+        memset(new_lines[index], 0, TERM_WIDTH);
+        if (text) {
+            strncpy(new_lines[index], text, TERM_WIDTH - 1);
+        }
+
+        // 3. Copy pointers for lines after the insertion point.
+        for (int i = index; i < edit_line_count; ++i) {
+            new_lines[i + 1] = edit_lines[i];
+        }
+
+        // 4. Free the old array of pointers and update the class members.
+        if (edit_lines) {
+            delete[] edit_lines;
+        }
+        edit_lines = new_lines;
+        edit_line_count++;
     }
 
-    for (int i = index; i < edit_line_count; ++i) nl[i + 1] = edit_lines[i];
+    // Delete the line at a given index.
+    void editor_delete_line_at(int index) {
+        if (index < 0 || index >= edit_line_count || edit_line_count <= 1) return;
 
-    delete[] edit_lines;
-    edit_lines = nl;
-    edit_line_count++;
-}
+        // Free the memory for the text buffer of the line being removed.
+        delete[] edit_lines[index];
 
-// Delete a line at index (freeing its buffer)
-void editor_delete_line_at(int index) {
-    if (index < 0 || index >= edit_line_count) return;
-    delete[] edit_lines[index];
-    for (int i = index; i < edit_line_count - 1; ++i) edit_lines[i] = edit_lines[i + 1];
-    edit_line_count--;
-    if (edit_line_count == 0) {
-        edit_lines = new char*[1];
-        edit_lines[0] = new char[TERM_WIDTH];
-        memset(edit_lines[0], 0, TERM_WIDTH);
-        edit_line_count = 1;
+        // Allocate a new, smaller array for the pointers.
+        char** new_lines = new char*[edit_line_count - 1];
+        
+        // 1. Copy pointers for lines before the deleted one.
+        for (int i = 0; i < index; ++i) {
+            new_lines[i] = edit_lines[i];
+        }
+
+        // 2. Copy pointers for lines after the deleted one.
+        for (int i = index + 1; i < edit_line_count; ++i) {
+            new_lines[i - 1] = edit_lines[i];
+        }
+
+        // 3. Free the old array of pointers and update the class members.
+        delete[] edit_lines;
+        edit_lines = new_lines;
+        edit_line_count--;
     }
-}
 
     // Get visible columns for the first prompt line (accounts for "> ")
     int term_cols_first() const {
@@ -4929,13 +4953,13 @@ void editor_delete_line_at(int index) {
 
     void scroll() {
         memmove(buffer[0], buffer[1], 37 * 120);
-        memset(buffer[37], 0, 120);
+        memset(buffer[35], 0, 120);
     }
     
     void push_line(const char* s) {
-        if (line_count >= 38) {
+        if (line_count >= 35) {
             scroll();
-            strncpy(buffer[37], s, 119);
+            strncpy(buffer[35], s, 119);
         } else {
             strncpy(buffer[line_count++], s, 119);
         }
@@ -5214,143 +5238,96 @@ public:
     }
 
     void on_key_press(char c) override {
-    if (in_editor) {
-        // --- RESTORED EDITOR LOGIC ---
-        if (edit_lines == nullptr || edit_current_line >= edit_line_count) {
-            return; // Safety check
-        }
+        if (in_editor) {
+            if (!edit_lines || edit_current_line >= edit_line_count) return; // Safety check
 
-        char* current_line_ptr = edit_lines[edit_current_line];
-        size_t current_len = strlen(current_line_ptr);
+            char* current_line_ptr = edit_lines[edit_current_line];
+            size_t current_len = strlen(current_line_ptr);
 
-        if (c == 17 || c == 27) { // Ctrl+Q or ESC to save and exit
-            int total_len = 0;
-            for (int i = 0; i < edit_line_count; i++) {
-                total_len += strlen(edit_lines[i]) + 1; // +1 for newline
-            }
-
-            char* file_content = new char[total_len + 1];
-            if (!file_content) return;
-            file_content[0] = '\0';
-            for (int i = 0; i < edit_line_count; i++) {
-                strcat(file_content, edit_lines[i]);
-                if (i < edit_line_count - 1) {
-                    strcat(file_content, "\n");
+            if (c == 17 || c == 27) { // Ctrl+Q or ESC to save and exit
+                // ... (save logic remains the same) ...
+                int total_len = 0;
+                for (int i = 0; i < edit_line_count; i++) {
+                    total_len += strlen(edit_lines[i]) + 1;
                 }
-            }
-
-            fat32_write_file(edit_filename, file_content, strlen(file_content));
-            delete[] file_content;
-
-            in_editor = false;
-            console_print("File saved.\n");
-            return;
-
-        } else if (c == KEY_UP) {
-            if (edit_current_line > 0) {
-                edit_current_line--;
-                if (edit_current_line < edit_scroll_offset) {
-                    edit_scroll_offset--;
+                char* file_content = new char[total_len + 1];
+                if (!file_content) return;
+                file_content[0] = '\0';
+                for (int i = 0; i < edit_line_count; i++) {
+                    strcat(file_content, edit_lines[i]);
+                    if (i < edit_line_count - 1) {
+                       strcat(file_content, "\n");
+                    }
                 }
-                if (edit_cursor_col > strlen(edit_lines[edit_current_line])) {
-                    edit_cursor_col = strlen(edit_lines[edit_current_line]);
-                }
-            }
-        } else if (c == KEY_DOWN) {
-            if (edit_current_line < edit_line_count - 1) {
-                edit_current_line++;
-                if (edit_current_line >= edit_scroll_offset + 35) {
-                    edit_scroll_offset++;
-                }
-                if (edit_cursor_col > strlen(edit_lines[edit_current_line])) {
-                    edit_cursor_col = strlen(edit_lines[edit_current_line]);
-                }
-            }
-        } else if (c == KEY_LEFT) {
-            if (edit_cursor_col > 0) {
-                edit_cursor_col--;
-            } else if (edit_current_line > 0) {
-                // Move to end of previous line
-                edit_current_line--;
-                edit_cursor_col = strlen(edit_lines[edit_current_line]);
-            }
-        } else if (c == KEY_RIGHT) {
-            if (edit_cursor_col < current_len) {
-                edit_cursor_col++;
-            } else if (edit_current_line < edit_line_count - 1) {
-                // Move to start of next line
+                fat32_write_file(edit_filename, file_content, strlen(file_content));
+                delete[] file_content;
+                in_editor = false;
+                console_print("File saved.\n");
+                return;
+            } else if (c == KEY_UP) {
+                if (edit_current_line > 0) edit_current_line--;
+            } else if (c == KEY_DOWN) {
+                if (edit_current_line < edit_line_count - 1) edit_current_line++;
+            } else if (c == KEY_LEFT) {
+                if (edit_cursor_col > 0) edit_cursor_col--;
+            } else if (c == KEY_RIGHT) {
+                if (edit_cursor_col < current_len) edit_cursor_col++;
+            } else if (c == '\n') { // Enter key
+                // Get text to the right of the cursor
+                const char* right_part_text = &current_line_ptr[edit_cursor_col];
+                // Insert a new line below the current one with that text
+                editor_insert_line_at(edit_current_line + 1, right_part_text);
+                // Truncate the current line at the cursor
+                current_line_ptr[edit_cursor_col] = '\0';
+                // Move cursor to the new line
                 edit_current_line++;
                 edit_cursor_col = 0;
-            }
-        } else if (c == '\n') { // Enter key
-            char* right_part = new char[current_len - edit_cursor_col + 1];
-            strcpy(right_part, &current_line_ptr[edit_cursor_col]);
-            current_line_ptr[edit_cursor_col] = '\0';
-
-            char** new_lines = new char*[edit_line_count + 1];
-            for(int i = 0; i <= edit_current_line; ++i) new_lines[i] = edit_lines[i];
-            new_lines[edit_current_line + 1] = right_part;
-            for(int i = edit_current_line + 1; i < edit_line_count; ++i) new_lines[i+1] = edit_lines[i];
-
-            delete[] edit_lines;
-            edit_lines = new_lines;
-            edit_line_count++;
-            edit_current_line++;
-            edit_cursor_col = 0;
-
-            if (edit_current_line >= edit_scroll_offset + 35) {
-                edit_scroll_offset++;
-            }
-
-        } else if (c == '\b') { // Backspace
-            if (edit_cursor_col > 0) {
-                memmove(&current_line_ptr[edit_cursor_col - 1], &current_line_ptr[edit_cursor_col], current_len - edit_cursor_col + 1);
-                edit_cursor_col--;
-            } else if (edit_current_line > 0) {
-                // Join with previous line
-                int prev_line_idx = edit_current_line - 1;
-                char* prev_line_ptr = edit_lines[prev_line_idx];
-                int prev_len = strlen(prev_line_ptr);
-
-                if (prev_len + current_len < TERM_WIDTH -1) {
-                    strcat(prev_line_ptr, current_line_ptr);
-                    delete[] current_line_ptr;
-
-                    memmove(&edit_lines[edit_current_line], &edit_lines[edit_current_line + 1], (edit_line_count - edit_current_line - 1) * sizeof(char*));
-                    edit_line_count--;
-                    edit_current_line--;
-                    edit_cursor_col = prev_len;
+            } else if (c == '\b') { // Backspace
+                if (edit_cursor_col > 0) { // Backspace within a line
+                    memmove(&current_line_ptr[edit_cursor_col - 1], &current_line_ptr[edit_cursor_col], current_len - edit_cursor_col + 1);
+                    edit_cursor_col--;
+                } else if (edit_current_line > 0) { // Backspace at start of line (join)
+                    int prev_line_idx = edit_current_line - 1;
+                    char* prev_line_ptr = edit_lines[prev_line_idx];
+                    int prev_len = strlen(prev_line_ptr);
+                    if (prev_len + current_len < TERM_WIDTH - 1) {
+                        strcat(prev_line_ptr, current_line_ptr);
+                        editor_delete_line_at(edit_current_line);
+                        edit_current_line = prev_line_idx;
+                        edit_cursor_col = prev_len;
+                    }
+                }
+            } else if (c >= 32 && c < 127) { // Printable characters
+                if (current_len < TERM_WIDTH - 2) {
+                    memmove(&current_line_ptr[edit_cursor_col + 1], &current_line_ptr[edit_cursor_col], current_len - edit_cursor_col + 1);
+                    current_line_ptr[edit_cursor_col] = c;
+                    edit_cursor_col++;
                 }
             }
-        } else if (c >= 32 && c < 127) { // Printable characters
-            if (current_len < TERM_WIDTH - 2) {
-                memmove(&current_line_ptr[edit_cursor_col + 1], &current_line_ptr[edit_cursor_col], current_len - edit_cursor_col + 1);
-                current_line_ptr[edit_cursor_col] = c;
-                edit_cursor_col++;
-            }
-        }
-    } else {
-        // --- WORKING TERMINAL PROMPT LOGIC ---
-        if (c == '\n') {
-            prompt_visual_lines = 0; // Finalize prompt
-            handle_command();
-            line_pos = 0;
-            current_line[0] = '\0';
-            update_prompt_display();
-        } else if (c == '\b') {
-            if (line_pos > 0) {
-                line_pos--;
+            // Clamp cursor and ensure it's visible after any operation
+            editor_clamp_cursor_to_line();
+            editor_ensure_cursor_visible();
+        } else {
+            // ... (non-editor terminal logic remains the same) ...
+            if (c == '\n') {
+                prompt_visual_lines = 0;
+                handle_command();
+                line_pos = 0;
+                current_line[0] = '\0';
+                update_prompt_display();
+            } else if (c == '\b') {
+                if (line_pos > 0) {
+                    line_pos--;
+                    current_line[line_pos] = 0;
+                }
+                update_prompt_display();
+            } else if (c >= 32 && c < 127 && line_pos < TERM_WIDTH - 2) {
+                current_line[line_pos++] = c;
                 current_line[line_pos] = 0;
+                update_prompt_display();
             }
-            update_prompt_display();
-        } else if (c >= 32 && c < 127 && line_pos < TERM_WIDTH - 2) {
-            current_line[line_pos++] = c;
-            current_line[line_pos] = 0;
-            update_prompt_display();
         }
     }
-}
-
 
     void update() override {}
 
