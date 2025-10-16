@@ -13,12 +13,12 @@ use VMware (other-64bit) with SATA drive, port 0
 
 Optional:
 
-# 1️ Make a place for compiler sources
+# 2 Make a place for compiler sources
 mkdir -p ~/opt/cross
 
 cd ~/opt/cross
 
-# 2️ Download Binutils and GCC
+# 3 Download Binutils and GCC
 wget https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.xz
 
 wget https://ftp.gnu.org/gnu/gcc/gcc-14.1.0/gcc-14.1.0.tar.xz
@@ -27,7 +27,7 @@ tar -xf binutils-2.43.tar.xz
 
 tar -xf gcc-14.2.0.tar.xz
 
-# 3 Build binutils
+# 4 Build binutils
 
 mkdir build-binutils
 
@@ -41,7 +41,7 @@ sudo make install
 
 cd ..
 
-# 4 Build GCC
+# 5 Build GCC
 
 mkdir build-gcc
 
