@@ -15,30 +15,46 @@ Optional:
 
 # 1️ Make a place for compiler sources
 mkdir -p ~/opt/cross
+
 cd ~/opt/cross
 
 # 2️ Download Binutils and GCC
 wget https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.xz
+
 wget https://ftp.gnu.org/gnu/gcc/gcc-14.1.0/gcc-14.1.0.tar.xz
 
 tar -xf binutils-2.43.tar.xz
+
 tar -xf gcc-14.2.0.tar.xz
 
 # 3 Build binutils
+
 mkdir build-binutils
+
 cd build-binutils
+
 ../binutils-2.43/configure --target=i686-elf --prefix=/usr/local/cross --with-sysroot --disable-nls --disable-werror
+
 make -j$(nproc)
+
 sudo make install
+
 cd ..
 
 # 4 Build GCC
+
 mkdir build-gcc
+
 cd build-gcc
+
 ../gcc-14.2.0/configure --target=i686-elf --prefix=/usr/local/cross --disable-nls --enable-languages=c,c++ --without-headers
+
 make all-gcc -j$(nproc)
+
 make all-target-libgcc -j$(nproc)
+
 sudo make install-gcc
+
 sudo make install-target-libgcc
 
 
