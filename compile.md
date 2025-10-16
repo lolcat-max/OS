@@ -43,9 +43,13 @@ sudo make install-target-libgcc
 
 
 export PATH="/usr/local/cross/bin:$PATH"
+
 export LIBRARY_PATH=/usr/lib/$(gcc -print-multiarch)
+
 export C_INCLUDE_PATH=/usr/include/$(gcc -print-multiarch)
+
 export CPLUS_INCLUDE_PATH=/usr/include/$(gcc -print-multiarch)
+
 
 i686-elf-gcc --version
 
