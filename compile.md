@@ -2,6 +2,15 @@ sudo apt update
 
 sudo apt install make gcc gcc-multilib binutils grub-common xorriso qemu-system-x86 build-essential nasm gcc binutils qemu-system-x86 xorriso grub-pc-bin mtools g++-multilib
 
+# 1 Kernel Build
+
+sudo make clean
+sudo make
+
+use VMware (other-64bit) with SATA drive, port 0
+
+
+Optional:
 
 # 1️ Make a place for compiler sources
 mkdir -p ~/opt/cross
@@ -39,8 +48,3 @@ export CPLUS_INCLUDE_PATH=/usr/include/$(gcc -print-multiarch)
 
 i686-elf-gcc --version
 
-# 5 Kernel Build
-
-sudo make
-
-use VMware (other-64bit) with SATA drive, port 0
