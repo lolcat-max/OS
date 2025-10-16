@@ -850,20 +850,21 @@ public:
                       num_desktop_items(0), dragging_icon_idx(-1), 
                       context_menu_active(false) {}
     void show_file_context_menu(int mx, int my, const char* filename) {
-        context_menu_active = true;
-        context_menu_x = mx;
-        context_menu_y = my;
-        current_context = CTX_EXPLORER_ITEM;
-        strncpy(context_file_path, filename, 127); // Store the filename for the action
-        num_context_menu_items = 0;
-        
-        if (strstr(filename, ".obj") != nullptr || strstr(filename, ".OBJ") != nullptr) {
-            context_menu_items[num_context_menu_items++] = "Run";
-        }
-        context_menu_items[num_context_menu_items++] = "Create Shortcut";
-        context_menu_items[num_context_menu_items++] = "Copy";
-        context_menu_items[num_context_menu_items++] = "Delete";
-    }
+		context_menu_active = true;
+		context_menu_x = mx;
+		context_menu_y = my;
+		current_context = CTX_EXPLORER_ITEM;
+		strncpy(context_file_path, filename, 127); // Store the filename for the action
+		num_context_menu_items = 0;
+		
+		if (strstr(filename, ".obj") != nullptr || strstr(filename, ".OBJ") != nullptr) {
+			context_menu_items[num_context_menu_items++] = "Run";
+		}
+		context_menu_items[num_context_menu_items++] = "Edit"; // ADDED THIS LINE
+		context_menu_items[num_context_menu_items++] = "Create Shortcut";
+		context_menu_items[num_context_menu_items++] = "Copy";
+		context_menu_items[num_context_menu_items++] = "Delete";
+	}
     // New: Load desktop items from filesystem
     // In WindowManager class
 void load_desktop_items() {
@@ -5678,82 +5679,74 @@ public:
         update_prompt_display();
     }
 };
-
 void WindowManager::execute_context_menu_action(int item_index) {
     if (item_index < 0 || item_index >= num_context_menu_items) return;
     const char* action = context_menu_items[item_index];
 
     if (current_context == CTX_DESKTOP) {
-        if (strcmp(action, "New Shortcut") == 0) {
-            // Creates a file named new.lnk containing "run program.elf"
-            fat32_write_file("/desktop/new.lnk", "run program.obj", 15);
-            load_desktop_items(); // Reloads desktop to show the new icon
-        } if (strcmp(action, "File Explorer") == 0) {
+        if (strcmp(action, "File Explorer") == 0) {
             launch_new_explorer();
-        } else if (strcmp(action, "New Shortcut") == 0) {
-            fat32_write_file("shortcut.lnk", "run program.obj", 15); // Create in root
-            load_desktop_items(); // Refresh desktop
         } else if (strcmp(action, "Paste") == 0) {
             if (g_clipboard_buffer[0] != '\0') {
                 const char* src_path = g_clipboard_buffer;
                 const char* filename = strrchr(src_path, '/');
-                filename = filename ? filename + 1 : src_path; // Get filename from path
+                filename = filename ? filename + 1 : src_path;
                 
                 char new_name[32] = "copy_of_";
-                strncat(new_name, filename, 22); // Create a new name for the copy
+                strncat(new_name, filename, 22);
 
-                fat32_copy_file(src_path, new_name); // Copy to root
-                load_desktop_items(); // Refresh desktop
+                fat32_copy_file(src_path, new_name);
+                load_desktop_items();
             }
         }
-    }// In WindowManager::execute_context_menu_action
-		else if (current_context == CTX_ICON) {
+    }
+    else if (current_context == CTX_ICON) {
         DesktopItem& item = desktop_items[context_icon_idx];
         
-        // --- ADD THIS BLOCK ---
         if (strcmp(action, "Run") == 0) {
             char command_buffer[128];
             snprintf(command_buffer, 128, "run %s", item.name);
             launch_terminal_with_command(command_buffer);
-        } 
-        // --- END ADDITION ---
-else if (current_context == CTX_EXPLORER_ITEM) {
-        const char* filename = context_file_path;
-
-        if (strcmp(action, "Create Shortcut") == 0) {
-            char shortcut_name[32];
-            char shortcut_content[128];
-            
-            // Create shortcut name (e.g., "myprog.lnk")
-            strncpy(shortcut_name, filename, 27);
-            char* dot = strrchr(shortcut_name, '.');
-            if (dot) *dot = '\0'; // Remove original extension
-            strcat(shortcut_name, ".lnk");
-
-            // Create shortcut content (e.g., "run myprog.obj")
-            snprintf(shortcut_content, 128, "run %s", filename);
-
-            fat32_write_file(shortcut_name, shortcut_content, strlen(shortcut_content));
-            load_desktop_items(); // Refresh desktop to show the new shortcut
-        } 
-        else if (strcmp(action, "Run") == 0) {
-             char command_buffer[128];
-             snprintf(command_buffer, 128, "run %s", filename);
-             launch_terminal_with_command(command_buffer);
-        }
-        // Add Copy/Delete logic for explorer items here if desired
-    }
-        else if (strcmp(action, "Copy") == 0) {
+        } else if (strcmp(action, "Edit") == 0) {
+            char command_buffer[128];
+            snprintf(command_buffer, 128, "edit \"%s\"", item.name);
+            launch_terminal_with_command(command_buffer);
+        } else if (strcmp(action, "Copy") == 0) {
             strncpy(g_clipboard_buffer, item.path, 1023);
         } else if (strcmp(action, "Delete") == 0) {
             fat32_remove_file(item.path);
-            load_desktop_items(); // Reload icons
+            load_desktop_items();
         }
+    }
+    else if (current_context == CTX_EXPLORER_ITEM) {
+        const char* filename = context_file_path;
+
+        if (strcmp(action, "Run") == 0) {
+            char command_buffer[128];
+            snprintf(command_buffer, 128, "run %s", filename);
+            launch_terminal_with_command(command_buffer);
+        } else if (strcmp(action, "Edit") == 0) {
+            char command_buffer[128];
+            snprintf(command_buffer, 128, "edit \"%s\"", filename);
+            launch_terminal_with_command(command_buffer);
+        } else if (strcmp(action, "Create Shortcut") == 0) {
+            char shortcut_name[32];
+            char shortcut_content[128];
+            
+            strncpy(shortcut_name, filename, 27);
+            char* dot = strrchr(shortcut_name, '.');
+            if (dot) *dot = '\0';
+            strcat(shortcut_name, ".lnk");
+
+            snprintf(shortcut_content, 128, "run %s", filename);
+
+            fat32_write_file(shortcut_name, shortcut_content, strlen(shortcut_content));
+            load_desktop_items();
+        } 
     }
 
     context_menu_active = false;
 }
-
 
 void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool left_clicked, bool right_clicked) {
     // --- Static variables to track double-clicks ---
@@ -5801,7 +5794,6 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
     }
     
     // --- 3. Handle Right Clicks (Opening Context Menu) ---
-    // --- 3. Handle Right Clicks (Opening Context Menu) ---
     if (right_clicked) {
 		if (focused_idx != -1) {
             Window* win = windows[focused_idx];
@@ -5834,6 +5826,7 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
                 context_menu_items[num_context_menu_items++] = "Run";
             }
             
+            context_menu_items[num_context_menu_items++] = "Edit"; // ADDED THIS LINE
             context_menu_items[num_context_menu_items++] = "Copy";
             context_menu_items[num_context_menu_items++] = "Delete";
 
@@ -5877,12 +5870,10 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
                 my >= desktop_items[i].y && my < desktop_items[i].y + 45) {
 
                 // Check for a double-click
-                // Check for a double-click
                 if (last_click_icon_idx == i && (g_timer_ticks - last_click_tick) < DOUBLE_CLICK_SPEED) {
                     // Double-click detected!
                     DesktopItem& item = desktop_items[i]; // Use a reference for cleaner code
 
-                    // In WindowManager::handle_input, inside the double-click check
 					if (strcmp(item.path, "explorer.app") == 0) {
 						launch_new_explorer();
 					} 
@@ -5892,12 +5883,6 @@ void WindowManager::handle_input(char key, int mx, int my, bool left_down, bool 
 						snprintf(command_buffer, 128, "run %s", item.name);
 						launch_terminal_with_command(command_buffer);
 					}
-                    // ADD THIS LOGIC FOR .obj FILES
-                    else if (strstr(item.name, ".obj") != nullptr || strstr(item.name, ".OBJ") != nullptr) {
-                        char command_buffer[128];
-                        snprintf(command_buffer, 128, "run %s", item.name);
-                        launch_terminal_with_command(command_buffer);
-                    }
                     
                     // Reset double-click tracking
                     last_click_tick = 0;
