@@ -5,6 +5,7 @@ sudo apt install make gcc gcc-multilib binutils grub-common xorriso qemu-system-
 # 1 Kernel Build
 
 sudo make clean
+
 sudo make
 
 use VMware (other-64bit) with SATA drive, port 0
