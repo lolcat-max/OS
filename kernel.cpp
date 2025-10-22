@@ -2862,6 +2862,7 @@ void chkdsk_full_scan(bool fix = false) {
 }
 
 
+#include <cstdarg>    // For va_list in printf
 
 // =============================================================================
 // SECTION 6: SELF-HOSTED C COMPILER
@@ -2871,10 +2872,24 @@ void chkdsk_full_scan(bool fix = false) {
 extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename);
 extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename);
 extern "C" void cmd_exec(const char* code_text);
+struct HardwareDevice {
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint64_t base_address;
+    uint64_t size;
+    uint32_t device_type;  // 0=Unknown, 1=Storage, 2=Network, 3=Graphics, 4=Audio, 5=USB
+    char description[64];
+};
+// --- Global Hardware Registry Definition ---
+const int MAX_HARDWARE_DEVICES = 32; // Define the constant
+HardwareDevice hardware_registry[MAX_HARDWARE_DEVICES];
+int hardware_count = 0;
 
-// Provided by the command shell tokenizer
+// Define shell parts variables (as declared extern in the header)
+// These will be populated by the terminal handler in kernel.cpp
 char* parts[32];
-int     part_count;
+int   part_count = 0;
+
 
 // ---- tiny helpers ----
 static inline int tcc_is_digit(char c){ return c>='0' && c<='9'; }
@@ -3097,43 +3112,6 @@ void int_to_string(int value, char* buffer) {
 static char file_buffer[65536]; // 64KB file buffer
 
 
-
-// ============================================================
-// PCI Device Configuration Functions
-// ============================================================
-
-uint32_t pci_read_dword(uint16_t bus, uint8_t device, uint8_t function, uint8_t offset) {
-    // Create configuration address
-    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | 
-                       ((uint32_t)device << 11) | ((uint32_t)function << 8) | 
-                       (offset & 0xFC);
-    
-    // Write to CONFIG_ADDRESS port (0xCF8)
-    asm volatile("outl %0, %w1" : : "a"(address), "Nd"(0xCF8) : "memory");
-    
-    // Read from CONFIG_DATA port (0xCFC)
-    uint32_t result;
-    asm volatile("inl %w1, %0" : "=a"(result) : "Nd"(0xCFC) : "memory");
-    
-    return result;
-}
-
-uint32_t pci_write_dword(uint16_t bus, uint8_t device, uint8_t function, 
-                         uint8_t offset, uint32_t value) {
-    // Create configuration address
-    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | 
-                       ((uint32_t)device << 11) | ((uint32_t)function << 8) | 
-                       (offset & 0xFC);
-    
-    // Write to CONFIG_ADDRESS port (0xCF8)
-    asm volatile("outl %0, %w1" : : "a"(address), "Nd"(0xCF8) : "memory");
-    
-    // Write to CONFIG_DATA port (0xCFC)
-    asm volatile("outl %0, %w1" : : "a"(value), "Nd"(0xCFC) : "memory");
-    
-    return value;
-}
-
 // ============================================================
 // Memory Management (new/delete operators)
 // ============================================================
@@ -3251,22 +3229,9 @@ static uint32_t pci_config_read_dword(uint16_t bus, uint8_t device, uint8_t func
     return result;
 }
 
-// ============================================================
-// Hardware Interface Discovery Structures
-// ============================================================
-struct HardwareDevice {
-    uint32_t vendor_id;
-    uint32_t device_id;
-    uint64_t base_address;
-    uint64_t size;
-    uint32_t device_type;  // 0=Unknown, 1=Storage, 2=Network, 3=Graphics, 4=Audio, 5=USB
-    char description[64];
-};
 
-// Global hardware registry
-static const int MAX_HARDWARE_DEVICES = 32;
-static HardwareDevice hardware_registry[MAX_HARDWARE_DEVICES];
-static int hardware_count = 0;
+
+// Global hardware_registry and hardware_count are defined at the top of the file.
 
 // More comprehensive PCI class codes
 static const char* get_pci_class_name(uint8_t base_class, uint8_t sub_class) {
@@ -3493,16 +3458,16 @@ enum TOp : unsigned char {
     T_STR_STARTS_WITH, T_STR_ENDS_WITH, T_STR_COUNT_CHAR, T_STR_REPLACE_CHAR,
 
     // NEW: Hardware Discovery and Memory-Mapped I/O
-    T_SCAN_HARDWARE,     // () -> device_count
-    T_GET_DEVICE_INFO,   // (device_index) -> device_array_handle
-    T_MMIO_READ8,        // (address) -> uint8_value
-    T_MMIO_READ16,       // (address) -> uint16_value
-    T_MMIO_READ32,       // (address) -> uint32_value
-    T_MMIO_READ64,       // (address) -> uint64_value (split into two 32-bit values)
-    T_MMIO_WRITE8,       // (address, value) -> success
-    T_MMIO_WRITE16,      // (address, value) -> success
-    T_MMIO_WRITE32,      // (address, value) -> success
-    T_MMIO_WRITE64,      // (address, low32, high32) -> success
+    T_SCAN_HARDWARE,      // () -> device_count
+    T_GET_DEVICE_INFO,    // (device_index) -> device_array_handle
+    T_MMIO_READ8,         // (address) -> uint8_value
+    T_MMIO_READ16,        // (address) -> uint16_value
+    T_MMIO_READ32,        // (address) -> uint32_value
+    T_MMIO_READ64,        // (address) -> uint64_value (split into two 32-bit values)
+    T_MMIO_WRITE8,        // (address, value) -> success
+    T_MMIO_WRITE16,       // (address, value) -> success
+    T_MMIO_WRITE32,       // (address, value) -> success
+    T_MMIO_WRITE64,       // (address, low32, high32) -> success
     T_GET_HARDWARE_ARRAY, // () -> hardware_device_array_handle
     T_DISPLAY_MEMORY_MAP // () -> displays formatted memory map
 };
@@ -3582,8 +3547,8 @@ struct TLex {
             pos += 2;
             t.v[i++] = '0'; t.v[i++] = 'x';
             while(i < 63 && ((src[pos] >= '0' && src[pos] <= '9') ||
-                              (src[pos] >= 'a' && src[pos] <= 'f') ||
-                              (src[pos] >= 'A' && src[pos] <= 'F'))) {
+                             (src[pos] >= 'a' && src[pos] <= 'f') ||
+                             (src[pos] >= 'A' && src[pos] <= 'F'))) {
                 char c = src[pos];
                 t.v[i++] = c;
                 if(c >= '0' && c <= '9') t.ival = t.ival * 16 + (c - '0');
@@ -3602,13 +3567,13 @@ struct TLex {
         while(tcc_is_alnum(src[pos])){ t.v[i++]=src[pos++]; if(i>=63) break; } t.v[i]=0;
         // Enhanced keywords with hardware and MMIO functions
         const char* kw[]={"int","char","string","return","if","else","while","break","continue",
-                         "cin","cout","endl","argc","argv","read_file","write_file","append_file",
-                         "array_size","array_resize","str_length","str_substr","int_to_str","str_compare",
-                         "str_find_char","str_find_str","str_find_last_char","str_contains",
-                         "str_starts_with","str_ends_with","str_count_char","str_replace_char",
-                         "scan_hardware","get_device_info","get_hardware_array","display_memory_map",
-                         "mmio_read8","mmio_read16","mmio_read32","mmio_read64",
-                         "mmio_write8","mmio_write16","mmio_write32","mmio_write64",0};
+                          "cin","cout","endl","argc","argv","read_file","write_file","append_file",
+                          "array_size","array_resize","str_length","str_substr","int_to_str","str_compare",
+                          "str_find_char","str_find_str","str_find_last_char","str_contains",
+                          "str_starts_with","str_ends_with","str_count_char","str_replace_char",
+                          "scan_hardware","get_device_info","get_hardware_array","display_memory_map",
+                          "mmio_read8","mmio_read16","mmio_read32","mmio_read64",
+                          "mmio_write8","mmio_write16","mmio_write32","mmio_write64",0};
         for(int k=0; kw[k]; ++k){ if(simple_strcmp(t.v,kw[k])==0){ t.t=TT_KW; break; } }
         return t;
     }
@@ -3874,8 +3839,8 @@ struct TCompiler {
                     }
 
                     pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);      // 1. Push handle
-                    pr.emit1(T_PUSH_IMM); pr.emit4(i);          // 2. Push index
-                    parse_expression();                         // 3. Push value
+                    pr.emit1(T_PUSH_IMM); pr.emit4(i);        // 2. Push index
+                    parse_expression();                       // 3. Push value
                     pr.emit1(T_STORE_ARRAY);                    // 4. Store
                     i++;
                 } while(accept(","));
@@ -3968,11 +3933,11 @@ struct TCompiler {
             if(tk.t==TT_PUNC && tk.v[0]=='['){
                 pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);  // 1. Push handle
                 adv(); // past '['
-                parse_expression();                    // 2. Push index
+                parse_expression();                      // 2. Push index
                 expect("]");
                 expect("=");
-                parse_expression();                    // 3. Push value
-                pr.emit1(T_STORE_ARRAY);               // 4. Store
+                parse_expression();                      // 3. Push value
+                pr.emit1(T_STORE_ARRAY);                    // 4. Store
                 expect(";");
                 return;
             }
@@ -4370,8 +4335,8 @@ struct TinyVM {
         arr->data[1] = dev.device_id;
         arr->data[2] = (uint32_t)(dev.base_address & 0xFFFFFFFF);      // low 32 bits
         arr->data[3] = (uint32_t)((dev.base_address >> 32) & 0xFFFFFFFF); // high 32 bits
-        arr->data[4] = (uint32_t)(dev.size & 0xFFFFFFFF);              // size low 32 bits
-        arr->data[5] = (uint32_t)((dev.size >> 32) & 0xFFFFFFFF);      // size high 32 bits
+        arr->data[4] = (uint32_t)(dev.size & 0xFFFFFFFF);            // size low 32 bits
+        arr->data[5] = (uint32_t)((dev.size >> 32) & 0xFFFFFFFF);    // size high 32 bits
         arr->data[6] = dev.device_type;
 
         return handle;
@@ -4756,7 +4721,7 @@ struct TinyVM {
 
                 case T_DISPLAY_MEMORY_MAP: {
                     printf("\n=== System Memory Map ===\n");
-                    printf("Address Range                                | Size      | Device Type | Description\n");
+                    printf("Address Range                                  | Size      | Device Type | Description\n");
                     printf("--------------------------------|----------|-------------|------------------\n");
 
                     for(int i = 0; i < hardware_count; i++) {
@@ -4773,12 +4738,12 @@ struct TinyVM {
                         // Device type
                         printf(" | ");
                         switch(dev.device_type) {
-                            case 1: printf("Storage    "); break;
-                            case 2: printf("Network    "); break;
-                            case 3: printf("Graphics   "); break;
-                            case 4: printf("Audio      "); break;
-                            case 5: printf("USB        "); break;
-                            default: printf("Unknown    "); break;
+                            case 1: printf("Storage   "); break;
+                            case 2: printf("Network   "); break;
+                            case 3: printf("Graphics  "); break;
+                            case 4: printf("Audio     "); break;
+                            case 5: printf("USB       "); break;
+                            default: printf("Unknown   "); break;
                         }
 
                         printf(" | %s\n", dev.description);
@@ -4894,7 +4859,7 @@ static int load(uint64_t base, int port, const char* path, TProgram& P){
     }
 
     // The original buggy line is no longer needed.
-    // int n = tcc_strlen(buf); 
+    // int n = tcc_strlen(buf);  
 
     if (n < 16) { 
         delete[] buf; 
@@ -5040,11 +5005,6 @@ char* get_arg(char* args, int n) {
     }
     return arg_start;
 }
-
-
-
-
-
 
 
 // =============================================================================
