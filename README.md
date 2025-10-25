@@ -15,4 +15,4 @@ self hosted compiler features these commands:
 "mmio_write8","mmio_write16","mmio_write32","mmio_write64"
 
 
-TODO: more GUI features, reduce compiler limitations, implement smp.
+TODO: more GUI features, fix cin, implement smp.
