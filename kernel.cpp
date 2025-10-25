@@ -2978,6 +2978,7 @@ void console_print_char(char c) {
             win->console_print(buf);
         }
     } else {
+        vga_print_char(c);
     }
 }
 
@@ -2993,6 +2994,79 @@ void console_print(const char* str) {
     } else {
         vga_print(str);
     }
+}
+
+// CORRECTED: Non-blocking get_char with fallback
+static char pending_char = 0;
+
+char get_char() {
+    // Check if we have a pending character from previous call
+    if (pending_char != 0) {
+        char c = pending_char;
+        pending_char = 0;
+        return c;
+    }
+
+    // Non-blocking read from keyboard
+    while (1) {
+        uint8_t status = inb(0x64);
+        if (status & 0x01) { // Data available
+            uint8_t scancode = inb(0x60);
+
+            // Simple scancode to ASCII conversion (US keyboard layout)
+            static const char scancode_map[] = {
+                0,   27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', '\t',
+                'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0, 'a', 's',
+                'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\', 'z', 'x', 'c', 'v',
+                'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
+            };
+
+            if (scancode < sizeof(scancode_map)) {
+                char c = scancode_map[scancode];
+                if (c != 0) {
+                    vga_print_char(c);
+                    return c;
+                }
+            }
+        } else {
+            // No data available - return a null character
+            // The caller should handle this and retry if needed
+            return 0;
+        }
+    }
+}
+
+// CORRECTED: read_line with timeout and proper handling
+static void read_line(char* buffer, int max_len) {
+    int i = 0;
+    int timeout_count = 0;
+    const int TIMEOUT_THRESHOLD = 100000; // Prevent infinite wait
+
+    while (i < max_len - 1 && timeout_count < TIMEOUT_THRESHOLD) {
+        char c = get_char();
+
+        if (c == 0) {
+            // No character available, continue waiting
+            timeout_count++;
+            continue;
+        }
+
+        timeout_count = 0; // Reset timeout on character received
+
+        if (c == '\n' || c == '\r') {
+            break;
+        }
+        if (c == '\b') {
+            if (i > 0) {
+                i--;
+            }
+        } else if (c >= 32 && c <= 126) {
+            buffer[i++] = c;
+        }
+    }
+
+    buffer[i] = 0;
+    vga_print_char('\n');
 }
 
 // ============================================================
@@ -3029,6 +3103,47 @@ void int_to_string(int value, char* buffer) {
     buffer[j] = 0;
 }
 
+
+// ============================================================
+// File I/O Functions (FAT32 Support)
+// ============================================================
+
+// Simplified file buffer for storage
+static char file_buffer[65536]; // 64KB file buffer
+
+
+// ============================================================
+// Memory Management (new/delete operators)
+// ============================================================
+
+// Simple heap allocator
+static unsigned char heap[1048576]; // 1MB heap
+static int heap_offset = 0;
+
+
+void simple_strcpy(char* dest, const char* src) {
+    while (*src) {
+        *dest++ = *src++;
+    }
+    *dest = '\0';
+}
+
+int simple_strcmp(const char* s1, const char* s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+void* simple_memcpy(void* dest, const void* src, int n) {
+    char* d = (char*)dest;
+    const char* s = (const char*)src;
+    while (n--) {
+        *d++ = *s++;
+    }
+    return dest;
+}
 // Basic printf implementation
 void printf(const char* format, ...) {
     va_list args;
@@ -3079,141 +3194,6 @@ void printf(const char* format, ...) {
     }
 
     va_end(args);
-}
-// CORRECTED: Non-blocking get_char with fallback
-static char pending_char = 0;
-
-void swap_buffers() {
-    if (fb_info.ptr && backbuffer) {
-        uint32_t* dest = fb_info.ptr;
-        uint32_t* src = backbuffer;
-        size_t count = fb_info.width * fb_info.height;
-
-        asm volatile (
-            "rep movsl"
-            : "=S"(src), "=D"(dest), "=c"(count)
-            : "S"(src), "D"(dest), "c"(count)
-            : "memory"
-        );
-    }
-}
-char get_char() {
-    // Check if we have a pending character from previous call
-    if (pending_char != 0) {
-        char c = pending_char;
-        pending_char = 0;
-        return c;
-    }
-
-    // Non-blocking read from keyboard
-    while (1) {
-		
-        uint8_t status = inb(0x64);
-        if (status & 0x01) { // Data available
-		
-            uint8_t scancode = inb(0x60);
-
-            // Simple scancode to ASCII conversion (US keyboard layout)
-            static const char scancode_map[] = {
-                0,   27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', '\t',
-                'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0, 'a', 's',
-                'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\', 'z', 'x', 'c', 'v',
-                'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
-            };
-
-            if (scancode < sizeof(scancode_map)) {
-                char c = scancode_map[scancode];
-                if (c != 0) {
-                    console_print_char(c);
-					wm.update_all();
-					swap_buffers();
-                    return c;
-                }
-            }
-			
-        } else {
-            // No data available - return a null character
-            // The caller should handle this and retry if needed
-            return 0;
-        }
-
-    }
-}
-
-// CORRECTED: read_line with timeout and proper handling
-static void read_line(char* buffer, int max_len) {
-    int i = 0;
-    int timeout_count = 0;
-    const int TIMEOUT_THRESHOLD = 100000; // Prevent infinite wait
-
-    while (i < max_len - 1/* && timeout_count < TIMEOUT_THRESHOLD*/) {
-        char c = get_char();
-		wm.update_all();
-		swap_buffers();
-        if (c == 0) {
-            // No character available, continue waiting
-            timeout_count++;
-            continue;
-        }
-
-        timeout_count = 0; // Reset timeout on character received
-
-        if (c == '\n' || c == '\r') {
-            break;
-        }
-        if (c == '\b') {
-            if (i > 0) {
-                i--;
-            }
-        } else if (c >= 32 && c <= 126) {
-            buffer[i++] = c;
-        }
-    }
-
-    buffer[i] = 0;
-
-}
-
-
-// ============================================================
-// File I/O Functions (FAT32 Support)
-// ============================================================
-
-// Simplified file buffer for storage
-static char file_buffer[65536]; // 64KB file buffer
-
-
-// ============================================================
-// Memory Management (new/delete operators)
-// ============================================================
-
-// Simple heap allocator
-static unsigned char heap[1048576]; // 1MB heap
-static int heap_offset = 0;
-
-
-void simple_strcpy(char* dest, const char* src) {
-    while (*src) {
-        *dest++ = *src++;
-    }
-    *dest = '\0';
-}
-
-int simple_strcmp(const char* s1, const char* s2) {
-    while (*s1 && (*s1 == *s2)) {
-        s1++;
-        s2++;
-    }
-    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
-}
-
-void* simple_memcpy(void* dest, const void* src, int n) {
-    char* d = (char*)dest;
-    const char* s = (const char*)src;
-    while (n--) {
-        *d++ = *s++;
-    }
-    return dest;
 }
 
 
@@ -4401,23 +4381,9 @@ struct TinyVM {
             }
         }
 
-        static uint32_t lastrefresh = 0;
-		int instructioncount = 0;
-		
-		while (ip < P->pc) {
-			TOp op = (TOp)P->code[ip++];
-			
-			// Refresh screen every ~100 instructions
-			if (++instructioncount % 1 == 0) {
-				uint32_t now = g_timer_ticks;
-				if (now - lastrefresh > 2) {  // ~40ms between updates
-					wm.update_all();
-					swap_buffers();
-					lastrefresh = now;
-				}
-			}
-		    switch(op){
-
+        while(ip < P->pc){
+            TOp op = (TOp)P->code[ip++];
+            switch(op){
                 case T_NOP: break;
                 case T_PUSH_IMM: { int v= *(int*)&P->code[ip]; ip+=4; push(v); } break;
                 case T_PUSH_STR: { int p= *(int*)&P->code[ip]; ip+=4; push(p); } break;
@@ -4844,34 +4810,12 @@ struct TinyVM {
 
                 case T_RET: { int rv=pop(); return rv; }
                 default: return -1;
-
             }
-			wm.update_all();
-			swap_buffers();
         }
-		
         return 0;
     }
 };
-// Compiler task state for multitasking
-struct CompilerTask {
-    enum State { IDLE, LEXING, PARSING, COMPILING, RUNNING } state;
-    const char* source;
-    int currentPhase;
-    int workUnitsCompleted;
-    bool hasError;
-    char errorMsg[256];
-    
-    CompilerTask() : state(IDLE), source(nullptr), currentPhase(0), 
-                     workUnitsCompleted(0), hasError(false) {
-        errorMsg[0] = '\0';
-    }
-};
 
-static CompilerTask gCompilerTask;
-// Forward declarations for compiler multitasking
-bool doCompilerWorkSlice();
-void startCompilationTask(const char* source);
 // ============================================================
 // Enhanced Object I/O (TVM3 - with hardware support)
 // ============================================================
@@ -5350,22 +5294,13 @@ void handle_command() {
     }
 
     if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
-    // In TerminalWindow::onkeypress or command handling
-			else if (strcmp(command, "exec") == 0) {
-		char* filename = get_arg(args, 0);
-		if (filename) {
-			char* content = fat32_read_file_as_string(filename);
-			if (content) {
-				startCompilationTask(content);
-				// Don't delete content yet - compiler task needs it
-			} else {
-				console_print("File not found.");
-			}
-		} else {
-			console_print("Usage: compile filename");
-		}
-	}
-	
+    if (strcmp(command, "compile") == 0) {
+        cmd_compile(ahci_base, selected_port, get_arg(args, 0));
+    } else if (strcmp(command, "run") == 0) {
+        cmd_run(ahci_base, selected_port, get_arg(args, 0));
+    } else if (strcmp(command, "exec") == 0) {
+        cmd_exec(get_arg(args, 0));
+    }
     else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
     else if (strcmp(command, "edit") == 0) {
@@ -5665,6 +5600,7 @@ public:
             } else if (c >= 32 && c < 127 && line_pos < TERM_WIDTH - 2) {
                 current_line[line_pos++] = c;
                 current_line[line_pos] = 0;
+                update_prompt_display();
             }
         }
     }
@@ -5688,6 +5624,7 @@ public:
             update_prompt_display();
         }
     }
+
 
     void console_print(const char* s) override {
         if (!s || in_editor) return;
@@ -5957,6 +5894,20 @@ void launch_terminal_with_command(const char* command) {
     static int win_count = 0;
     wm.add_window(new TerminalWindow(150 + (win_count++ % 10) * 30, 90 + (win_count % 10) * 30, command));
 }
+void swap_buffers() {
+    if (fb_info.ptr && backbuffer) {
+        uint32_t* dest = fb_info.ptr;
+        uint32_t* src = backbuffer;
+        size_t count = fb_info.width * fb_info.height;
+
+        asm volatile (
+            "rep movsl"
+            : "=S"(src), "=D"(dest), "=c"(count)
+            : "S"(src), "D"(dest), "c"(count)
+            : "memory"
+        );
+    }
+}
 
 static volatile bool g_evt_timer = false;
 static volatile bool g_evt_input = false;
@@ -5974,49 +5925,8 @@ static void init_screen_timer(uint16_t hz) {
     outb(0x40, divisor & 0xFF);
     outb(0x40, (divisor >> 8) & 0xFF);
 }
-// Simple time-sliced compilation - runs compiler across multiple frames
-bool doCompilerWorkSlice() {
-    if (gCompilerTask.state == CompilerTask::IDLE) {
-        return false;
-    }
 
-    if (gCompilerTask.state == CompilerTask::COMPILING) {
-        TCompiler C;
-        int ok = C.compile(gCompilerTask.source);
-        if (ok > 0) {
-            // Success - now run it
-            TinyVM vm;
-            static const char* argvv[1];
-            vm.run(C.pr, 0, argvv, ahci_base, g_ahci_port); // <-- Check this line
-            wm.print_to_focused("Execution complete.");
-        } else {
-            wm.print_to_focused("Compilation failed.");
-        }
-        
-        // Clean up
-        if (gCompilerTask.source) {
-            delete[] (char*)gCompilerTask.source;
-            gCompilerTask.source = nullptr;
-        }
-        gCompilerTask.state = CompilerTask::IDLE;
-    }
-    return true;
-}
 
-// Start a compilation task
-void startCompilationTask(const char* source) {
-    if (gCompilerTask.state != CompilerTask::IDLE) {
-        wm.print_to_focused("Compiler busy...");
-        return;
-    }
-    
-    gCompilerTask.source = source;
-    gCompilerTask.state = CompilerTask::COMPILING;
-    gCompilerTask.currentPhase = 0;
-    gCompilerTask.workUnitsCompleted = 0;
-    gCompilerTask.hasError = false;
-    wm.print_to_focused("Compilation queued...");
-}
 
 // =============================================================================
 // KERNEL MAIN - ATOMIC FRAME RENDERING
@@ -6105,9 +6015,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             g_evt_timer = true;
             g_timer_ticks++;
         }
-		if (poll_counter % 8 == 0) {
-			doCompilerWorkSlice();
-		}
+
         if (g_evt_input) {
             g_evt_input = false;
             bool leftClickedThisFrame = mouse_left_down && !mouse_left_last_frame;
@@ -6145,5 +6053,3 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         mouse_right_last_frame = mouse_right_down;
     }
 }
-
-
