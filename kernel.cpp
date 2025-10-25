@@ -5689,7 +5689,6 @@ public:
         }
     }
 
-
     void console_print(const char* s) override {
         if (!s || in_editor) return;
 
@@ -6146,4 +6145,5 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         mouse_right_last_frame = mouse_right_down;
     }
 }
+
 
