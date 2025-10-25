@@ -6004,7 +6004,6 @@ bool doCompilerWorkSlice() {
     return true;
 }
 
-
 // Start a compilation task
 void startCompilationTask(const char* source) {
     if (gCompilerTask.state != CompilerTask::IDLE) {
@@ -6147,3 +6146,4 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
         mouse_right_last_frame = mouse_right_down;
     }
 }
+
