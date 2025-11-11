@@ -22,6 +22,7 @@ typedef signed short int16_t;
 typedef signed int int32_t;
 typedef unsigned int uintptr_t;
 typedef unsigned int size_t;
+// Add this right after the existing CXX ABI section in your kernel.cpp
 
 // --- CXX ABI Stubs ---
 namespace __cxxabiv1 {
@@ -36,6 +37,19 @@ namespace __cxxabiv1 {
     class __si_class_type_info { virtual void dummy(); };
     void __si_class_type_info::dummy() {}
 }
+
+// Exception handling stubs
+extern "C" void __gxx_personality_v0() {
+    // Exception handling not supported - halt if called
+    asm volatile("cli; hlt");
+}
+
+extern "C" void _Unwind_Resume() {
+    // Stack unwinding not supported - halt if called
+    asm volatile("cli; hlt");
+}
+
+// Continue with rest of kernel code...
 
 // --- Forward Declarations ---
 class Window;
@@ -2862,7 +2876,6 @@ void chkdsk_full_scan(bool fix = false) {
 }
 
 
-
 // --- Command parsing helper ---
 char* get_arg(char* args, int n) {
     char* p = args;
@@ -3190,13 +3203,7 @@ void handle_command() {
     }
 
     if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
-    if (strcmp(command, "compile") == 0) {
-        cmd_compile(ahci_base, selected_port, get_arg(args, 0));
-    } else if (strcmp(command, "run") == 0) {
-        cmd_run(ahci_base, selected_port, get_arg(args, 0));
-    } else if (strcmp(command, "exec") == 0) {
-        cmd_exec(get_arg(args, 0));
-    }
+
     else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
     else if (strcmp(command, "edit") == 0) {
@@ -3931,7 +3938,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                 // =============================================================================
                 // ATOMIC FRAME RENDERING - PREVENTS ALL TRAILING AND TEARING
                 // =============================================================================
-                
                 g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
                 
                 wm.update_all();
