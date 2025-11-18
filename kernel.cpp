@@ -60,6 +60,9 @@ void launch_new_terminal();
 void launch_new_explorer(); // New
 void launch_terminal_with_command(const char* command); // ADD THIS LINE
 
+void handle_run_command(const char* filename, TerminalWindow* term);
+void bytevm_tick();  // ADD THIS TOO
+
 int fat32_write_file(const char* filename, const void* data, uint32_t size);
 int fat32_remove_file(const char* filename);
 char* fat32_read_file_as_string(const char* filename);
@@ -3294,6 +3297,20 @@ void handle_command() {
             }
         }
     }
+	
+	
+	else if (strcmp(command, "run") == 0) {
+	    char* filename = get_arg(args, 0);
+	    if (filename) {
+	        handle_run_command(filename, this);
+	    } else {
+	        console_print("Usage: run \"<filename>\"\n");
+	    }
+	}
+	
+	
+	
+	
     else if (strcmp(command, "mv") == 0) {
         char args_for_src[120];
         strncpy(args_for_src, args, 119);
@@ -3829,7 +3846,1191 @@ static void init_screen_timer(uint16_t hz) {
     outb(0x40, (divisor >> 8) & 0xFF);
 }
 
+/*
+ * BYTEVM - TICK-BASED C COMPILER AND VM
+ * ======================================
+ * Full C syntax support with tick-based execution
+ * Non-blocking cooperative multitasking
+ * 
+ * EXACT PLACEMENT IN YOUR KERNEL.CPP:
+ * ====================================
+ * 
+ * STEP 1: Find line ~60 with forward declarations. ADD THIS LINE:
+ * 
+ *         void handle_run_command(const char* filename, TerminalWindow* term);
+ *         void bytevm_tick();  // ADD THIS TOO
+ * 
+ * STEP 2: Find the END of chkdsk_full_scan() function (around line 1900)
+ *         IMPORTANT: Make sure you're OUTSIDE any class definition!
+ *         Look for a line with just "}" that closes a function, not a class.
+ *         ADD ALL THE CODE BELOW starting from "// BYTEVM INSTRUCTION SET"
+ * 
+ * STEP 3: In TerminalWindow::handle_command(), add the run command
+ * 
+ * STEP 4: In kernel_main() loop, after wm.update_all(), add: bytevm_tick();
+ */
 
+// =============================================================================
+// BYTEVM INSTRUCTION SET
+// =============================================================================
+
+enum VMOpcode : uint8_t {
+    OP_PUSH = 0x01, OP_POP, OP_DUP, OP_SWAP,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_NEG,
+    OP_AND, OP_OR, OP_XOR, OP_NOT, OP_SHL, OP_SHR,
+    OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE,
+    OP_JMP, OP_JZ, OP_JNZ, OP_CALL, OP_RET,
+    OP_LOAD, OP_STORE, OP_LOADL, OP_STOREL, OP_LOADG, OP_STOREG,
+    OP_PRINT, OP_SETPIXEL, OP_GETPIXEL, OP_DELAY, OP_GETKEY,
+    OP_NOP, OP_HALT, OP_YIELD, OP_FRAME_START, OP_FRAME_END
+};
+
+struct VMInstruction {
+    VMOpcode op;
+    int32_t arg;
+    VMInstruction() : op(OP_NOP), arg(0) {}
+    VMInstruction(VMOpcode o, int32_t a = 0) : op(o), arg(a) {}
+};
+
+// =============================================================================
+// TICK-BASED VIRTUAL MACHINE
+// =============================================================================
+
+class ByteVM {
+private:
+    static constexpr int STACK_SIZE = 2048;
+    static constexpr int MEMORY_SIZE = 8192;
+    static constexpr int MAX_INSTRUCTIONS = 4096;
+    static constexpr int INSTRUCTIONS_PER_TICK = 500;
+    
+    int32_t stack[STACK_SIZE];
+    int32_t memory[MEMORY_SIZE];
+    VMInstruction* program;
+    int program_size;
+    int pc, sp, bp;
+    int call_stack[64];
+    int call_sp;
+    bool running, halted, error;
+    char error_msg[128];
+    int instructions_this_tick;
+    uint32_t delay_until;
+    TerminalWindow* output_terminal;
+    
+    void push(int32_t val) {
+        if (sp >= STACK_SIZE) { set_error("Stack overflow"); return; }
+        stack[sp++] = val;
+    }
+    
+    int32_t pop() {
+        if (sp <= 0) { set_error("Stack underflow"); return 0; }
+        return stack[--sp];
+    }
+    
+    void set_error(const char* msg) {
+        error = true;
+        running = false;
+        strncpy(error_msg, msg, 127);
+        if (output_terminal) {
+            char buf[150];
+            snprintf(buf, 150, "VM ERROR at PC=%d: %s\n", pc, msg);
+            output_terminal->console_print(buf);
+        }
+    }
+    
+    void execute_instruction() {
+        if (pc < 0 || pc >= program_size) { set_error("PC out of bounds"); return; }
+        
+        VMInstruction& inst = program[pc++];
+        
+        switch (inst.op) {
+            case OP_PUSH: push(inst.arg); break;
+            case OP_POP: pop(); break;
+            case OP_DUP: push(stack[sp-1]); break;
+            case OP_SWAP: { int32_t a = pop(), b = pop(); push(a); push(b); break; }
+            
+            case OP_ADD: { int32_t b = pop(), a = pop(); push(a + b); break; }
+            case OP_SUB: { int32_t b = pop(), a = pop(); push(a - b); break; }
+            case OP_MUL: { int32_t b = pop(), a = pop(); push(a * b); break; }
+            case OP_DIV: { 
+                int32_t b = pop(), a = pop(); 
+                if (b == 0) { set_error("Division by zero"); return; }
+                push(a / b); 
+                break; 
+            }
+            case OP_MOD: { 
+                int32_t b = pop(), a = pop(); 
+                if (b == 0) { set_error("Modulo by zero"); return; }
+                push(a % b); 
+                break; 
+            }
+            case OP_NEG: push(-pop()); break;
+            
+            case OP_AND: { int32_t b = pop(), a = pop(); push(a & b); break; }
+            case OP_OR: { int32_t b = pop(), a = pop(); push(a | b); break; }
+            case OP_XOR: { int32_t b = pop(), a = pop(); push(a ^ b); break; }
+            case OP_NOT: push(~pop()); break;
+            case OP_SHL: { int32_t b = pop(), a = pop(); push(a << b); break; }
+            case OP_SHR: { int32_t b = pop(), a = pop(); push(a >> b); break; }
+            
+            case OP_EQ: { int32_t b = pop(), a = pop(); push(a == b ? 1 : 0); break; }
+            case OP_NE: { int32_t b = pop(), a = pop(); push(a != b ? 1 : 0); break; }
+            case OP_LT: { int32_t b = pop(), a = pop(); push(a < b ? 1 : 0); break; }
+            case OP_LE: { int32_t b = pop(), a = pop(); push(a <= b ? 1 : 0); break; }
+            case OP_GT: { int32_t b = pop(), a = pop(); push(a > b ? 1 : 0); break; }
+            case OP_GE: { int32_t b = pop(), a = pop(); push(a >= b ? 1 : 0); break; }
+            
+            case OP_JMP: pc = inst.arg; break;
+            case OP_JZ: if (pop() == 0) pc = inst.arg; break;
+            case OP_JNZ: if (pop() != 0) pc = inst.arg; break;
+            
+            case OP_CALL:
+                if (call_sp >= 64) { set_error("Call stack overflow"); return; }
+                call_stack[call_sp++] = pc;
+                pc = inst.arg;
+                break;
+                
+            case OP_RET:
+                if (call_sp <= 0) { halted = true; running = false; return; }
+                pc = call_stack[--call_sp];
+                break;
+            
+            case OP_LOAD: {
+                int32_t addr = pop();
+                if (addr < 0 || addr >= MEMORY_SIZE) { set_error("Memory read OOB"); return; }
+                push(memory[addr]);
+                break;
+            }
+            
+            case OP_STORE: {
+                int32_t val = pop(), addr = pop();
+                if (addr < 0 || addr >= MEMORY_SIZE) { set_error("Memory write OOB"); return; }
+                memory[addr] = val;
+                break;
+            }
+            
+            case OP_LOADL: push(stack[bp + inst.arg]); break;
+            case OP_STOREL: stack[bp + inst.arg] = pop(); break;
+            case OP_LOADG: push(memory[inst.arg]); break;
+            case OP_STOREG: memory[inst.arg] = pop(); break;
+            
+            case OP_PRINT: {
+                int32_t val = pop();
+                if (output_terminal) {
+                    char buf[32];
+                    snprintf(buf, 32, "%d\n", val);
+                    output_terminal->console_print(buf);
+                }
+                break;
+            }
+            
+            case OP_SETPIXEL: {
+                int32_t color = pop(), y = pop(), x = pop();
+                put_pixel_back(x, y, color);
+                break;
+            }
+            
+            case OP_GETPIXEL: {
+                int32_t y = pop(), x = pop();
+                if (x >= 0 && x < (int)fb_info.width && y >= 0 && y < (int)fb_info.height) {
+                    push(backbuffer[y * fb_info.width + x]);
+                } else {
+                    push(0);
+                }
+                break;
+            }
+            
+            case OP_GETKEY: push(last_key_press); break;
+            
+            case OP_DELAY:
+                delay_until = g_timer_ticks + inst.arg;
+                running = false;
+                break;
+            
+            case OP_FRAME_START:
+                // Mark frame boundary - could be used for timing
+                break;
+                
+            case OP_FRAME_END:
+                // Force yield at end of frame
+                return;
+            
+            case OP_YIELD: return;
+            case OP_HALT: halted = true; running = false; break;
+            case OP_NOP: break;
+        }
+    }
+    
+public:
+    ByteVM() : program(nullptr), program_size(0), pc(0), sp(0), bp(0), 
+               call_sp(0), running(false), halted(false), error(false),
+               instructions_this_tick(0), delay_until(0), output_terminal(nullptr) {
+        memset(stack, 0, sizeof(stack));
+        memset(memory, 0, sizeof(memory));
+    }
+    
+    ~ByteVM() { if (program) delete[] program; }
+    
+    void set_output(TerminalWindow* term) { output_terminal = term; }
+    
+    bool load_program(VMInstruction* code, int size) {
+        if (program) delete[] program;
+        program = new VMInstruction[size];
+        if (!program) return false;
+        for (int i = 0; i < size; i++) program[i] = code[i];
+        program_size = size;
+        pc = 0; sp = 0; bp = 0; call_sp = 0;
+        running = true; halted = false; error = false;
+        return true;
+    }
+    
+    void tick() {
+        if (delay_until > 0) {
+            if (g_timer_ticks >= delay_until) {
+                delay_until = 0;
+                running = true;
+            } else return;
+        }
+        
+        if (!running || halted || error) return;
+        
+        instructions_this_tick = 0;
+        while (running && instructions_this_tick < INSTRUCTIONS_PER_TICK) {
+            execute_instruction();
+            instructions_this_tick++;
+        }
+    }
+    
+    bool is_running() const { return running && !halted && !error; }
+};
+
+// =============================================================================
+// C LANGUAGE TOKENIZER
+// =============================================================================
+
+enum TokenType {
+    TOK_EOF, TOK_NUMBER, TOK_IDENT,
+    TOK_INT, TOK_VOID, TOK_IF, TOK_ELSE, TOK_WHILE, TOK_FOR, TOK_RETURN,
+    TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_PERCENT,
+    TOK_EQ, TOK_NE, TOK_LT, TOK_LE, TOK_GT, TOK_GE,
+    TOK_AND, TOK_OR, TOK_NOT,
+    TOK_ASSIGN, TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
+    TOK_SEMICOLON, TOK_COMMA,
+    TOK_PLUSPLUS, TOK_MINUSMINUS
+};
+
+struct Token {
+    TokenType type;
+    int value;
+    char text[64];
+};
+
+class Tokenizer {
+private:
+    const char* source;
+    int pos;
+    
+    char peek() { return source[pos]; }
+    char advance() { return source[pos++]; }
+    
+    void skip_whitespace() {
+        while (peek() == ' ' || peek() == '\t' || peek() == '\n' || peek() == '\r') {
+            advance();
+        }
+        // Skip comments
+        if (peek() == '/' && source[pos+1] == '/') {
+            while (peek() && peek() != '\n') advance();
+        }
+    }
+    
+public:
+    Tokenizer(const char* src) : source(src), pos(0) {}
+    
+    Token next() {
+        skip_whitespace();
+        Token tok;
+        tok.type = TOK_EOF;
+        tok.value = 0;
+        tok.text[0] = '\0';
+        
+        if (!peek()) return tok;
+        
+        // Numbers
+        if (peek() >= '0' && peek() <= '9') {
+            tok.type = TOK_NUMBER;
+            tok.value = 0;
+            while (peek() >= '0' && peek() <= '9') {
+                tok.value = tok.value * 10 + (advance() - '0');
+            }
+            return tok;
+        }
+        
+        // Identifiers and keywords
+        if ((peek() >= 'a' && peek() <= 'z') || (peek() >= 'A' && peek() <= 'Z') || peek() == '_') {
+            int i = 0;
+            while (((peek() >= 'a' && peek() <= 'z') || (peek() >= 'A' && peek() <= 'Z') || 
+                    (peek() >= '0' && peek() <= '9') || peek() == '_') && i < 63) {
+                tok.text[i++] = advance();
+            }
+            tok.text[i] = '\0';
+            
+            if (strcmp(tok.text, "int") == 0) tok.type = TOK_INT;
+            else if (strcmp(tok.text, "void") == 0) tok.type = TOK_VOID;
+            else if (strcmp(tok.text, "if") == 0) tok.type = TOK_IF;
+            else if (strcmp(tok.text, "else") == 0) tok.type = TOK_ELSE;
+            else if (strcmp(tok.text, "while") == 0) tok.type = TOK_WHILE;
+            else if (strcmp(tok.text, "for") == 0) tok.type = TOK_FOR;
+            else if (strcmp(tok.text, "return") == 0) tok.type = TOK_RETURN;
+            else tok.type = TOK_IDENT;
+            return tok;
+        }
+        
+        // Operators
+        char c = advance();
+        switch (c) {
+            case '+': 
+                if (peek() == '+') { advance(); tok.type = TOK_PLUSPLUS; }
+                else tok.type = TOK_PLUS; 
+                break;
+            case '-': 
+                if (peek() == '-') { advance(); tok.type = TOK_MINUSMINUS; }
+                else tok.type = TOK_MINUS; 
+                break;
+            case '*': tok.type = TOK_STAR; break;
+            case '/': tok.type = TOK_SLASH; break;
+            case '%': tok.type = TOK_PERCENT; break;
+            case '=':
+                if (peek() == '=') { advance(); tok.type = TOK_EQ; }
+                else tok.type = TOK_ASSIGN;
+                break;
+            case '!':
+                if (peek() == '=') { advance(); tok.type = TOK_NE; }
+                else tok.type = TOK_NOT;
+                break;
+            case '<':
+                if (peek() == '=') { advance(); tok.type = TOK_LE; }
+                else tok.type = TOK_LT;
+                break;
+            case '>':
+                if (peek() == '=') { advance(); tok.type = TOK_GE; }
+                else tok.type = TOK_GT;
+                break;
+            case '&': if (peek() == '&') { advance(); tok.type = TOK_AND; } break;
+            case '|': if (peek() == '|') { advance(); tok.type = TOK_OR; } break;
+            case '(': tok.type = TOK_LPAREN; break;
+            case ')': tok.type = TOK_RPAREN; break;
+            case '{': tok.type = TOK_LBRACE; break;
+            case '}': tok.type = TOK_RBRACE; break;
+            case ';': tok.type = TOK_SEMICOLON; break;
+            case ',': tok.type = TOK_COMMA; break;
+        }
+        return tok;
+    }
+};
+
+// =============================================================================
+// C COMPILER
+// =============================================================================
+
+class CCompiler {
+private:
+    VMInstruction code[4096];
+    int code_size;
+    Tokenizer* tokenizer;
+    Token current_token;
+    
+    struct Variable {
+        char name[64];
+        int offset;
+        bool is_local;
+    };
+    
+    Variable variables[128];
+    int var_count;
+    int local_offset;
+    int global_offset;
+    
+    void emit(VMOpcode op, int32_t arg = 0) {
+        if (code_size >= 4096) return;
+        code[code_size++] = VMInstruction(op, arg);
+    }
+    
+    void advance() {
+        current_token = tokenizer->next();
+    }
+    
+    bool match(TokenType type) {
+        if (current_token.type == type) {
+            advance();
+            return true;
+        }
+        return false;
+    }
+    
+    void expect(TokenType type) {
+        if (!match(type)) {
+            // Error handling
+        }
+    }
+    
+    int find_variable(const char* name) {
+        for (int i = var_count - 1; i >= 0; i--) {
+            if (strcmp(variables[i].name, name) == 0) {
+                return i;
+            }
+        }
+        return -1;
+    }
+    
+    void add_variable(const char* name, bool is_local) {
+        if (var_count >= 128) return;
+        strcpy(variables[var_count].name, name);
+        variables[var_count].is_local = is_local;
+        if (is_local) {
+            variables[var_count].offset = local_offset++;
+        } else {
+            variables[var_count].offset = global_offset++;
+        }
+        var_count++;
+    }
+    
+    // Expression parser (precedence climbing)
+    void parse_primary() {
+        if (current_token.type == TOK_NUMBER) {
+            emit(OP_PUSH, current_token.value);
+            advance();
+        } else if (current_token.type == TOK_IDENT) {
+            char name[64];
+            strcpy(name, current_token.text);
+            advance();
+            
+            if (match(TOK_LPAREN)) {
+                // Function call
+                int arg_count = 0;
+                if (current_token.type != TOK_RPAREN) {
+                    parse_expression();
+                    arg_count++;
+                    while (match(TOK_COMMA)) {
+                        parse_expression();
+                        arg_count++;
+                    }
+                }
+                expect(TOK_RPAREN);
+                
+                // Built-in functions
+                if (strcmp(name, "print") == 0) {
+                    emit(OP_PRINT);
+                } else if (strcmp(name, "setpixel") == 0) {
+                    emit(OP_SETPIXEL);
+                } else if (strcmp(name, "getpixel") == 0) {
+                    emit(OP_GETPIXEL);
+                } else if (strcmp(name, "delay") == 0) {
+                    emit(OP_DELAY);
+                } else if (strcmp(name, "getkey") == 0) {
+                    emit(OP_GETKEY);
+                }
+            } else {
+                // Variable
+                int var_idx = find_variable(name);
+                if (var_idx >= 0) {
+                    if (variables[var_idx].is_local) {
+                        emit(OP_LOADL, variables[var_idx].offset);
+                    } else {
+                        emit(OP_LOADG, variables[var_idx].offset);
+                    }
+                }
+            }
+        } else if (match(TOK_LPAREN)) {
+            parse_expression();
+            expect(TOK_RPAREN);
+        }
+    }
+    
+    void parse_unary() {
+        if (match(TOK_MINUS)) {
+            parse_unary();
+            emit(OP_NEG);
+        } else if (match(TOK_NOT)) {
+            parse_unary();
+            emit(OP_NOT);
+        } else {
+            parse_primary();
+        }
+    }
+    
+    void parse_multiplicative() {
+        parse_unary();
+        while (true) {
+            if (match(TOK_STAR)) {
+                parse_unary();
+                emit(OP_MUL);
+            } else if (match(TOK_SLASH)) {
+                parse_unary();
+                emit(OP_DIV);
+            } else if (match(TOK_PERCENT)) {
+                parse_unary();
+                emit(OP_MOD);
+            } else {
+                break;
+            }
+        }
+    }
+    
+    void parse_additive() {
+        parse_multiplicative();
+        while (true) {
+            if (match(TOK_PLUS)) {
+                parse_multiplicative();
+                emit(OP_ADD);
+            } else if (match(TOK_MINUS)) {
+                parse_multiplicative();
+                emit(OP_SUB);
+            } else {
+                break;
+            }
+        }
+    }
+    
+    void parse_comparison() {
+        parse_additive();
+        while (true) {
+            if (match(TOK_EQ)) {
+                parse_additive();
+                emit(OP_EQ);
+            } else if (match(TOK_NE)) {
+                parse_additive();
+                emit(OP_NE);
+            } else if (match(TOK_LT)) {
+                parse_additive();
+                emit(OP_LT);
+            } else if (match(TOK_LE)) {
+                parse_additive();
+                emit(OP_LE);
+            } else if (match(TOK_GT)) {
+                parse_additive();
+                emit(OP_GT);
+            } else if (match(TOK_GE)) {
+                parse_additive();
+                emit(OP_GE);
+            } else {
+                break;
+            }
+        }
+    }
+    
+    void parse_logical_and() {
+        parse_comparison();
+        while (match(TOK_AND)) {
+            parse_comparison();
+            emit(OP_AND);
+        }
+    }
+    
+    void parse_logical_or() {
+        parse_logical_and();
+        while (match(TOK_OR)) {
+            parse_logical_and();
+            emit(OP_OR);
+        }
+    }
+    
+    void parse_expression() {
+        parse_logical_or();
+    }
+    
+    void parse_statement() {
+        if (match(TOK_IF)) {
+            expect(TOK_LPAREN);
+            parse_expression();
+            expect(TOK_RPAREN);
+            
+            int jz_addr = code_size;
+            emit(OP_JZ, 0); // Placeholder
+            
+            parse_statement();
+            
+            if (match(TOK_ELSE)) {
+                int jmp_addr = code_size;
+                emit(OP_JMP, 0); // Placeholder
+                code[jz_addr].arg = code_size;
+                parse_statement();
+                code[jmp_addr].arg = code_size;
+            } else {
+                code[jz_addr].arg = code_size;
+            }
+        } else if (match(TOK_WHILE)) {
+            int loop_start = code_size;
+            expect(TOK_LPAREN);
+            parse_expression();
+            expect(TOK_RPAREN);
+            
+            int jz_addr = code_size;
+            emit(OP_JZ, 0); // Placeholder
+            
+            parse_statement();
+            emit(OP_JMP, loop_start);
+            code[jz_addr].arg = code_size;
+        } else if (match(TOK_FOR)) {
+            expect(TOK_LPAREN);
+            
+            // Init
+            if (current_token.type == TOK_INT) {
+                parse_declaration();
+            } else if (current_token.type != TOK_SEMICOLON) {
+                parse_expression();
+                emit(OP_POP);
+            }
+            expect(TOK_SEMICOLON);
+            
+            int loop_start = code_size;
+            
+            // Condition
+            int jz_addr = -1;
+            if (current_token.type != TOK_SEMICOLON) {
+                parse_expression();
+                jz_addr = code_size;
+                emit(OP_JZ, 0);
+            }
+            expect(TOK_SEMICOLON);
+            
+            // Jump over increment
+            int jmp_body = code_size;
+            emit(OP_JMP, 0);
+            
+            // Increment
+            int inc_start = code_size;
+            if (current_token.type != TOK_RPAREN) {
+                parse_expression();
+                emit(OP_POP);
+            }
+            emit(OP_JMP, loop_start);
+            expect(TOK_RPAREN);
+            
+            // Body
+            code[jmp_body].arg = code_size;
+            parse_statement();
+            emit(OP_JMP, inc_start);
+            
+            if (jz_addr >= 0) {
+                code[jz_addr].arg = code_size;
+            }
+        } else if (match(TOK_RETURN)) {
+            if (current_token.type != TOK_SEMICOLON) {
+                parse_expression();
+            }
+            emit(OP_RET);
+            expect(TOK_SEMICOLON);
+        } else if (match(TOK_LBRACE)) {
+            while (current_token.type != TOK_RBRACE && current_token.type != TOK_EOF) {
+                parse_statement();
+            }
+            expect(TOK_RBRACE);
+        } else if (current_token.type == TOK_INT) {
+            parse_declaration();
+        } else {
+            // Expression statement or assignment
+            if (current_token.type == TOK_IDENT) {
+                char name[64];
+                strcpy(name, current_token.text);
+                advance();
+                
+                if (match(TOK_ASSIGN)) {
+                    parse_expression();
+                    int var_idx = find_variable(name);
+                    if (var_idx >= 0) {
+                        if (variables[var_idx].is_local) {
+                            emit(OP_STOREL, variables[var_idx].offset);
+                        } else {
+                            emit(OP_STOREG, variables[var_idx].offset);
+                        }
+                    }
+                } else if (match(TOK_PLUSPLUS)) {
+                    int var_idx = find_variable(name);
+                    if (var_idx >= 0) {
+                        if (variables[var_idx].is_local) {
+                            emit(OP_LOADL, variables[var_idx].offset);
+                        } else {
+                            emit(OP_LOADG, variables[var_idx].offset);
+                        }
+                        emit(OP_PUSH, 1);
+                        emit(OP_ADD);
+                        if (variables[var_idx].is_local) {
+                            emit(OP_STOREL, variables[var_idx].offset);
+                        } else {
+                            emit(OP_STOREG, variables[var_idx].offset);
+                        }
+                    }
+                } else if (match(TOK_MINUSMINUS)) {
+                    int var_idx = find_variable(name);
+                    if (var_idx >= 0) {
+                        if (variables[var_idx].is_local) {
+                            emit(OP_LOADL, variables[var_idx].offset);
+                        } else {
+                            emit(OP_LOADG, variables[var_idx].offset);
+                        }
+                        emit(OP_PUSH, 1);
+                        emit(OP_SUB);
+                        if (variables[var_idx].is_local) {
+                            emit(OP_STOREL, variables[var_idx].offset);
+                        } else {
+                            emit(OP_STOREG, variables[var_idx].offset);
+                        }
+                    }
+                }
+            }
+            expect(TOK_SEMICOLON);
+        }
+    }
+    
+    void parse_declaration() {
+        expect(TOK_INT);
+        char name[64];
+        strcpy(name, current_token.text);
+        expect(TOK_IDENT);
+        
+        add_variable(name, true);
+        
+        if (match(TOK_ASSIGN)) {
+            parse_expression();
+            int var_idx = find_variable(name);
+            if (var_idx >= 0) {
+                emit(OP_STOREL, variables[var_idx].offset);
+            }
+        }
+        expect(TOK_SEMICOLON);
+    }
+    
+public:
+    CCompiler() : code_size(0), tokenizer(nullptr), var_count(0), 
+                  local_offset(0), global_offset(0) {}
+    
+    bool compile(const char* source) {
+        code_size = 0;
+        var_count = 0;
+        local_offset = 0;
+        global_offset = 0;
+        
+        tokenizer = new Tokenizer(source);
+        advance();
+        
+        // Parse function (simplified - assumes main() only)
+        if (match(TOK_INT) || match(TOK_VOID)) {
+            expect(TOK_IDENT); // function name
+            expect(TOK_LPAREN);
+            expect(TOK_RPAREN);
+            expect(TOK_LBRACE);
+            
+            while (current_token.type != TOK_RBRACE && current_token.type != TOK_EOF) {
+                parse_statement();
+            }
+            
+            emit(OP_HALT);
+        }
+        
+        delete tokenizer;
+        return true;
+    }
+    
+    VMInstruction* get_code() { return code; }
+    int get_code_size() const { return code_size; }
+};
+
+// =============================================================================
+// GLOBAL VM INSTANCE & INTEGRATION
+// =============================================================================
+
+static ByteVM* g_running_vm = nullptr;
+static CCompiler g_compiler;
+
+// Call this in your main loop's update section (after wm.update_all())
+void bytevm_tick() {
+    if (g_running_vm) {
+        g_running_vm->tick();
+        
+        // Cleanup if finished
+        if (!g_running_vm->is_running()) {
+            delete g_running_vm;
+            g_running_vm = nullptr;
+        }
+    }
+}
+
+// Implementation - place this AFTER all class definitions
+// It uses TerminalWindow so must come after the class is defined
+void handle_run_command(const char* filename, TerminalWindow* term) {
+    // Stop any currently running VM
+    if (g_running_vm) {
+        delete g_running_vm;
+        g_running_vm = nullptr;
+    }
+    
+    // Load program from file
+    char* source = fat32_read_file_as_string(filename);
+    if (!source) {
+        term->console_print("Failed to load file.\n");
+        return;
+    }
+    
+    // Compile
+    term->console_print("Compiling...\n");
+    if (!g_compiler.compile(source)) {
+        term->console_print("Compilation failed.\n");
+        delete[] source;
+        return;
+    }
+    delete[] source;
+    
+    char buf[64];
+    snprintf(buf, 64, "Generated %d instructions.\n", g_compiler.get_code_size());
+    term->console_print(buf);
+    
+    // Create VM and load program
+    g_running_vm = new ByteVM();
+    g_running_vm->set_output(term);
+    
+    if (!g_running_vm->load_program(g_compiler.get_code(), g_compiler.get_code_size())) {
+        term->console_print("Failed to load program into VM.\n");
+        delete g_running_vm;
+        g_running_vm = nullptr;
+        return;
+    }
+    
+    term->console_print("Program started (tick-based execution).\n");
+}
+
+/*
+ * ============================================================================
+ * INTEGRATION INSTRUCTIONS
+ * ============================================================================
+ * 
+ * 1. Add to TerminalWindow::handle_command() in the "else if" chain:
+ * 
+ *    else if (strcmp(command, "run") == 0) {
+ *        char* filename = get_arg(args, 0);
+ *        if (filename) {
+ *            handle_run_command(filename, this);
+ *        } else {
+ *            console_print("Usage: run \"<filename>\"\n");
+ *        }
+ *    }
+ * 
+ * 2. Add to your main loop (after wm.update_all(), before drawing cursor):
+ * 
+ *    bytevm_tick();
+ * 
+ * 3. Example C programs to test:
+ * 
+ * ============================================================================
+ * EXAMPLE 1: test.c - Simple counter
+ * ============================================================================
+ */
+
+/*
+int main() {
+    int i = 0;
+    while (i < 10) {
+        print(i);
+        i++;
+    }
+    return 0;
+}
+*/
+
+/*
+ * ============================================================================
+ * EXAMPLE 2: draw.c - Draw animated line
+ * ============================================================================
+ */
+
+/*
+int main() {
+    int x = 0;
+    while (x < 800) {
+        setpixel(x, 300, 0xFF0000);
+        x++;
+        if (x % 10 == 0) {
+            delay(1);  // Delay 1 tick every 10 pixels
+        }
+    }
+    return 0;
+}
+*/
+
+/*
+ * ============================================================================
+ * EXAMPLE 3: animate.c - Bouncing pixel
+ * ============================================================================
+ */
+
+/*
+int main() {
+    int x = 100;
+    int y = 100;
+    int dx = 2;
+    int dy = 3;
+    int color = 0x00FF00;
+    
+    int i = 0;
+    while (i < 1000) {
+        // Clear old position (draw black)
+        setpixel(x, y, 0x000000);
+        
+        // Update position
+        x = x + dx;
+        y = y + dy;
+        
+        // Bounce off edges
+        if (x > 800) {
+            x = 800;
+            dx = -dx;
+        }
+        if (x < 0) {
+            x = 0;
+            dx = -dx;
+        }
+        if (y > 600) {
+            y = 600;
+            dy = -dy;
+        }
+        if (y < 0) {
+            y = 0;
+            dy = -dy;
+        }
+        
+        // Draw new position
+        setpixel(x, y, color);
+        
+        delay(1);  // One frame delay
+        i++;
+    }
+    return 0;
+}
+*/
+
+/*
+ * ============================================================================
+ * EXAMPLE 4: pattern.c - Draw pattern
+ * ============================================================================
+ */
+
+/*
+int main() {
+    int y = 0;
+    while (y < 600) {
+        int x = 0;
+        while (x < 800) {
+            int color = (x * y) % 0xFFFFFF;
+            setpixel(x, y, color);
+            x = x + 4;
+        }
+        y = y + 4;
+        if (y % 20 == 0) {
+            delay(1);  // Yield every 20 lines
+        }
+    }
+    return 0;
+}
+*/
+
+/*
+ * ============================================================================
+ * EXAMPLE 5: game.c - Simple interactive program
+ * ============================================================================
+ */
+
+/*
+int main() {
+    int x = 400;
+    int y = 300;
+    int color = 0xFFFF00;
+    
+    int running = 1;
+    while (running) {
+        // Clear old position
+        setpixel(x, y, 0x000000);
+        
+        // Get keyboard input
+        int key = getkey();
+        
+        // Update based on arrow keys
+        if (key == -3) { x = x - 5; }  // Left arrow
+        if (key == -4) { x = x + 5; }  // Right arrow  
+        if (key == -1) { y = y - 5; }  // Up arrow
+        if (key == -2) { y = y + 5; }  // Down arrow
+        
+        // Keep in bounds
+        if (x < 0) { x = 0; }
+        if (x > 800) { x = 800; }
+        if (y < 0) { y = 0; }
+        if (y > 600) { y = 600; }
+        
+        // Draw new position
+        setpixel(x, y, color);
+        
+        delay(2);  // 2 tick delay
+    }
+    return 0;
+}
+*/
+
+/*
+ * ============================================================================
+ * EXAMPLE 6: mandelbrot.c - Fractal renderer
+ * ============================================================================
+ */
+
+/*
+int main() {
+    int py = 0;
+    while (py < 400) {
+        int px = 0;
+        while (px < 640) {
+            // Map pixel to complex plane
+            int x0 = (px * 3500) / 640 - 2500;
+            int y0 = (py * 2000) / 400 - 1000;
+            
+            int x = 0;
+            int y = 0;
+            int iteration = 0;
+            int max_iteration = 50;
+            
+            while (x*x + y*y <= 4000000 && iteration < max_iteration) {
+                int xtemp = (x*x - y*y) / 1000 + x0;
+                y = (2*x*y) / 1000 + y0;
+                x = xtemp;
+                iteration++;
+            }
+            
+            // Color based on iteration
+            int color = 0;
+            if (iteration < max_iteration) {
+                color = (iteration * 16777) % 0xFFFFFF;
+            }
+            
+            setpixel(px, py, color);
+            px++;
+        }
+        
+        if (py % 4 == 0) {
+            delay(1);  // Yield every 4 lines
+        }
+        py++;
+    }
+    return 0;
+}
+*/
+
+/*
+ * ============================================================================
+ * SUPPORTED C FEATURES
+ * ============================================================================
+ * 
+ * Data Types:
+ *   - int (32-bit signed integer)
+ * 
+ * Operators:
+ *   - Arithmetic: +, -, *, /, %, ++, --
+ *   - Comparison: ==, !=, <, <=, >, >=
+ *   - Logical: &&, ||, !
+ *   - Bitwise: &, |, ^, ~, <<, >>
+ * 
+ * Control Flow:
+ *   - if / else
+ *   - while
+ *   - for
+ *   - return
+ * 
+ * Built-in Functions:
+ *   - print(int value)              - Print integer to terminal
+ *   - setpixel(int x, int y, int c) - Draw pixel (RGB color)
+ *   - getpixel(int x, int y)        - Get pixel color
+ *   - delay(int ticks)              - Delay execution
+ *   - getkey()                      - Get last key pressed
+ * 
+ * Variables:
+ *   - Local variables (in functions)
+ *   - Global variables (outside functions) - NOT YET IMPLEMENTED
+ * 
+ * Limitations:
+ *   - Only one function (main) supported
+ *   - No arrays or pointers
+ *   - No strings
+ *   - No function parameters/arguments
+ *   - No structs or enums
+ * 
+ * ============================================================================
+ * PERFORMANCE NOTES
+ * ============================================================================
+ * 
+ * The VM executes 500 instructions per tick by default.
+ * 
+ * To prevent UI freezing:
+ *   - Use delay() in long loops
+ *   - Break work across multiple frames
+ *   - The VM automatically yields at frame boundaries
+ * 
+ * Adjust INSTRUCTIONS_PER_TICK in ByteVM class for different performance:
+ *   - Lower = more responsive UI, slower programs
+ *   - Higher = faster programs, potential UI lag
+ * 
+ * ============================================================================
+ * DEBUGGING TIPS
+ * ============================================================================
+ * 
+ * 1. Use print() to output values during execution
+ * 2. Add delay(10) at strategic points to slow down execution
+ * 3. Check terminal for "VM ERROR" messages
+ * 4. Common errors:
+ *    - Stack overflow: Too many nested calls or expressions
+ *    - Division by zero: Check your math
+ *    - Memory OOB: Invalid pixel coordinates
+ * 
+ * ============================================================================
+ * EXTENDING THE COMPILER
+ * ============================================================================
+ * 
+ * To add new built-in functions:
+ * 
+ * 1. Add opcode to VMOpcode enum
+ * 2. Implement in ByteVM::execute_instruction()
+ * 3. Add to CCompiler::parse_primary() function call handler
+ * 
+ * Example - Adding a random() function:
+ * 
+ *   In VMOpcode: OP_RANDOM,
+ *   
+ *   In execute_instruction():
+ *     case OP_RANDOM: {
+ *       int max = pop();
+ *       push(g_timer_ticks % max);  // Simple pseudo-random
+ *       break;
+ *     }
+ *   
+ *   In parse_primary():
+ *     else if (strcmp(name, "random") == 0) {
+ *       emit(OP_RANDOM);
+ *     }
+ * 
+ * ============================================================================
+ * ADVANCED USAGE
+ * ============================================================================
+ * 
+ * Multiple Programs:
+ *   - Currently only one VM can run at a time
+ *   - To add multitasking, maintain array of ByteVM instances
+ *   - Call tick() on each VM in round-robin fashion
+ * 
+ * Saving Bytecode:
+ *   - Save g_compiler.get_code() array to file as .obj
+ *   - Load directly into VM without recompiling
+ *   - Much faster startup for large programs
+ * 
+ * Memory Mapped I/O:
+ *   - Use memory[] array as shared memory
+ *   - Programs can communicate through shared variables
+ *   - Implement semaphores for synchronization
+ * 
+ * ============================================================================
+ */
 
 // =============================================================================
 // KERNEL MAIN - ATOMIC FRAME RENDERING
@@ -3899,6 +5100,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // =============================================================================
     for (;;) {
         poll_input_universal();
+        bytevm_tick();
 
         bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
         bool l_button_changed = (mouse_left_down != mouse_left_last_frame);
@@ -3939,7 +5141,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                 // ATOMIC FRAME RENDERING - PREVENTS ALL TRAILING AND TEARING
                 // =============================================================================
                 g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
-                
                 wm.update_all();
                 
                 draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
