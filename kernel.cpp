@@ -22,7 +22,6 @@ typedef signed short int16_t;
 typedef signed int int32_t;
 typedef unsigned int uintptr_t;
 typedef unsigned int size_t;
-// Add this right after the existing CXX ABI section in your kernel.cpp
 
 // --- CXX ABI Stubs ---
 namespace __cxxabiv1 {
@@ -38,19 +37,6 @@ namespace __cxxabiv1 {
     void __si_class_type_info::dummy() {}
 }
 
-// Exception handling stubs
-extern "C" void __gxx_personality_v0() {
-    // Exception handling not supported - halt if called
-    asm volatile("cli; hlt");
-}
-
-extern "C" void _Unwind_Resume() {
-    // Stack unwinding not supported - halt if called
-    asm volatile("cli; hlt");
-}
-
-// Continue with rest of kernel code...
-
 // --- Forward Declarations ---
 class Window;
 class TerminalWindow;
@@ -59,9 +45,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr);
 void launch_new_terminal();
 void launch_new_explorer(); // New
 void launch_terminal_with_command(const char* command); // ADD THIS LINE
-
-void handle_run_command(const char* filename, TerminalWindow* term);
-void bytevm_tick();  // ADD THIS TOO
 
 int fat32_write_file(const char* filename, const void* data, uint32_t size);
 int fat32_remove_file(const char* filename);
@@ -2879,6 +2862,2111 @@ void chkdsk_full_scan(bool fix = false) {
 }
 
 
+#include <cstdarg>    // For va_list in printf
+
+// =============================================================================
+// SECTION 6: SELF-HOSTED C COMPILER
+// =============================================================================
+
+// Forward declarations consumed by the command shell
+extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename);
+extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename);
+extern "C" void cmd_exec(const char* code_text);
+struct HardwareDevice {
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint64_t base_address;
+    uint64_t size;
+    uint32_t device_type;  // 0=Unknown, 1=Storage, 2=Network, 3=Graphics, 4=Audio, 5=USB
+    char description[64];
+};
+// --- Global Hardware Registry Definition ---
+const int MAX_HARDWARE_DEVICES = 32; // Define the constant
+HardwareDevice hardware_registry[MAX_HARDWARE_DEVICES];
+int hardware_count = 0;
+
+// Define shell parts variables (as declared extern in the header)
+// These will be populated by the terminal handler in kernel.cpp
+char* parts[32];
+int   part_count = 0;
+
+
+// ---- tiny helpers ----
+static inline int tcc_is_digit(char c){ return c>='0' && c<='9'; }
+static inline int tcc_is_alpha(char c){ return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_'; }
+static inline int tcc_is_alnum(char c){ return tcc_is_alpha(c)||tcc_is_digit(c); }
+static inline int tcc_strlen(const char* s){ int n=0; while(s && s[n]) ++n; return n; }
+
+// ============================================================
+// Console and Terminal I/O Functions
+// ============================================================
+
+// VGA Text Mode Buffer (typically at 0xB8000)
+static volatile char* const VGA_BUFFER = (volatile char* const)0xB8000;
+static int vga_row = 0;
+static int vga_col = 0;
+static const int VGA_WIDTH = 80;
+static const int VGA_HEIGHT = 23;
+void vga_print_char(char c) {
+    if (c == '\n') {
+        vga_col = 0;
+        vga_row++;
+        if (vga_row >= VGA_HEIGHT) {
+            vga_row = VGA_HEIGHT - 1;
+            // Scroll VGA buffer up
+            for (int row = 0; row < VGA_HEIGHT - 1; row++) {
+                for (int col = 0; col < VGA_WIDTH; col++) {
+                    int src_idx = ((row + 1) * VGA_WIDTH + col) * 2;
+                    int dst_idx = (row * VGA_WIDTH + col) * 2;
+                    VGA_BUFFER[dst_idx] = VGA_BUFFER[src_idx];
+                    VGA_BUFFER[dst_idx + 1] = VGA_BUFFER[src_idx + 1];
+                }
+            }
+            // Clear last line
+            for (int col = 0; col < VGA_WIDTH; col++) {
+                int idx = ((VGA_HEIGHT - 1) * VGA_WIDTH + col) * 2;
+                VGA_BUFFER[idx] = ' ';
+                VGA_BUFFER[idx + 1] = 0x07;
+            }
+        }
+    } else if (c >= 32 && c < 127) {
+        int index = (vga_row * VGA_WIDTH + vga_col) * 2;
+        VGA_BUFFER[index] = c;
+        VGA_BUFFER[index + 1] = 0x07;
+        vga_col++;
+        if (vga_col >= VGA_WIDTH) {
+            vga_col = 0;
+            vga_row++;
+            if (vga_row >= VGA_HEIGHT) {
+                vga_row = VGA_HEIGHT - 1;
+                // Scroll VGA buffer up
+                for (int row = 0; row < VGA_HEIGHT - 1; row++) {
+                    for (int col = 0; col < VGA_WIDTH; col++) {
+                        int src_idx = ((row + 1) * VGA_WIDTH + col) * 2;
+                        int dst_idx = (row * VGA_WIDTH + col) * 2;
+                        VGA_BUFFER[dst_idx] = VGA_BUFFER[src_idx];
+                        VGA_BUFFER[dst_idx + 1] = VGA_BUFFER[src_idx + 1];
+                    }
+                }
+                // Clear last line
+                for (int col = 0; col < VGA_WIDTH; col++) {
+                    int idx = ((VGA_HEIGHT - 1) * VGA_WIDTH + col) * 2;
+                    VGA_BUFFER[idx] = ' ';
+                    VGA_BUFFER[idx + 1] = 0x07;
+                }
+            }
+        }
+    }
+}
+
+void vga_print(const char* str) {
+    if (!str) return;
+    while (*str) {
+        vga_print_char(*str);
+        str++;
+    }
+}
+
+// Route to window if available, otherwise VGA
+void console_print_char(char c) {
+    int num_wins = wm.get_num_windows();
+    int focused = wm.get_focused_idx();
+    if (num_wins > 0 && focused >= 0 && focused < num_wins) {
+        Window* win = wm.get_window(focused);
+        if (win) {
+            char buf[2] = {c, 0};
+            win->console_print(buf);
+        }
+    } else {
+        vga_print_char(c);
+    }
+}
+
+void console_print(const char* str) {
+    if (!str) return;
+    int num_wins = wm.get_num_windows();
+    int focused = wm.get_focused_idx();
+    if (num_wins > 0 && focused >= 0 && focused < num_wins) {
+        Window* win = wm.get_window(focused);
+        if (win) {
+            win->console_print(str);
+        }
+    } else {
+        vga_print(str);
+    }
+}
+
+// CORRECTED: Non-blocking get_char with fallback
+static char pending_char = 0;
+
+char get_char() {
+    // Check if we have a pending character from previous call
+    if (pending_char != 0) {
+        char c = pending_char;
+        pending_char = 0;
+        return c;
+    }
+
+    // Non-blocking read from keyboard
+    while (1) {
+        uint8_t status = inb(0x64);
+        if (status & 0x01) { // Data available
+            uint8_t scancode = inb(0x60);
+
+            // Simple scancode to ASCII conversion (US keyboard layout)
+            static const char scancode_map[] = {
+                0,   27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b', '\t',
+                'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n', 0, 'a', 's',
+                'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\', 'z', 'x', 'c', 'v',
+                'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' '
+            };
+
+            if (scancode < sizeof(scancode_map)) {
+                char c = scancode_map[scancode];
+                if (c != 0) {
+                    vga_print_char(c);
+                    return c;
+                }
+            }
+        } else {
+            // No data available - return a null character
+            // The caller should handle this and retry if needed
+            return 0;
+        }
+    }
+}
+
+// CORRECTED: read_line with timeout and proper handling
+static void read_line(char* buffer, int max_len) {
+    int i = 0;
+    int timeout_count = 0;
+    const int TIMEOUT_THRESHOLD = 100000; // Prevent infinite wait
+
+    while (i < max_len - 1 && timeout_count < TIMEOUT_THRESHOLD) {
+        char c = get_char();
+
+        if (c == 0) {
+            // No character available, continue waiting
+            timeout_count++;
+            continue;
+        }
+
+        timeout_count = 0; // Reset timeout on character received
+
+        if (c == '\n' || c == '\r') {
+            break;
+        }
+        if (c == '\b') {
+            if (i > 0) {
+                i--;
+            }
+        } else if (c >= 32 && c <= 126) {
+            buffer[i++] = c;
+        }
+    }
+
+    buffer[i] = 0;
+    vga_print_char('\n');
+}
+
+// ============================================================
+// Integer Conversion Functions
+// ============================================================
+
+void int_to_string(int value, char* buffer) {
+    if (!buffer) return;
+    
+    if (value == 0) {
+        buffer[0] = '0';
+        buffer[1] = 0;
+        return;
+    }
+    
+    int negative = value < 0;
+    if (negative) value = -value;
+    
+    int i = 0;
+    char temp[16];
+    
+    while (value > 0) {
+        temp[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+    
+    int j = 0;
+    if (negative) buffer[j++] = '-';
+    
+    while (i > 0) {
+        buffer[j++] = temp[--i];
+    }
+    
+    buffer[j] = 0;
+}
+
+
+// ============================================================
+// File I/O Functions (FAT32 Support)
+// ============================================================
+
+// Simplified file buffer for storage
+static char file_buffer[65536]; // 64KB file buffer
+
+
+// ============================================================
+// Memory Management (new/delete operators)
+// ============================================================
+
+// Simple heap allocator
+static unsigned char heap[1048576]; // 1MB heap
+static int heap_offset = 0;
+
+
+void simple_strcpy(char* dest, const char* src) {
+    while (*src) {
+        *dest++ = *src++;
+    }
+    *dest = '\0';
+}
+
+int simple_strcmp(const char* s1, const char* s2) {
+    while (*s1 && (*s1 == *s2)) {
+        s1++;
+        s2++;
+    }
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+
+void* simple_memcpy(void* dest, const void* src, int n) {
+    char* d = (char*)dest;
+    const char* s = (const char*)src;
+    while (n--) {
+        *d++ = *s++;
+    }
+    return dest;
+}
+// Basic printf implementation
+void printf(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+
+    char buffer[256]; // A buffer to hold consecutive characters
+    int buffer_index = 0;
+
+    while (*format != '\0') {
+        if (*format == '%') {
+            // If there's anything in the buffer, print it first
+            if (buffer_index > 0) {
+                buffer[buffer_index] = '\0';
+                console_print(buffer);
+                buffer_index = 0; // Reset buffer
+            }
+
+            format++; // Move past the '%'
+            if (*format == 'd') {
+                int i = va_arg(args, int);
+                char num_buf[12];
+                int_to_string(i, num_buf);
+                console_print(num_buf);
+            } else if (*format == 's') {
+                char* s = va_arg(args, char*);
+                console_print(s);
+            } else if (*format == 'c') {
+                char c = (char)va_arg(args, int);
+                char str[2] = {c, 0};
+                console_print(str);
+            } else { // Handles %% and unknown specifiers
+                console_print_char('%');
+                console_print_char(*format);
+            }
+        } else {
+            // Add the character to our buffer
+            if (buffer_index < 255) {
+                buffer[buffer_index++] = *format;
+            }
+        }
+        format++;
+    }
+
+    // Print any remaining characters in the buffer at the end
+    if (buffer_index > 0) {
+        buffer[buffer_index] = '\0';
+        console_print(buffer);
+    }
+
+    va_end(args);
+}
+
+
+// Helper functions for hex conversion and PCI access
+static void uint32_to_hex_string(uint32_t value, char* buffer) {
+    const char hex_chars[] = "0123456789ABCDEF";
+    for(int i = 7; i >= 0; i--) {
+        buffer[7-i] = hex_chars[(value >> (i*4)) & 0xF];
+    }
+    buffer[8] = 0;
+}
+
+static void uint64_to_hex_string(uint64_t value, char* buffer) {
+    const char hex_chars[] = "0123456789ABCDEF";
+    for(int i = 15; i >= 0; i--) {
+        buffer[15-i] = hex_chars[(value >> (i*4)) & 0xF];
+    }
+    buffer[16] = 0;
+}
+
+// Simple PCI configuration space access
+static uint32_t pci_config_read_dword(uint16_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    uint32_t address = 0x80000000 | ((uint32_t)bus << 16) | ((uint32_t)device << 11) |
+                       ((uint32_t)function << 8) | (offset & 0xFC);
+
+    // Write address to CONFIG_ADDRESS (0xCF8)
+    asm volatile("outl %0, %w1" : : "a"(address), "Nd"(0xCF8) : "memory");
+
+    // Read data from CONFIG_DATA (0xCFC)
+    uint32_t result;
+    asm volatile("inl %w1, %0" : "=a"(result) : "Nd"(0xCFC) : "memory");
+
+    return result;
+}
+
+
+
+// Global hardware_registry and hardware_count are defined at the top of the file.
+
+// More comprehensive PCI class codes
+static const char* get_pci_class_name(uint8_t base_class, uint8_t sub_class) {
+    switch (base_class) {
+        case 0x00: return "Unclassified";
+        case 0x01:
+            switch (sub_class) {
+                case 0x00: return "SCSI Controller";
+                case 0x01: return "IDE Controller";
+                case 0x02: return "Floppy Controller";
+                case 0x03: return "IPI Controller";
+                case 0x04: return "RAID Controller";
+                case 0x05: return "ATA Controller";
+                case 0x06: return "SATA Controller";
+                case 0x07: return "SAS Controller";
+                case 0x08: return "NVMe Controller";
+                default: return "Storage Controller";
+            }
+        case 0x02: return "Network Controller";
+        case 0x03:
+            switch (sub_class) {
+                case 0x00: return "VGA Controller";
+                case 0x01: return "XGA Controller";
+                case 0x02: return "3D Controller";
+                default: return "Display Controller";
+            }
+        case 0x04: return "Multimedia Controller";
+        case 0x05: return "Memory Controller";
+        case 0x06: return "Bridge Device";
+        case 0x07: return "Communication Controller";
+        case 0x08: return "System Peripheral";
+        case 0x09: return "Input Device";
+        case 0x0A: return "Docking Station";
+        case 0x0B: return "Processor";
+        case 0x0C:
+            switch (sub_class) {
+                case 0x00: return "FireWire Controller";
+                case 0x01: return "ACCESS Bus";
+                case 0x02: return "SSA";
+                case 0x03: return "USB Controller";
+                case 0x04: return "Fibre Channel";
+                case 0x05: return "SMBus";
+                default: return "Serial Bus Controller";
+            }
+        case 0x0D: return "Wireless Controller";
+        case 0x0E: return "Intelligent Controller";
+        case 0x0F: return "Satellite Controller";
+        case 0x10: return "Encryption Controller";
+        case 0x11: return "Signal Processing Controller";
+        default: return "Unknown Device";
+    }
+}
+
+// Improved PCI device discovery
+static void discover_pci_devices() {
+    for (uint16_t bus = 0; bus < 256; bus++) {
+        for (uint8_t device = 0; device < 32; device++) {
+            for (uint8_t function = 0; function < 8; function++) {
+                uint32_t vendor_device = pci_config_read_dword(bus, device, function, 0);
+                if ((vendor_device & 0xFFFF) == 0xFFFF) continue;
+
+                if (hardware_count >= MAX_HARDWARE_DEVICES) return;
+
+                HardwareDevice& dev = hardware_registry[hardware_count];
+                dev.vendor_id = vendor_device & 0xFFFF;
+                dev.device_id = (vendor_device >> 16) & 0xFFFF;
+
+                // Read class code
+                uint32_t class_code = pci_config_read_dword(bus, device, function, 0x08);
+                uint8_t base_class = (class_code >> 24) & 0xFF;
+                uint8_t sub_class = (class_code >> 16) & 0xFF;
+
+                // Map to device type
+                switch (base_class) {
+                    case 0x01: dev.device_type = 1; break; // Storage
+                    case 0x02: dev.device_type = 2; break; // Network
+                    case 0x03: dev.device_type = 3; break; // Graphics
+                    case 0x04: dev.device_type = 4; break; // Audio
+                    case 0x0C:
+                        dev.device_type = (sub_class == 0x03) ? 5 : 0; // USB or other
+                        break;
+                    default: dev.device_type = 0; break;
+                }
+
+                // Get description
+                const char* desc = get_pci_class_name(base_class, sub_class);
+                strncpy(dev.description, desc, 63);
+                dev.description[63] = '\0';
+
+                // Read BAR0 for base address (handle both 32-bit and 64-bit BARs)
+                uint32_t bar0 = pci_config_read_dword(bus, device, function, 0x10);
+                if (bar0 & 0x1) {
+                    // I/O port
+                    dev.base_address = bar0 & 0xFFFFFFFC;
+                    dev.size = 0x100;
+                } else {
+                    // Memory mapped
+                    dev.base_address = bar0 & 0xFFFFFFF0;
+                    
+                    // Check if 64-bit BAR
+                    if ((bar0 & 0x6) == 0x4) {
+                        uint32_t bar1 = pci_config_read_dword(bus, device, function, 0x14);
+                        dev.base_address |= ((uint64_t)bar1 << 32);
+                    }
+                    
+                    // Try to determine size by writing all 1s and reading back
+                    pci_config_read_dword(bus, device, function, 0x04); // Save command reg
+                    uint32_t orig_bar = bar0;
+                    
+                    outl(0xCF8, 0x80000000 | ((uint32_t)bus << 16) | 
+                         ((uint32_t)device << 11) | ((uint32_t)function << 8) | 0x10);
+                    outl(0xCFC, 0xFFFFFFFF);
+                    uint32_t size_bar = inl(0xCFC);
+                    
+                    // Restore original BAR
+                    outl(0xCF8, 0x80000000 | ((uint32_t)bus << 16) | 
+                         ((uint32_t)device << 11) | ((uint32_t)function << 8) | 0x10);
+                    outl(0xCFC, orig_bar);
+                    
+                    if (size_bar != 0 && size_bar != 0xFFFFFFFF) {
+                        size_bar &= 0xFFFFFFF0;
+                        dev.size = ~size_bar + 1;
+                    } else {
+                        dev.size = 0x1000; // Default to 4KB
+                    }
+                }
+
+                hardware_count++;
+
+                if (function == 0) {
+                    uint8_t header_type = (class_code >> 16) & 0xFF;
+                    if (!(header_type & 0x80)) {
+                        break; // Single function device
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+static void discover_memory_regions() {
+    // Add known memory regions
+    if (hardware_count < MAX_HARDWARE_DEVICES) {
+        HardwareDevice& dev = hardware_registry[hardware_count];
+        dev.vendor_id = 0x0000;
+        dev.device_id = 0x0001;
+        dev.base_address = 0xB8000; // VGA text mode buffer
+        dev.size = 0x8000;
+        dev.device_type = 3;
+        simple_strcpy(dev.description, "VGA Text Buffer");
+        hardware_count++;
+    }
+
+    if (hardware_count < MAX_HARDWARE_DEVICES) {
+        HardwareDevice& dev = hardware_registry[hardware_count];
+        dev.vendor_id = 0x0000;
+        dev.device_id = 0x0002;
+        dev.base_address = 0xA0000; // VGA graphics buffer
+        dev.size = 0x20000;
+        dev.device_type = 3;
+        simple_strcpy(dev.description, "VGA Graphics Buffer");
+        hardware_count++;
+    }
+}
+
+static int scan_hardware() {
+    hardware_count = 0;
+    discover_pci_devices();
+    discover_memory_regions();
+    return hardware_count;
+}
+
+// Safety check for MMIO access
+static bool is_safe_mmio_address(uint64_t addr, uint64_t size) {
+    // Check if address falls within any known device range
+    for (int i = 0; i < hardware_count; i++) {
+        const HardwareDevice& dev = hardware_registry[i];
+        if (addr >= dev.base_address &&
+            addr + size <= dev.base_address + dev.size) {
+            return true;
+        }
+    }
+
+    // Allow access to standard VGA and system areas even if not enumerated
+    if (addr >= 0xA0000 && addr < 0x100000) return true; // VGA/BIOS area
+    if (addr >= 0xB8000 && addr < 0xC0000) return true; // VGA text buffer
+    if (addr >= 0x3C0 && addr < 0x3E0) return true;     // VGA registers
+    if (addr >= 0x60 && addr < 0x70) return true;       // Keyboard controller
+
+    return false;
+}
+
+// ============================================================
+// Enhanced Bytecode ISA with Hardware Discovery and MMIO
+// ============================================================
+enum TOp : unsigned char {
+    // stack/data
+    T_NOP=0, T_PUSH_IMM, T_PUSH_STR, T_LOAD_LOCAL, T_STORE_LOCAL, T_POP,
+
+    // arithmetic / unary
+    T_ADD, T_SUB, T_MUL, T_DIV, T_NEG,
+
+    // comparisons
+    T_EQ, T_NE, T_LT, T_LE, T_GT, T_GE,
+
+    // control flow
+    T_JMP, T_JZ, T_JNZ, T_RET,
+
+    // I/O and args
+    T_PRINT_INT, T_PRINT_CHAR, T_PRINT_STR, T_PRINT_ENDL, T_PRINT_INT_ARRAY, T_PRINT_STRING_ARRAY,
+    T_READ_INT, T_READ_CHAR, T_READ_STR,
+    T_PUSH_ARGC, T_PUSH_ARGV_PTR,
+
+    // File I/O operations
+    T_READ_FILE, T_WRITE_FILE, T_APPEND_FILE,
+
+    // Array operations
+    T_ALLOC_ARRAY, T_LOAD_ARRAY, T_STORE_ARRAY, T_ARRAY_SIZE, T_ARRAY_RESIZE,
+
+    // String operations
+    T_STR_CONCAT, T_STR_LENGTH, T_STR_SUBSTR, T_INT_TO_STR, T_STR_COMPARE,
+    T_STR_FIND_CHAR, T_STR_FIND_STR, T_STR_FIND_LAST_CHAR, T_STR_CONTAINS,
+    T_STR_STARTS_WITH, T_STR_ENDS_WITH, T_STR_COUNT_CHAR, T_STR_REPLACE_CHAR,
+
+    // NEW: Hardware Discovery and Memory-Mapped I/O
+    T_SCAN_HARDWARE,      // () -> device_count
+    T_GET_DEVICE_INFO,    // (device_index) -> device_array_handle
+    T_MMIO_READ8,         // (address) -> uint8_value
+    T_MMIO_READ16,        // (address) -> uint16_value
+    T_MMIO_READ32,        // (address) -> uint32_value
+    T_MMIO_READ64,        // (address) -> uint64_value (split into two 32-bit values)
+    T_MMIO_WRITE8,        // (address, value) -> success
+    T_MMIO_WRITE16,       // (address, value) -> success
+    T_MMIO_WRITE32,       // (address, value) -> success
+    T_MMIO_WRITE64,       // (address, low32, high32) -> success
+    T_GET_HARDWARE_ARRAY, // () -> hardware_device_array_handle
+    T_DISPLAY_MEMORY_MAP // () -> displays formatted memory map
+};
+
+// ============================================================
+// Enhanced Program buffers with hardware support
+// ============================================================
+struct TProgram {
+    static const int CODE_MAX = 8192;
+    unsigned char code[CODE_MAX];
+    int pc = 0;
+
+    static const int LIT_MAX = 4096;
+    char lit[LIT_MAX];
+    int lit_top = 0;
+
+    static const int LOC_MAX = 32;
+    char  loc_name[LOC_MAX][32];
+    unsigned char loc_type[LOC_MAX]; // 0=int,1=char,2=string,3=int_array,4=string_array,5=device_array
+    int   loc_array_size[LOC_MAX];
+    int   loc_count = 0;
+
+    int add_local(const char* name, unsigned char t, int array_size = 0){
+        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], name)==0) return i; }
+        if(loc_count>=LOC_MAX) return -1;
+        simple_strcpy(loc_name[loc_count], name);
+        loc_type[loc_count]=t;
+        loc_array_size[loc_count] = array_size;
+        return loc_count++;
+    }
+    int get_local(const char* name){
+        for(int i=0;i<loc_count;i++){ if(simple_strcmp(loc_name[i], name)==0) return i; }
+        return -1;
+    }
+    int get_local_type(int idx){ return (idx>=0 && idx<loc_count)? loc_type[idx] : 0; }
+    int get_array_size(int idx){ return (idx>=0 && idx<loc_count)? loc_array_size[idx] : 0; }
+
+    void emit1(unsigned char op){ if(pc<CODE_MAX) code[pc++]=op; }
+    void emit4(int v){ if(pc+4<=CODE_MAX){ code[pc++]=v&0xff; code[pc++]=(v>>8)&0xff; code[pc++]=(v>>16)&0xff; code[pc++]=(v>>24)&0xff; } }
+    int  mark(){ return pc; }
+    void patch4(int at, int v){ if(at+4<=CODE_MAX){ code[at+0]=v&0xff; code[at+1]=(v>>8)&0xff; code[at+2]=(v>>16)&0xff; code[at+3]=(v>>24)&0xff; } }
+
+    const char* add_lit(const char* s){
+        int n = tcc_strlen(s)+1;
+        if(lit_top+n > LIT_MAX) return "";
+        char* p = &lit[lit_top];
+        simple_memcpy(p, s, n);
+        lit_top += n;
+        return p;
+    }
+};
+
+// ============================================================
+// Enhanced Tokenizer with hardware and MMIO keywords
+// ============================================================
+enum TTokType { TT_EOF, TT_ID, TT_NUM, TT_STR, TT_CH, TT_KW, TT_OP, TT_PUNC };
+struct TTok { TTokType t; char v[256]; int ival; };
+
+struct TLex {
+    const char* src; int pos; int line;
+    void init(const char* s){ src=s; pos=0; line=1; }
+
+    void skipws(){
+        for(;;){
+            char c=src[pos];
+            if(c==' '||c=='\t'||c=='\r'||c=='\n'){ if(c=='\n') line++; pos++; continue; }
+            if(c=='/' && src[pos+1]=='/'){ pos+=2; while(src[pos] && src[pos]!='\n') pos++; continue; }
+            if(c=='/' && src[pos+1]=='*'){ pos+=2; while(src[pos] && !(src[pos]=='*'&&src[pos+1]=='/')) pos++; if(src[pos]) pos+=2; continue; }
+            break;
+        }
+    }
+
+    TTok number(){
+        TTok t; t.t=TT_NUM; t.ival=0; int i=0;
+        // Support hex numbers (0x prefix)
+        if(src[pos] == '0' && (src[pos+1] == 'x' || src[pos+1] == 'X')) {
+            pos += 2;
+            t.v[i++] = '0'; t.v[i++] = 'x';
+            while(i < 63 && ((src[pos] >= '0' && src[pos] <= '9') ||
+                             (src[pos] >= 'a' && src[pos] <= 'f') ||
+                             (src[pos] >= 'A' && src[pos] <= 'F'))) {
+                char c = src[pos];
+                t.v[i++] = c;
+                if(c >= '0' && c <= '9') t.ival = t.ival * 16 + (c - '0');
+                else if(c >= 'a' && c <= 'f') t.ival = t.ival * 16 + (c - 'a' + 10);
+                else if(c >= 'A' && c <= 'F') t.ival = t.ival * 16 + (c - 'A' + 10);
+                pos++;
+            }
+        } else {
+            while(tcc_is_digit(src[pos])){ t.v[i++]=src[pos]; t.ival = t.ival*10 + (src[pos]-'0'); pos++; if(i>=63) break; }
+        }
+        t.v[i]=0; return t;
+    }
+
+    TTok ident(){
+        TTok t; t.t=TT_ID; int i=0;
+        while(tcc_is_alnum(src[pos])){ t.v[i++]=src[pos++]; if(i>=63) break; } t.v[i]=0;
+        // Enhanced keywords with hardware and MMIO functions
+        const char* kw[]={"int","char","string","return","if","else","while","break","continue",
+                          "cin","cout","endl","argc","argv","read_file","write_file","append_file",
+                          "array_size","array_resize","str_length","str_substr","int_to_str","str_compare",
+                          "str_find_char","str_find_str","str_find_last_char","str_contains",
+                          "str_starts_with","str_ends_with","str_count_char","str_replace_char",
+                          "scan_hardware","get_device_info","get_hardware_array","display_memory_map",
+                          "mmio_read8","mmio_read16","mmio_read32","mmio_read64",
+                          "mmio_write8","mmio_write16","mmio_write32","mmio_write64",0};
+        for(int k=0; kw[k]; ++k){ if(simple_strcmp(t.v,kw[k])==0){ t.t=TT_KW; break; } }
+        return t;
+    }
+
+    TTok string(){
+        TTok t; t.t=TT_STR; int i=0; pos++;
+        while(src[pos] && src[pos]!='"'){ if(i<256) t.v[i++]=src[pos]; pos++; }
+        t.v[i]=0; if(src[pos]=='"') pos++; return t;
+    }
+
+    TTok chlit(){
+        TTok t; t.t=TT_CH; t.v[0]=0; int v=0; pos++; // skip '
+        if(src[pos] && src[pos+1]=='\''){ v = (unsigned char)src[pos]; pos+=2; }
+        t.ival = v; return t;
+    }
+
+    TTok op_or_punc(){
+        TTok t; t.t=TT_OP; t.v[0]=src[pos]; t.v[1]=0; char c=src[pos];
+        if(c=='<' && src[pos+1]=='<'){ t.v[0]='<'; t.v[1]='<'; t.v[2]=0; pos+=2; return t; }
+        if(c=='>' && src[pos+1]=='>'){ t.v[0]='>'; t.v[1]='>'; t.v[2]=0; pos+=2; return t; }
+        if((c=='='||c=='!'||c=='<'||c=='>') && src[pos+1]=='='){ t.v[0]=c; t.v[1]='='; t.v[2]=0; pos+=2; return t; }
+        pos++; if(c=='('||c==')'||c=='{'||c=='}'||c==';'||c==','||c=='['||c==']') t.t=TT_PUNC; return t;
+    }
+
+    TTok next(){
+        skipws();
+        if(src[pos]==0){ TTok t; t.t=TT_EOF; t.v[0]=0; return t; }
+        if(src[pos]=='"') return string();
+        if(src[pos]=='\'') return chlit();
+        if(tcc_is_digit(src[pos]) || (src[pos]=='0' && (src[pos+1]=='x'||src[pos+1]=='X'))) return number();
+        if(tcc_is_alpha(src[pos])) return ident();
+        return op_or_punc();
+    }
+};
+
+// ============================================================
+// Enhanced Parser / Compiler with Hardware and MMIO support
+// ============================================================
+struct TCompiler {
+    TLex lx; TTok tk; TProgram pr;
+
+    int brk_pos[32]; int brk_cnt=0;
+    int cont_pos[32]; int cont_cnt=0;
+
+    void adv(){ tk = lx.next(); }
+    int  accept(const char* s){ if(simple_strcmp(tk.v,s)==0){ adv(); return 1; } return 0; }
+    void expect(const char* s){ if(!accept(s)) { printf("Parse error near: %s\n", tk.v); } }
+
+    void parse_primary(){
+        if(tk.t==TT_NUM){ pr.emit1(T_PUSH_IMM); pr.emit4(tk.ival); adv(); return; }
+        if(tk.t==TT_CH){ pr.emit1(T_PUSH_IMM); pr.emit4(tk.ival); adv(); return; }
+        if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"argc")==0){ pr.emit1(T_PUSH_ARGC); adv(); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); return; }
+
+        // File I/O built-ins
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"read_file")==0){
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_READ_FILE); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"write_file")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_WRITE_FILE); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"append_file")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_APPEND_FILE); return;
+        }
+
+        // Array built-ins
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"array_size")==0){
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_ARRAY_SIZE); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"array_resize")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_ARRAY_RESIZE); return;
+        }
+
+        // String built-ins
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_length")==0){
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_STR_LENGTH); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_substr")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(",");
+            parse_expression(); expect(")"); pr.emit1(T_STR_SUBSTR); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"int_to_str")==0){
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_INT_TO_STR); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_compare")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_COMPARE); return;
+        }
+
+        // String search functions
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_char")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_CHAR); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_str")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_STR); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_find_last_char")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_FIND_LAST_CHAR); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_contains")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_CONTAINS); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_starts_with")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_STARTS_WITH); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_ends_with")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_ENDS_WITH); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_count_char")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_STR_COUNT_CHAR); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"str_replace_char")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(",");
+            parse_expression(); expect(")"); pr.emit1(T_STR_REPLACE_CHAR); return;
+        }
+
+        // NEW: Hardware Discovery Functions
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"scan_hardware")==0){
+            adv(); expect("("); expect(")"); pr.emit1(T_SCAN_HARDWARE); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"get_device_info")==0){
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_GET_DEVICE_INFO); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"get_hardware_array")==0){
+            adv(); expect("("); expect(")"); pr.emit1(T_GET_HARDWARE_ARRAY); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"display_memory_map")==0){
+            adv(); expect("("); expect(")"); pr.emit1(T_DISPLAY_MEMORY_MAP); return;
+        }
+
+        // NEW: Memory-Mapped I/O Functions
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read8")==0){
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ8); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read16")==0){
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ16); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read32")==0){
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ32); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_read64")==0){
+            adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_MMIO_READ64); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write8")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE8); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write16")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE16); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write32")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE32); return;
+        }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"mmio_write64")==0){
+            adv(); expect("("); parse_expression(); expect(","); parse_expression(); expect(",");
+            parse_expression(); expect(")"); pr.emit1(T_MMIO_WRITE64); return;
+        }
+
+        if(tk.t==TT_PUNC && tk.v[0]=='('){ adv(); parse_expression(); expect(")"); return; }
+
+        if(tk.t==TT_ID){
+            int idx = pr.get_local(tk.v);
+            if(idx<0){ printf("Unknown var %s\n", tk.v); }
+            char var_name[32]; simple_strcpy(var_name, tk.v);
+            adv();
+
+            // Array indexing
+            if(tk.t==TT_PUNC && tk.v[0]=='['){
+                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // push handle
+                adv(); // past '['
+                parse_expression(); // push index
+                expect("]");
+                pr.emit1(T_LOAD_ARRAY);
+                return;
+            }
+
+            pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);
+            return;
+        }
+    }
+
+    void parse_unary(){
+        if(accept("-")){ parse_unary(); pr.emit1(T_NEG); return; }
+        parse_primary();
+    }
+
+    void parse_term(){
+        parse_unary();
+        while(tk.v[0]=='*' || tk.v[0]=='/'){
+            char op=tk.v[0]; adv(); parse_unary();
+            pr.emit1(op=='*'?T_MUL:T_DIV);
+        }
+    }
+
+    void parse_arith(){
+        parse_term();
+        while(tk.v[0]=='+' || tk.v[0]=='-'){
+            char op=tk.v[0]; adv(); parse_term();
+            if(op=='+') {
+                pr.emit1(T_ADD); // This will be overridden for strings in VM
+            } else {
+                pr.emit1(T_SUB);
+            }
+        }
+    }
+
+    void parse_cmp(){
+        parse_arith();
+        while(tk.t==TT_OP && (simple_strcmp(tk.v,"==")==0 || simple_strcmp(tk.v,"!=")==0 ||
+              simple_strcmp(tk.v,"<")==0 || simple_strcmp(tk.v,"<=")==0 ||
+              simple_strcmp(tk.v,">")==0 || simple_strcmp(tk.v,">=")==0)){
+            char opv[3]; simple_strcpy(opv, tk.v); adv(); parse_arith();
+            if(simple_strcmp(opv,"==")==0) pr.emit1(T_EQ);
+            else if(simple_strcmp(opv,"!=")==0) pr.emit1(T_NE);
+            else if(simple_strcmp(opv,"<")==0)  pr.emit1(T_LT);
+            else if(simple_strcmp(opv,"<=")==0) pr.emit1(T_LE);
+            else if(simple_strcmp(opv,">")==0)  pr.emit1(T_GT);
+            else pr.emit1(T_GE);
+        }
+    }
+
+    void parse_expression(){ parse_cmp(); }
+
+    void parse_decl(unsigned char tkind){
+        adv(); // past type keyword
+        if(tk.t!=TT_ID){ printf("Expected identifier\n"); return; }
+        char nm[32]; simple_strcpy(nm, tk.v); adv();
+
+        int array_size = 0;
+        // Array declaration syntax: int arr[size] or string arr[size]
+        if(tk.t==TT_PUNC && tk.v[0]=='['){
+            adv();
+            if(tk.t==TT_NUM){
+                array_size = tk.ival;
+                adv();
+            } else {
+                printf("Expected array size\n"); return;
+            }
+            expect("]");
+
+            if (tkind == 0) tkind = 3; // int -> int_array
+            else if (tkind == 2) tkind = 4; // string -> string_array
+        }
+
+        int idx = pr.add_local(nm, tkind, array_size);
+
+        // If it's an array, allocate it now, before parsing initializer
+        if (tkind == 3 || tkind == 4) {
+            pr.emit1(T_PUSH_IMM); pr.emit4(array_size);
+            pr.emit1(T_ALLOC_ARRAY);
+            pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
+        }
+
+        if(accept("=")){
+            if(tkind==3 || tkind==4){ // Array initialization
+                expect("{");
+                int i = 0;
+                do {
+                    if (tk.t == TT_PUNC && tk.v[0] == '}') break; // empty list or trailing comma
+                    if (i >= array_size) {
+                        printf("Too many initializers for array\n");
+                        while(!accept("}")) { if(tk.t==TT_EOF) break; adv(); }
+                        goto end_init;
+                    }
+
+                    pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);      // 1. Push handle
+                    pr.emit1(T_PUSH_IMM); pr.emit4(i);        // 2. Push index
+                    parse_expression();                       // 3. Push value
+                    pr.emit1(T_STORE_ARRAY);                    // 4. Store
+                    i++;
+                } while(accept(","));
+                expect("}");
+                end_init:;
+            } else if(tkind==2){ // string
+                if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); }
+                else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); }
+                else if(tk.t==TT_ID){ int j=pr.get_local(tk.v); adv(); pr.emit1(T_LOAD_LOCAL); pr.emit4(j); }
+                else { parse_expression(); }
+                pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
+            } else {
+                parse_expression();
+                pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
+            }
+        }
+        expect(";");
+    }
+
+    void parse_assign_or_coutcin(){
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"cout")==0){ adv();
+            for(;;){
+                expect("<<");
+                if(tk.t==TT_KW && simple_strcmp(tk.v,"endl")==0){ adv(); pr.emit1(T_PRINT_ENDL); }
+                else if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); pr.emit1(T_PRINT_STR); }
+                else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); pr.emit1(T_PRINT_STR); }
+                else if(tk.t==TT_ID){
+                    char var_name[32]; simple_strcpy(var_name, tk.v);
+                    int idx = pr.get_local(tk.v); int ty = pr.get_local_type(idx); adv();
+
+                    // Handle array element printing vs whole array printing
+                    if(tk.t==TT_PUNC && tk.v[0]=='['){
+                        pr.emit1(T_LOAD_LOCAL); pr.emit4(idx); // load array
+                        adv(); // past '['
+                        parse_expression(); // push index
+                        expect("]");
+                        pr.emit1(T_LOAD_ARRAY); // load element
+                        if (ty == 3) pr.emit1(T_PRINT_INT);      // int array element
+                        else if (ty == 4) pr.emit1(T_PRINT_STR);  // string array element
+                        else if (ty == 5) pr.emit1(T_PRINT_INT);  // device array element
+                    } else {
+                        pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);
+                        if(ty==4) pr.emit1(T_PRINT_STRING_ARRAY); // Print whole string array
+                        else if(ty==3) pr.emit1(T_PRINT_INT_ARRAY); // Print whole int array
+                        else if(ty==2) pr.emit1(T_PRINT_STR);
+                        else if(ty==1) pr.emit1(T_PRINT_CHAR);
+                        else pr.emit1(T_PRINT_INT);
+                    }
+                } else { parse_expression(); pr.emit1(T_PRINT_INT); }
+                if(tk.t==TT_PUNC && tk.v[0]==';'){ adv(); break; }
+            }
+            return;
+        }
+        if (tk.t==TT_KW && simple_strcmp(tk.v,"cin")==0) {
+            adv();
+            for (;;) {
+                expect(">>");
+                if (tk.t != TT_ID) {
+                    printf("cin expects identifier\n");
+                    return;
+                }
+                int idx = pr.get_local(tk.v);
+                int ty  = pr.get_local_type(idx);
+                adv(); // past identifier
+
+                // Read into scalar variable based on its type
+                if (ty == 2)      pr.emit1(T_READ_STR);   // string
+                else if (ty == 1) pr.emit1(T_READ_CHAR);  // char
+                else              pr.emit1(T_READ_INT);   // int (default)
+
+                pr.emit1(T_STORE_LOCAL);
+                pr.emit4(idx);
+
+                // End the chain only at a semicolon; otherwise continue parsing >>
+                if (tk.t == TT_PUNC && tk.v[0] == ';') {
+                    adv();
+                    break;
+                }
+            }
+            return;
+        }
+
+        if(tk.t==TT_ID){
+            int idx = pr.get_local(tk.v);
+            if(idx<0){ printf("Unknown var %s\n", tk.v); }
+            int ty = pr.get_local_type(idx);
+            adv();
+
+            // Array element assignment
+            if(tk.t==TT_PUNC && tk.v[0]=='['){
+                pr.emit1(T_LOAD_LOCAL); pr.emit4(idx);  // 1. Push handle
+                adv(); // past '['
+                parse_expression();                      // 2. Push index
+                expect("]");
+                expect("=");
+                parse_expression();                      // 3. Push value
+                pr.emit1(T_STORE_ARRAY);                    // 4. Store
+                expect(";");
+                return;
+            }
+
+            expect("=");
+            if(ty==2){
+                if(tk.t==TT_STR){ const char* p=pr.add_lit(tk.v); pr.emit1(T_PUSH_STR); pr.emit4((int)p); adv(); }
+                else if(tk.t==TT_KW && simple_strcmp(tk.v,"argv")==0){ adv(); expect("("); parse_expression(); expect(")"); pr.emit1(T_PUSH_ARGV_PTR); }
+                else if(tk.t==TT_ID){ int j=pr.get_local(tk.v); adv(); pr.emit1(T_LOAD_LOCAL); pr.emit4(j); }
+                else { parse_expression(); }
+            } else {
+                parse_expression();
+            }
+            pr.emit1(T_STORE_LOCAL); pr.emit4(idx);
+            expect(";");
+            return;
+        }
+
+        // Expression statement
+        parse_expression();
+        pr.emit1(T_POP); // Pop unused result
+        expect(";");
+    }
+
+    void parse_if(){
+        adv(); expect("("); parse_expression(); expect(")");
+        pr.emit1(T_JZ); int jz_at = pr.mark(); pr.emit4(0);
+        parse_block();
+        int has_else = (tk.t==TT_KW && simple_strcmp(tk.v,"else")==0);
+        if(has_else){
+            pr.emit1(T_JMP); int j_at = pr.mark(); pr.emit4(0);
+            int here = pr.pc; pr.patch4(jz_at, here);
+            adv(); // else
+            parse_block();
+            int end = pr.pc; pr.patch4(j_at, end);
+        } else {
+            int here = pr.pc; pr.patch4(jz_at, here);
+        }
+    }
+
+    void parse_while(){
+        adv(); expect("("); int cond_ip = pr.pc; parse_expression(); expect(")");
+        pr.emit1(T_JZ); int jz_at = pr.mark(); pr.emit4(0);
+        int brk_base=brk_cnt, cont_base=cont_cnt;
+        parse_block();
+        for(int i=cont_base;i<cont_cnt;i++){ pr.patch4(cont_pos[i], cond_ip); }
+        cont_cnt = cont_base;
+        pr.emit1(T_JMP); pr.emit4(cond_ip);
+        int end_ip = pr.pc; pr.patch4(jz_at, end_ip);
+        for(int i=brk_base;i<brk_cnt;i++){ pr.patch4(brk_pos[i], end_ip); }
+        brk_cnt = brk_base;
+    }
+
+    void parse_block(){
+        if(accept("{")){
+            while(!(tk.t==TT_PUNC && tk.v[0]=='}') && tk.t!=TT_EOF) parse_stmt();
+            expect("}");
+        } else {
+            parse_stmt();
+        }
+    }
+
+    void parse_stmt(){
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"int")==0){ parse_decl(0); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"char")==0){ parse_decl(1); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"string")==0){ parse_decl(2); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"return")==0){ adv(); parse_expression(); pr.emit1(T_RET); expect(";"); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"if")==0){ parse_if(); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"while")==0){ parse_while(); return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"break")==0){ adv(); expect(";"); pr.emit1(T_JMP); int at=pr.mark(); pr.emit4(0); brk_pos[brk_cnt++]=at; return; }
+        if(tk.t==TT_KW && simple_strcmp(tk.v,"continue")==0){ adv(); expect(";"); pr.emit1(T_JMP); int at=pr.mark(); pr.emit4(0); cont_pos[cont_cnt++]=at; return; }
+        parse_assign_or_coutcin();
+    }
+
+    int compile(const char* source){
+        lx.init(source); adv();
+        if(!(tk.t==TT_KW && simple_strcmp(tk.v,"int")==0)) { printf("Expected 'int' at start\n"); return -1; }
+        adv();
+        if(!(tk.t==TT_ID && simple_strcmp(tk.v,"main")==0)){ printf("Expected main\n"); return -1; }
+        adv(); expect("("); expect(")"); parse_block();
+        pr.emit1(T_PUSH_IMM); pr.emit4(0); pr.emit1(T_RET);
+        return pr.pc;
+    }
+};
+
+// ============================================================
+// Enhanced VM with Hardware Discovery and Memory-Mapped I/O
+// ============================================================
+struct TinyVM {
+    static const int STK_MAX = 1024;
+    int   stk[STK_MAX]; int sp=0;
+    int   locals[TProgram::LOC_MAX];
+    int   argc; const char** argv;
+    TProgram* P;
+    char str_in[256];
+    uint64_t ahci_base; int port; // for file I/O
+
+    // String pool for dynamic string management
+    static const int STRING_POOL_SIZE = 8192;
+    char string_pool[STRING_POOL_SIZE];
+    int string_pool_top = 0;
+
+    // Simple array management
+    struct Array {
+        int* data;
+        int size;
+        int capacity;
+    };
+    static const int MAX_ARRAYS = 64;
+    Array arrays[MAX_ARRAYS];
+    int array_count = 0;
+
+    // Special array handle for hardware devices
+    int hardware_array_handle = 0;
+
+    inline void push(int v){ if(sp<STK_MAX) stk[sp++]=v; }
+    inline int  pop(){ return sp?stk[--sp]:0; }
+
+    // Memory-Mapped I/O functions
+    uint8_t mmio_read_8(uint64_t addr) {
+        if (!is_safe_mmio_address(addr, 1)) {
+            char hex[17]; uint64_to_hex_string(addr, hex);
+            printf("MMIO: Unsafe read8 at 0x%s\n", hex);
+            return 0xFF;
+        }
+        return *(volatile uint8_t*)addr;
+    }
+
+    uint16_t mmio_read_16(uint64_t addr) {
+        if (!is_safe_mmio_address(addr, 2)) {
+            char hex[17]; uint64_to_hex_string(addr, hex);
+            printf("MMIO: Unsafe read16 at 0x%s\n", hex);
+            return 0xFFFF;
+        }
+        return *(volatile uint16_t*)addr;
+    }
+
+    uint32_t mmio_read_32(uint64_t addr) {
+        if (!is_safe_mmio_address(addr, 4)) {
+            char hex[17]; uint64_to_hex_string(addr, hex);
+            printf("MMIO: Unsafe read32 at 0x%s\n", hex);
+            return 0xFFFFFFFF;
+        }
+        return *(volatile uint32_t*)addr;
+    }
+
+    uint64_t mmio_read_64(uint64_t addr) {
+        if (!is_safe_mmio_address(addr, 8)) {
+            char hex[17]; uint64_to_hex_string(addr, hex);
+            printf("MMIO: Unsafe read64 at 0x%s\n", hex);
+            return 0xFFFFFFFFFFFFFFFFULL;
+        }
+        return *(volatile uint64_t*)addr;
+    }
+
+    bool mmio_write_8(uint64_t addr, uint8_t value) {
+        if (!is_safe_mmio_address(addr, 1)) {
+            char hex[17]; uint64_to_hex_string(addr, hex);
+            printf("MMIO: Unsafe write8 at 0x%s\n", hex);
+            return false;
+        }
+        *(volatile uint8_t*)addr = value;
+        return true;
+    }
+
+    bool mmio_write_16(uint64_t addr, uint16_t value) {
+        if (!is_safe_mmio_address(addr, 2)) {
+            char hex[17]; uint64_to_hex_string(addr, hex);
+            printf("MMIO: Unsafe write16 at 0x%s\n", hex);
+            return false;
+        }
+        *(volatile uint16_t*)addr = value;
+        return true;
+    }
+
+    bool mmio_write_32(uint64_t addr, uint32_t value) {
+        if (!is_safe_mmio_address(addr, 4)) {
+            char hex[17]; uint64_to_hex_string(addr, hex);
+            printf("MMIO: Unsafe write32 at 0x%s\n", hex);
+            return false;
+        }
+        *(volatile uint32_t*)addr = value;
+        return true;
+    }
+
+    bool mmio_write_64(uint64_t addr, uint64_t value) {
+        if (!is_safe_mmio_address(addr, 8)) {
+            char hex[17]; uint64_to_hex_string(addr, hex);
+            printf("MMIO: Unsafe write64 at 0x%s\n", hex);
+            return false;
+        }
+        *(volatile uint64_t*)addr = value;
+        return true;
+    }
+
+    // String management functions
+    const char* alloc_string(int len) {
+        if(string_pool_top + len + 1 > STRING_POOL_SIZE) {
+            string_pool_top = 0; // Simple reset
+        }
+        if(string_pool_top + len + 1 > STRING_POOL_SIZE) return nullptr;
+        char* result = &string_pool[string_pool_top];
+        string_pool_top += len + 1;
+        return result;
+    }
+
+    const char* concat_strings(const char* a, const char* b) {
+        if(!a) a = "";
+        if(!b) b = "";
+        int len_a = tcc_strlen(a);
+        int len_b = tcc_strlen(b);
+        const char* result = alloc_string(len_a + len_b);
+        if(!result) return "";
+        char* dest = (char*)result;
+        simple_memcpy(dest, a, len_a);
+        simple_memcpy(dest + len_a, b, len_b + 1);
+        return result;
+    }
+
+    const char* int_to_string_vm(int value) {
+        static char temp_buf[16];
+        int_to_string(value, temp_buf);
+        int len = tcc_strlen(temp_buf);
+        const char* result = alloc_string(len);
+        if(!result) return "";
+        simple_memcpy((char*)result, temp_buf, len + 1);
+        return result;
+    }
+
+    const char* substring(const char* str, int start, int len) {
+        if(!str) return "";
+        int str_len = tcc_strlen(str);
+        if(start < 0 || start >= str_len || len <= 0) return "";
+        if(start + len > str_len) len = str_len - start;
+
+        const char* result = alloc_string(len);
+        if(!result) return "";
+        char* dest = (char*)result;
+        simple_memcpy(dest, str + start, len);
+        dest[len] = 0;
+        return result;
+    }
+
+    int string_compare(const char* a, const char* b) {
+        if(!a && !b) return 0;
+        if(!a) return -1;
+        if(!b) return 1;
+        return simple_strcmp(a, b);
+    }
+
+    // String search and manipulation functions (abbreviated for space)
+    int find_char(const char* str, char c) {
+        if(!str) return -1;
+        for(int i = 0; str[i]; i++) {
+            if(str[i] == c) return i;
+        }
+        return -1;
+    }
+
+    int find_last_char(const char* str, char c) {
+        if(!str) return -1;
+        int last_pos = -1;
+        for(int i = 0; str[i]; i++) {
+            if(str[i] == c) last_pos = i;
+        }
+        return last_pos;
+    }
+
+    int find_string(const char* haystack, const char* needle) {
+        if(!haystack || !needle) return -1;
+        if(!needle[0]) return 0;
+
+        int hay_len = tcc_strlen(haystack);
+        int needle_len = tcc_strlen(needle);
+        if(needle_len > hay_len) return -1;
+
+        for(int i = 0; i <= hay_len - needle_len; i++) {
+            int j;
+            for(j = 0; j < needle_len; j++) {
+                if(haystack[i + j] != needle[j]) break;
+            }
+            if(j == needle_len) return i;
+        }
+        return -1;
+    }
+
+    int string_contains(const char* str, const char* substr) {
+        return find_string(str, substr) != -1 ? 1 : 0;
+    }
+
+    int string_starts_with(const char* str, const char* prefix) {
+        if(!str || !prefix) return 0;
+        if(!prefix[0]) return 1;
+
+        int i = 0;
+        while(prefix[i] && str[i]) {
+            if(str[i] != prefix[i]) return 0;
+            i++;
+        }
+        return prefix[i] == 0 ? 1 : 0;
+    }
+
+    int string_ends_with(const char* str, const char* suffix) {
+        if(!str || !suffix) return 0;
+        if(!suffix[0]) return 1;
+
+        int str_len = tcc_strlen(str);
+        int suffix_len = tcc_strlen(suffix);
+        if(suffix_len > str_len) return 0;
+
+        int start_pos = str_len - suffix_len;
+        for(int i = 0; i < suffix_len; i++) {
+            if(str[start_pos + i] != suffix[i]) return 0;
+        }
+        return 1;
+    }
+
+    int count_char(const char* str, char c) {
+        if(!str) return 0;
+        int count = 0;
+        for(int i = 0; str[i]; i++) {
+            if(str[i] == c) count++;
+        }
+        return count;
+    }
+
+    const char* replace_char(const char* str, char old_char, char new_char) {
+        if(!str) return "";
+        int len = tcc_strlen(str);
+        const char* result = alloc_string(len);
+        if(!result) return "";
+
+        char* dest = (char*)result;
+        for(int i = 0; i < len; i++) {
+            dest[i] = (str[i] == old_char) ? new_char : str[i];
+        }
+        dest[len] = 0;
+        return result;
+    }
+
+    // Check if values on stack are strings
+    bool is_string_ptr(int val) {
+        const char* ptr = (const char*)val;
+        return (ptr >= P->lit && ptr < P->lit + P->lit_top) ||
+               (ptr >= string_pool && ptr < string_pool + string_pool_top);
+    }
+
+    // Array management functions
+    int alloc_array(int size) {
+        if(array_count >= MAX_ARRAYS) return 0;
+        Array& arr = arrays[array_count];
+        arr.size = size;
+        arr.capacity = size;
+        static int array_pool[MAX_ARRAYS * 256];
+        static int pool_offset = 0;
+        if(pool_offset + size > MAX_ARRAYS * 256) return 0;
+        arr.data = &array_pool[pool_offset];
+        pool_offset += size;
+        for(int i = 0; i < size; i++) arr.data[i] = 0;
+        return ++array_count;
+    }
+
+    Array* get_array(int handle) {
+        if(handle <= 0 || handle > array_count) return nullptr;
+        return &arrays[handle - 1];
+    }
+
+    int resize_array(int handle, int new_size) {
+        Array* arr = get_array(handle);
+        if(!arr || new_size <= 0) return 0;
+
+        int new_handle = alloc_array(new_size);
+        Array* new_arr = get_array(new_handle);
+        if(!new_arr) return 0;
+
+        int copy_size = (arr->size < new_size) ? arr->size : new_size;
+        for(int i = 0; i < copy_size; i++) {
+            new_arr->data[i] = arr->data[i];
+        }
+        return new_handle;
+    }
+
+    // NEW: Create hardware device info array
+    int create_device_info_array(int device_index) {
+        if(device_index < 0 || device_index >= hardware_count) return 0;
+
+        const HardwareDevice& dev = hardware_registry[device_index];
+
+        // Create array with device info: [vendor_id, device_id, base_addr_low, base_addr_high, size_low, size_high, device_type]
+        int handle = alloc_array(7);
+        Array* arr = get_array(handle);
+        if(!arr) return 0;
+
+        arr->data[0] = dev.vendor_id;
+        arr->data[1] = dev.device_id;
+        arr->data[2] = (uint32_t)(dev.base_address & 0xFFFFFFFF);      // low 32 bits
+        arr->data[3] = (uint32_t)((dev.base_address >> 32) & 0xFFFFFFFF); // high 32 bits
+        arr->data[4] = (uint32_t)(dev.size & 0xFFFFFFFF);            // size low 32 bits
+        arr->data[5] = (uint32_t)((dev.size >> 32) & 0xFFFFFFFF);    // size high 32 bits
+        arr->data[6] = dev.device_type;
+
+        return handle;
+    }
+
+    // NEW: Create array containing all hardware devices
+    int create_hardware_array() {
+        if(hardware_array_handle > 0) return hardware_array_handle; // Return existing handle
+
+        hardware_array_handle = alloc_array(hardware_count * 7); // 7 fields per device
+        Array* arr = get_array(hardware_array_handle);
+        if(!arr) return 0;
+
+        for(int i = 0; i < hardware_count; i++) {
+            const HardwareDevice& dev = hardware_registry[i];
+            int base = i * 7;
+            arr->data[base + 0] = dev.vendor_id;
+            arr->data[base + 1] = dev.device_id;
+            arr->data[base + 2] = (uint32_t)(dev.base_address & 0xFFFFFFFF);
+            arr->data[base + 3] = (uint32_t)((dev.base_address >> 32) & 0xFFFFFFFF);
+            arr->data[base + 4] = (uint32_t)(dev.size & 0xFFFFFFFF);
+            arr->data[base + 5] = (uint32_t)((dev.size >> 32) & 0xFFFFFFFF);
+            arr->data[base + 6] = dev.device_type;
+        }
+
+        return hardware_array_handle;
+    }
+
+    int run(TProgram& prog, int ac, const char** av, uint64_t base, int p){
+        P=&prog; argc=ac; argv=av; sp=0; ahci_base=base; port=p;
+        for (int i=0;i<TProgram::LOC_MAX;i++) locals[i]=0;
+        array_count = 0;
+        hardware_array_handle = 0;
+        string_pool_top = 0;
+        int ip=0;
+
+        // Initialize arrays declared in locals
+        for(int i = 0; i < P->loc_count; i++) {
+            if(P->loc_type[i] == 3 || P->loc_type[i] == 4) {
+                int arr_handle = alloc_array(P->loc_array_size[i]);
+                locals[i] = arr_handle;
+            }
+        }
+
+        while(ip < P->pc){
+            TOp op = (TOp)P->code[ip++];
+            switch(op){
+                case T_NOP: break;
+                case T_PUSH_IMM: { int v= *(int*)&P->code[ip]; ip+=4; push(v); } break;
+                case T_PUSH_STR: { int p= *(int*)&P->code[ip]; ip+=4; push(p); } break;
+                case T_LOAD_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; push(locals[i]); } break;
+                case T_STORE_LOCAL:{ int i=*(int*)&P->code[ip]; ip+=4; locals[i]=pop(); } break;
+                case T_POP: { if(sp) --sp; } break;
+
+                // Enhanced ADD operation - handles both integers and string concatenation
+                case T_ADD: {
+                    int b=pop(), a=pop();
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        const char* result = concat_strings((const char*)a, (const char*)b);
+                        push((int)result);
+                    } else {
+                        push(a+b);
+                    }
+                } break;
+                case T_SUB: { int b=pop(), a=pop(); push(a-b);} break;
+                case T_MUL: { int b=pop(), a=pop(); push(a*b);} break;
+                case T_DIV: { int b=pop(), a=pop(); push(b? a/b:0);} break;
+                case T_NEG: { int a=pop(); push(-a);} break;
+
+                // Enhanced comparison operations - handle string comparisons
+                case T_EQ: {
+                    int b=pop(), a=pop();
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) == 0 ? 1 : 0);
+                    } else {
+                        push(a==b);
+                    }
+                } break;
+                case T_NE: {
+                    int b=pop(), a=pop();
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) != 0 ? 1 : 0);
+                    } else {
+                        push(a!=b);
+                    }
+                } break;
+                case T_LT: {
+                    int b=pop(), a=pop();
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) < 0 ? 1 : 0);
+                    } else {
+                        push(a<b);
+                    }
+                } break;
+                case T_LE: {
+                    int b=pop(), a=pop();
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) <= 0 ? 1 : 0);
+                    } else {
+                        push(a<=b);
+                    }
+                } break;
+                case T_GT: {
+                    int b=pop(), a=pop();
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) > 0 ? 1 : 0);
+                    } else {
+                        push(a>b);
+                    }
+                } break;
+                case T_GE: {
+                    int b=pop(), a=pop();
+                    if(is_string_ptr(a) || is_string_ptr(b)) {
+                        push(string_compare((const char*)a, (const char*)b) >= 0 ? 1 : 0);
+                    } else {
+                        push(a>=b);
+                    }
+                } break;
+
+                case T_JMP: { int t=*(int*)&P->code[ip]; ip=t; } break;
+                case T_JZ:  { int t=*(int*)&P->code[ip]; ip+=4; int v=pop(); if(v==0) ip=t; } break;
+                case T_JNZ: { int t=*(int*)&P->code[ip]; ip+=4; int v=pop(); if(v!=0) ip=t; } break;
+
+                case T_PRINT_INT: { int v=pop(); char b[16]; int_to_string(v,b); printf("%s", b); } break;
+                case T_PRINT_CHAR:{ int v=pop(); char b[2]; b[0]=(char)(v&0xff); b[1]=0; printf("%s", b); } break;
+                case T_PRINT_STR: { const char* p=(const char*)pop(); if(p) printf("%s", p); } break;
+                case T_PRINT_ENDL:{ printf("\n"); } break;
+
+                case T_PRINT_INT_ARRAY: {
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    if (arr) {
+                        printf("[");
+                        for (int i = 0; i < arr->size; i++) {
+                            char b[16];
+                            int_to_string(arr->data[i], b);
+                            printf("%s", b);
+                            if (i < arr->size - 1) printf(", ");
+                        }
+                        printf("]");
+                    } else {
+                        printf("(null array)");
+                    }
+                } break;
+
+                case T_PRINT_STRING_ARRAY: {
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    if (arr) {
+                        printf("[");
+                        for (int i = 0; i < arr->size; i++) {
+                            const char* p = (const char*)arr->data[i];
+                            printf("\"");
+                            if (p) printf("%s", p);
+                            printf("\"");
+                            if (i < arr->size - 1) printf(", ");
+                        }
+                        printf("]");
+                    } else {
+                        printf("(null array)");
+                    }
+                } break;
+
+                case T_READ_INT: {
+                    char t[32];
+                    read_line(t, 32);
+                    push(simple_atoi(t));
+                } break;
+                case T_READ_CHAR:{
+                    char t[4];
+                    read_line(t, 4);
+                    push((unsigned char)t[0]);
+                } break;
+                case T_READ_STR: {
+                    read_line(str_in, 256);
+                    push((int)str_in);
+                } break;
+
+                case T_PUSH_ARGC: { push(argc); } break;
+                case T_PUSH_ARGV_PTR: { int idx=pop(); const char* p=(idx>=0 && idx<argc && argv)? argv[idx]:""; push((int)p); } break;
+
+                // File I/O operations
+                case T_READ_FILE: {
+                    const char* filename = (const char*)pop();
+                    char* file_buffer = fat32_read_file_as_string(filename);
+                    if(file_buffer) {
+                        push((int)file_buffer);
+                    } else {
+                        push((int)"");
+                    }
+                } break;
+
+                case T_WRITE_FILE: {
+                    const char* content = (const char*)pop();
+                    const char* filename = (const char*)pop();
+                    int len = tcc_strlen(content);
+                    int result = fat32_write_file(filename, (const unsigned char*)content, len);
+                    push(result >= 0 ? 1 : 0);
+                } break;
+
+                case T_APPEND_FILE: {
+                    const char* content = (const char*)pop();
+                    const char* filename = (const char*)pop();
+                    char* existing_buffer = fat32_read_file_as_string(filename);
+                    int n = 0;
+                    if(existing_buffer) {
+                        n = tcc_strlen(existing_buffer);
+                    }
+
+                    int content_len = tcc_strlen(content);
+                    char* new_buffer = new char[n + content_len + 1];
+                    if (existing_buffer) {
+                        simple_memcpy(new_buffer, existing_buffer, n);
+                        delete[] existing_buffer;
+                    }
+                    simple_memcpy(new_buffer + n, content, content_len + 1);
+
+                    int result = fat32_write_file(filename, (const unsigned char*)new_buffer, n + content_len);
+                    push(result >= 0 ? 1 : 0);
+                    delete[] new_buffer;
+                } break;
+
+                // Array operations
+                case T_ALLOC_ARRAY: {
+                    int size = pop();
+                    int handle = alloc_array(size);
+                    push(handle);
+                } break;
+
+                case T_LOAD_ARRAY: {
+                    int index = pop();
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    if(arr && index >= 0 && index < arr->size) {
+                        push(arr->data[index]);
+                    } else {
+                        push(0);
+                    }
+                } break;
+
+                case T_STORE_ARRAY: {
+                    int value = pop();
+                    int index = pop();
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    if(arr && index >= 0 && index < arr->size) {
+                        arr->data[index] = value;
+                    }
+                } break;
+
+                case T_ARRAY_SIZE: {
+                    int handle = pop();
+                    Array* arr = get_array(handle);
+                    push(arr ? arr->size : 0);
+                } break;
+
+                case T_ARRAY_RESIZE: {
+                    int new_size = pop();
+                    int handle = pop();
+                    int new_handle = resize_array(handle, new_size);
+                    push(new_handle);
+                } break;
+
+                // String operations
+                case T_STR_CONCAT: {
+                    const char* b = (const char*)pop();
+                    const char* a = (const char*)pop();
+                    const char* result = concat_strings(a, b);
+                    push((int)result);
+                } break;
+
+                case T_STR_LENGTH: {
+                    const char* str = (const char*)pop();
+                    push(str ? tcc_strlen(str) : 0);
+                } break;
+
+                case T_STR_SUBSTR: {
+                    int len = pop();
+                    int start = pop();
+                    const char* str = (const char*)pop();
+                    const char* result = substring(str, start, len);
+                    push((int)result);
+                } break;
+
+                case T_INT_TO_STR: {
+                    int value = pop();
+                    const char* result = int_to_string_vm(value);
+                    push((int)result);
+                } break;
+
+                case T_STR_COMPARE: {
+                    const char* b = (const char*)pop();
+                    const char* a = (const char*)pop();
+                    push(string_compare(a, b));
+                } break;
+
+                // String search operations
+                case T_STR_FIND_CHAR: {
+                    char c = (char)pop();
+                    const char* str = (const char*)pop();
+                    push(find_char(str, c));
+                } break;
+
+                case T_STR_FIND_STR: {
+                    const char* needle = (const char*)pop();
+                    const char* haystack = (const char*)pop();
+                    push(find_string(haystack, needle));
+                } break;
+
+                case T_STR_FIND_LAST_CHAR: {
+                    char c = (char)pop();
+                    const char* str = (const char*)pop();
+                    push(find_last_char(str, c));
+                } break;
+
+                case T_STR_CONTAINS: {
+                    const char* substr = (const char*)pop();
+                    const char* str = (const char*)pop();
+                    push(string_contains(str, substr));
+                } break;
+
+                case T_STR_STARTS_WITH: {
+                    const char* prefix = (const char*)pop();
+                    const char* str = (const char*)pop();
+                    push(string_starts_with(str, prefix));
+                } break;
+
+                case T_STR_ENDS_WITH: {
+                    const char* suffix = (const char*)pop();
+                    const char* str = (const char*)pop();
+                    push(string_ends_with(str, suffix));
+                } break;
+
+                case T_STR_COUNT_CHAR: {
+                    char c = (char)pop();
+                    const char* str = (const char*)pop();
+                    push(count_char(str, c));
+                } break;
+
+                case T_STR_REPLACE_CHAR: {
+                    char new_char = (char)pop();
+                    char old_char = (char)pop();
+                    const char* str = (const char*)pop();
+                    const char* result = replace_char(str, old_char, new_char);
+                    push((int)result);
+                } break;
+
+                // NEW: Hardware Discovery and MMIO Operations
+                case T_SCAN_HARDWARE: {
+                    int count = scan_hardware();
+                    push(count);
+                    printf("Hardware scan found %d devices\n", count);
+
+                    // Display memory map
+                    printf("\n=== Memory Map ===\n");
+                    for(int i = 0; i < count; i++) {
+                        const HardwareDevice& dev = hardware_registry[i];
+                        printf("Device %d: %s\n", i, dev.description);
+                        char hex64_base[17], hex64_end[17], hex64_size[17];
+                        uint64_to_hex_string(dev.base_address, hex64_base);
+                        uint64_to_hex_string(dev.base_address + dev.size - 1, hex64_end);
+                        uint64_to_hex_string(dev.size, hex64_size);
+                        printf("  Base: 0x%s - 0x%s (Size: 0x%s)\n", hex64_base, hex64_end, hex64_size);
+
+                        char hex32_vendor[9], hex32_device[9];
+                        uint32_to_hex_string(dev.vendor_id, hex32_vendor);
+                        uint32_to_hex_string(dev.device_id, hex32_device);
+                        printf("  Vendor: 0x%s Device: 0x%s\n\n", hex32_vendor, hex32_device);
+                    }
+                } break;
+
+                case T_GET_DEVICE_INFO: {
+                    int device_index = pop();
+                    int handle = create_device_info_array(device_index);
+                    push(handle);
+                } break;
+
+                case T_GET_HARDWARE_ARRAY: {
+                    int handle = create_hardware_array();
+                    push(handle);
+                } break;
+
+                case T_DISPLAY_MEMORY_MAP: {
+                    printf("\n=== System Memory Map ===\n");
+                    printf("Address Range                                  | Size      | Device Type | Description\n");
+                    printf("--------------------------------|----------|-------------|------------------\n");
+
+                    for(int i = 0; i < hardware_count; i++) {
+                        const HardwareDevice& dev = hardware_registry[i];
+
+                        // Display start address
+                        char hex_start[17], hex_end[17], hex_size[17];
+                        uint64_to_hex_string(dev.base_address, hex_start);
+                        uint64_to_hex_string(dev.base_address + dev.size - 1, hex_end);
+                        uint64_to_hex_string(dev.size, hex_size);
+
+                        printf("0x%s - 0x%s | 0x%s", hex_start, hex_end, hex_size);
+
+                        // Device type
+                        printf(" | ");
+                        switch(dev.device_type) {
+                            case 1: printf("Storage   "); break;
+                            case 2: printf("Network   "); break;
+                            case 3: printf("Graphics  "); break;
+                            case 4: printf("Audio     "); break;
+                            case 5: printf("USB       "); break;
+                            default: printf("Unknown   "); break;
+                        }
+
+                        printf(" | %s\n", dev.description);
+                    }
+
+                    printf("\nTotal devices: %d\n", hardware_count);
+                    push(hardware_count); // Return device count
+                } break;
+
+                case T_MMIO_READ8: {
+                    uint64_t addr = (uint64_t)pop();
+                    uint8_t value = mmio_read_8(addr);
+                    push((int)value);
+                } break;
+
+                case T_MMIO_READ16: {
+                    uint64_t addr = (uint64_t)pop();
+                    uint16_t value = mmio_read_16(addr);
+                    push((int)value);
+                } break;
+
+                case T_MMIO_READ32: {
+                    uint64_t addr = (uint64_t)pop();
+                    uint32_t value = mmio_read_32(addr);
+                    push((int)value);
+                } break;
+
+                case T_MMIO_READ64: {
+                    uint64_t addr = (uint64_t)pop();
+                    uint64_t value = mmio_read_64(addr);
+                    push((int)(value >> 32));      // high 32 bits first
+                    push((int)(value & 0xFFFFFFFF)); // low 32 bits second
+                } break;
+
+                case T_MMIO_WRITE8: {
+                    uint8_t value = (uint8_t)pop();
+                    uint64_t addr = (uint64_t)pop();
+                    bool success = mmio_write_8(addr, value);
+                    push(success ? 1 : 0);
+                } break;
+
+                case T_MMIO_WRITE16: {
+                    uint16_t value = (uint16_t)pop();
+                    uint64_t addr = (uint64_t)pop();
+                    bool success = mmio_write_16(addr, value);
+                    push(success ? 1 : 0);
+                } break;
+
+                case T_MMIO_WRITE32: {
+                    uint32_t value = (uint32_t)pop();
+                    uint64_t addr = (uint64_t)pop();
+                    bool success = mmio_write_32(addr, value);
+                    push(success ? 1 : 0);
+                } break;
+
+                case T_MMIO_WRITE64: {
+                    uint32_t high32 = (uint32_t)pop();
+                    uint32_t low32 = (uint32_t)pop();
+                    uint64_t addr = (uint64_t)pop();
+                    uint64_t value = ((uint64_t)high32 << 32) | low32;
+                    bool success = mmio_write_64(addr, value);
+                    push(success ? 1 : 0);
+                } break;
+
+                case T_RET: { int rv=pop(); return rv; }
+                default: return -1;
+            }
+        }
+        return 0;
+    }
+};
+
+// ============================================================
+// Enhanced Object I/O (TVM3 - with hardware support)
+// ============================================================
+struct TVMObject {
+    static int save(uint64_t base, int port, const char* path, const TProgram& P){
+        static unsigned char buf[ TProgram::CODE_MAX + TProgram::LIT_MAX + 128 ];
+        int off=0;
+        buf[off++]='T'; buf[off++]='V'; buf[off++]='M'; buf[off++]='3'; // Version 3 with hardware support
+        *(int*)&buf[off]=P.pc; off+=4;
+        *(int*)&buf[off]=P.lit_top; off+=4;
+        *(int*)&buf[off]=P.loc_count; off+=4;
+        simple_memcpy(&buf[off], P.code, P.pc); off+=P.pc;
+        simple_memcpy(&buf[off], P.lit, P.lit_top); off+=P.lit_top;
+
+        // Save local variable metadata (names, types, array sizes)
+        for(int i = 0; i < P.loc_count; i++) {
+            int name_len = tcc_strlen(P.loc_name[i]) + 1;
+            simple_memcpy(&buf[off], P.loc_name[i], name_len); off += name_len;
+            buf[off++] = P.loc_type[i];
+            *(int*)&buf[off] = P.loc_array_size[i]; off += 4;
+        }
+
+        return fat32_write_file(path, buf, off);
+    }
+
+    // In SECTION 6, inside the TVMObject struct
+
+static int load(uint64_t base, int port, const char* path, TProgram& P){
+    // FIX: First, get the file's directory entry to find its true size.
+    fat_dir_entry_t entry;
+    uint32_t sector, offset;
+    if (fat32_find_entry(path, &entry, &sector, &offset) != 0) {
+        return -1; // File not found
+    }
+    uint32_t n = entry.file_size; // Use the REAL size from the filesystem.
+
+    // Now we can read the file content.
+    char* buf = fat32_read_file_as_string(path);
+    if (!buf) {
+        return -1; // Read failed
+    }
+
+    // The original buggy line is no longer needed.
+    // int n = tcc_strlen(buf);  
+
+    if (n < 16) { 
+        delete[] buf; 
+        return -1; 
+    }
+    if (!(buf[0] == 'T' && buf[1] == 'V' && buf[2] == 'M' && (buf[3] == '1' || buf[3] == '2' || buf[3] == '3'))) {
+        delete[] buf;
+        return -2;
+    }
+    int cp = *(int*)&buf[4], lp = *(int*)&buf[8], lc = *(int*)&buf[12];
+    if (cp < 0 || cp > TProgram::CODE_MAX || lp < 0 || lp > TProgram::LIT_MAX || lc < 0 || lc > TProgram::LOC_MAX) {
+        delete[] buf;
+        return -3;
+    }
+
+    // The rest of the function now works correctly because 'n' is the true file size.
+    P.pc = cp; P.lit_top = lp; P.loc_count = lc;
+    int off = 16;
+    simple_memcpy(P.code, &buf[off], cp); off += cp;
+    simple_memcpy(P.lit, &buf[off], lp); off += lp;
+
+    if (buf[3] >= '2') {
+        for (int i = 0; i < lc; i++) {
+            int name_len = 0;
+            while (off + name_len < n && buf[off + name_len] != 0) name_len++;
+            
+            if (name_len < 32) {
+                simple_memcpy(P.loc_name[i], &buf[off], name_len + 1);
+            } else {
+                P.loc_name[i][0] = 0;
+            }
+            off += name_len + 1;
+            
+            // Boundary check before reading type and size
+            if (off + 5 > n) {
+                delete[] buf;
+                return -4; // Corrupt file, not enough data for metadata
+            }
+            
+            P.loc_type[i] = buf[off++];
+            P.loc_array_size[i] = *(int*)&buf[off]; off += 4;
+        }
+    } else {
+        for (int i = 0; i < lc; i++) {
+            P.loc_name[i][0] = 0;
+            P.loc_type[i] = 0;
+            P.loc_array_size[i] = 0;
+        }
+    }
+    delete[] buf;
+    return 0;
+};
+};
+
+// ============================================================
+// Enhanced compile/run entry points
+// ============================================================
+static int tinyvm_compile_to_obj(uint64_t ahci_base, int port, const char* src_path, const char* obj_path){
+    char* srcbuf = fat32_read_file_as_string(src_path);
+    if(!srcbuf){ printf("read fail\n"); return -1; }
+    TCompiler C; int ok = C.compile(srcbuf);
+    delete[] srcbuf;
+    if(ok<0){ printf("Compilation failed!\n"); return -2; }
+    int w = TVMObject::save(ahci_base, port, obj_path, C.pr);
+    if(w<0){ printf("write fail\n"); return -3; }
+    return 0;
+}
+
+static int tinyvm_run_obj(uint64_t ahci_base, int port, const char* obj_path, int argc, const char** argv){
+    TProgram P; int r = TVMObject::load(ahci_base, port, obj_path, P);
+    if(r<0){ printf("load fail\n"); return -1; }
+    TinyVM vm; int rv = vm.run(P, argc, argv, ahci_base, port);
+    char b[16]; int_to_string(rv,b); printf("%s", b);
+    return rv;
+}
+
+// ============================================================
+// Enhanced Shell glue with hardware discovery info
+// ============================================================
+extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename){
+    if (!filename) { printf("Usage: compile <file.cpp>\n"); return; }
+    static char obj[64]; int i=0; while(filename[i] && i<60){ obj[i]=filename[i]; i++; }
+    while(i>0 && obj[i-1] != '.') i--; obj[i]=0; simple_strcpy(&obj[i], "obj");
+    printf("Compiling %s...\n", filename);
+    int r = tinyvm_compile_to_obj(ahci_base, port, filename, obj);
+    if(r==0) { printf("OK -> %s\n", obj); } else { printf("Compilation failed!\n"); }
+}
+
+extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename){
+    if (!filename) { printf("Usage: run <file.obj> [args...]\n"); return; }
+    static const char* argvv[16];
+    int argc=0;
+    for(int i=2;i<part_count && argc<16;i++){ argvv[argc++] = parts[i]; }
+    printf("Executing %s...\n", filename);
+    tinyvm_run_obj(ahci_base, port, filename, argc, argvv);
+}
+
+extern "C" void cmd_exec(const char* code_text){
+    if(!code_text){ printf("No code\n"); return; }
+    TCompiler C; int ok = C.compile(code_text);
+    if(ok<0){ printf("Compilation failed!\n"); return; }
+    TinyVM vm; TProgram& P = C.pr;
+    static const char* argvv[1] = { };
+    int rv = vm.run(P, 0, argvv, 0, 0); // no file I/O in exec mode
+    char b[16]; int_to_string(rv,b); printf("%s", b);
+}
+
 // --- Command parsing helper ---
 char* get_arg(char* args, int n) {
     char* p = args;
@@ -3204,9 +5292,14 @@ void handle_command() {
             args++;
         }
     }
-
-    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
-
+    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, test, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
+    if (strcmp(command, "test") == 0) {
+		compile_and_run("int main(){return 42;}");//test
+    } else if (strcmp(command, "run") == 0) {
+        cmd_run(ahci_base, selected_port, get_arg(args, 0));
+    } else if (strcmp(command, "exec") == 0) {
+        cmd_exec(get_arg(args, 0));
+    }
     else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
     else if (strcmp(command, "edit") == 0) {
@@ -3297,20 +5390,6 @@ void handle_command() {
             }
         }
     }
-	
-	
-	else if (strcmp(command, "run") == 0) {
-	    char* filename = get_arg(args, 0);
-	    if (filename) {
-	        handle_run_command(filename, this);
-	    } else {
-	        console_print("Usage: run \"<filename>\"\n");
-	    }
-	}
-	
-	
-	
-	
     else if (strcmp(command, "mv") == 0) {
         char args_for_src[120];
         strncpy(args_for_src, args, 119);
@@ -3505,24 +5584,28 @@ public:
             editor_clamp_cursor_to_line();
             editor_ensure_cursor_visible();
         } else {
-            if (c == '\n') {
-                prompt_visual_lines = 0;
-                handle_command();
-                line_pos = 0;
-                current_line[0] = '\0';
-                update_prompt_display();
-            } else if (c == '\b') {
-                if (line_pos > 0) {
-                    line_pos--;
-                    current_line[line_pos] = 0;
-                }
-                update_prompt_display();
-            } else if (c >= 32 && c < 127 && line_pos < TERM_WIDTH - 2) {
+        // Terminal input mode
+        if (c == '\n') {
+            prompt_visual_lines = 0;
+            handle_command();
+            line_pos = 0;
+            current_line[0] = '\0';
+            update_prompt_display();
+        } else if (c == '\b') {
+            if (line_pos > 0) {
+                current_line[--line_pos] = '\0';
+                // Lightweight update: just refresh the last buffer line
+                snprintf(buffer[line_count > 0 ? line_count - 1 : 0], TERM_WIDTH, "> %s", current_line);
+            }
+        } else if (c >= 32 && c < 127) {
+            if (line_pos < TERM_WIDTH - 2) {
                 current_line[line_pos++] = c;
-                current_line[line_pos] = 0;
-                update_prompt_display();
+                current_line[line_pos] = '\0';
+                // Lightweight update: just refresh the last buffer line
+                snprintf(buffer[line_count > 0 ? line_count - 1 : 0], TERM_WIDTH, "> %s", current_line);
             }
         }
+		}
     }
 
      // --- THIS IS THE CORRECTED UPDATE METHOD ---
@@ -3846,1191 +5929,41 @@ static void init_screen_timer(uint16_t hz) {
     outb(0x40, (divisor >> 8) & 0xFF);
 }
 
-/*
- * BYTEVM - TICK-BASED C COMPILER AND VM
- * ======================================
- * Full C syntax support with tick-based execution
- * Non-blocking cooperative multitasking
- * 
- * EXACT PLACEMENT IN YOUR KERNEL.CPP:
- * ====================================
- * 
- * STEP 1: Find line ~60 with forward declarations. ADD THIS LINE:
- * 
- *         void handle_run_command(const char* filename, TerminalWindow* term);
- *         void bytevm_tick();  // ADD THIS TOO
- * 
- * STEP 2: Find the END of chkdsk_full_scan() function (around line 1900)
- *         IMPORTANT: Make sure you're OUTSIDE any class definition!
- *         Look for a line with just "}" that closes a function, not a class.
- *         ADD ALL THE CODE BELOW starting from "// BYTEVM INSTRUCTION SET"
- * 
- * STEP 3: In TerminalWindow::handle_command(), add the run command
- * 
- * STEP 4: In kernel_main() loop, after wm.update_all(), add: bytevm_tick();
- */
-
-// =============================================================================
-// BYTEVM INSTRUCTION SET
-// =============================================================================
-
-enum VMOpcode : uint8_t {
-    OP_PUSH = 0x01, OP_POP, OP_DUP, OP_SWAP,
-    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_NEG,
-    OP_AND, OP_OR, OP_XOR, OP_NOT, OP_SHL, OP_SHR,
-    OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE,
-    OP_JMP, OP_JZ, OP_JNZ, OP_CALL, OP_RET,
-    OP_LOAD, OP_STORE, OP_LOADL, OP_STOREL, OP_LOADG, OP_STOREG,
-    OP_PRINT, OP_SETPIXEL, OP_GETPIXEL, OP_DELAY, OP_GETKEY,
-    OP_NOP, OP_HALT, OP_YIELD, OP_FRAME_START, OP_FRAME_END
-};
-
-struct VMInstruction {
-    VMOpcode op;
-    int32_t arg;
-    VMInstruction() : op(OP_NOP), arg(0) {}
-    VMInstruction(VMOpcode o, int32_t a = 0) : op(o), arg(a) {}
-};
-
-// =============================================================================
-// TICK-BASED VIRTUAL MACHINE
-// =============================================================================
-
-class ByteVM {
-private:
-    static constexpr int STACK_SIZE = 2048;
-    static constexpr int MEMORY_SIZE = 8192;
-    static constexpr int MAX_INSTRUCTIONS = 4096;
-    static constexpr int INSTRUCTIONS_PER_TICK = 500;
-    
-    int32_t stack[STACK_SIZE];
-    int32_t memory[MEMORY_SIZE];
-    VMInstruction* program;
-    int program_size;
-    int pc, sp, bp;
-    int call_stack[64];
-    int call_sp;
-    bool running, halted, error;
-    char error_msg[128];
-    int instructions_this_tick;
-    uint32_t delay_until;
-    TerminalWindow* output_terminal;
-    
-    void push(int32_t val) {
-        if (sp >= STACK_SIZE) { set_error("Stack overflow"); return; }
-        stack[sp++] = val;
-    }
-    
-    int32_t pop() {
-        if (sp <= 0) { set_error("Stack underflow"); return 0; }
-        return stack[--sp];
-    }
-    
-    void set_error(const char* msg) {
-        error = true;
-        running = false;
-        strncpy(error_msg, msg, 127);
-        if (output_terminal) {
-            char buf[150];
-            snprintf(buf, 150, "VM ERROR at PC=%d: %s\n", pc, msg);
-            output_terminal->console_print(buf);
-        }
-    }
-    
-    void execute_instruction() {
-        if (pc < 0 || pc >= program_size) { set_error("PC out of bounds"); return; }
-        
-        VMInstruction& inst = program[pc++];
-        
-        switch (inst.op) {
-            case OP_PUSH: push(inst.arg); break;
-            case OP_POP: pop(); break;
-            case OP_DUP: push(stack[sp-1]); break;
-            case OP_SWAP: { int32_t a = pop(), b = pop(); push(a); push(b); break; }
-            
-            case OP_ADD: { int32_t b = pop(), a = pop(); push(a + b); break; }
-            case OP_SUB: { int32_t b = pop(), a = pop(); push(a - b); break; }
-            case OP_MUL: { int32_t b = pop(), a = pop(); push(a * b); break; }
-            case OP_DIV: { 
-                int32_t b = pop(), a = pop(); 
-                if (b == 0) { set_error("Division by zero"); return; }
-                push(a / b); 
-                break; 
-            }
-            case OP_MOD: { 
-                int32_t b = pop(), a = pop(); 
-                if (b == 0) { set_error("Modulo by zero"); return; }
-                push(a % b); 
-                break; 
-            }
-            case OP_NEG: push(-pop()); break;
-            
-            case OP_AND: { int32_t b = pop(), a = pop(); push(a & b); break; }
-            case OP_OR: { int32_t b = pop(), a = pop(); push(a | b); break; }
-            case OP_XOR: { int32_t b = pop(), a = pop(); push(a ^ b); break; }
-            case OP_NOT: push(~pop()); break;
-            case OP_SHL: { int32_t b = pop(), a = pop(); push(a << b); break; }
-            case OP_SHR: { int32_t b = pop(), a = pop(); push(a >> b); break; }
-            
-            case OP_EQ: { int32_t b = pop(), a = pop(); push(a == b ? 1 : 0); break; }
-            case OP_NE: { int32_t b = pop(), a = pop(); push(a != b ? 1 : 0); break; }
-            case OP_LT: { int32_t b = pop(), a = pop(); push(a < b ? 1 : 0); break; }
-            case OP_LE: { int32_t b = pop(), a = pop(); push(a <= b ? 1 : 0); break; }
-            case OP_GT: { int32_t b = pop(), a = pop(); push(a > b ? 1 : 0); break; }
-            case OP_GE: { int32_t b = pop(), a = pop(); push(a >= b ? 1 : 0); break; }
-            
-            case OP_JMP: pc = inst.arg; break;
-            case OP_JZ: if (pop() == 0) pc = inst.arg; break;
-            case OP_JNZ: if (pop() != 0) pc = inst.arg; break;
-            
-            case OP_CALL:
-                if (call_sp >= 64) { set_error("Call stack overflow"); return; }
-                call_stack[call_sp++] = pc;
-                pc = inst.arg;
-                break;
-                
-            case OP_RET:
-                if (call_sp <= 0) { halted = true; running = false; return; }
-                pc = call_stack[--call_sp];
-                break;
-            
-            case OP_LOAD: {
-                int32_t addr = pop();
-                if (addr < 0 || addr >= MEMORY_SIZE) { set_error("Memory read OOB"); return; }
-                push(memory[addr]);
-                break;
-            }
-            
-            case OP_STORE: {
-                int32_t val = pop(), addr = pop();
-                if (addr < 0 || addr >= MEMORY_SIZE) { set_error("Memory write OOB"); return; }
-                memory[addr] = val;
-                break;
-            }
-            
-            case OP_LOADL: push(stack[bp + inst.arg]); break;
-            case OP_STOREL: stack[bp + inst.arg] = pop(); break;
-            case OP_LOADG: push(memory[inst.arg]); break;
-            case OP_STOREG: memory[inst.arg] = pop(); break;
-            
-            case OP_PRINT: {
-                int32_t val = pop();
-                if (output_terminal) {
-                    char buf[32];
-                    snprintf(buf, 32, "%d\n", val);
-                    output_terminal->console_print(buf);
-                }
-                break;
-            }
-            
-            case OP_SETPIXEL: {
-                int32_t color = pop(), y = pop(), x = pop();
-                put_pixel_back(x, y, color);
-                break;
-            }
-            
-            case OP_GETPIXEL: {
-                int32_t y = pop(), x = pop();
-                if (x >= 0 && x < (int)fb_info.width && y >= 0 && y < (int)fb_info.height) {
-                    push(backbuffer[y * fb_info.width + x]);
-                } else {
-                    push(0);
-                }
-                break;
-            }
-            
-            case OP_GETKEY: push(last_key_press); break;
-            
-            case OP_DELAY:
-                delay_until = g_timer_ticks + inst.arg;
-                running = false;
-                break;
-            
-            case OP_FRAME_START:
-                // Mark frame boundary - could be used for timing
-                break;
-                
-            case OP_FRAME_END:
-                // Force yield at end of frame
-                return;
-            
-            case OP_YIELD: return;
-            case OP_HALT: halted = true; running = false; break;
-            case OP_NOP: break;
-        }
-    }
-    
-public:
-    ByteVM() : program(nullptr), program_size(0), pc(0), sp(0), bp(0), 
-               call_sp(0), running(false), halted(false), error(false),
-               instructions_this_tick(0), delay_until(0), output_terminal(nullptr) {
-        memset(stack, 0, sizeof(stack));
-        memset(memory, 0, sizeof(memory));
-    }
-    
-    ~ByteVM() { if (program) delete[] program; }
-    
-    void set_output(TerminalWindow* term) { output_terminal = term; }
-    
-    bool load_program(VMInstruction* code, int size) {
-        if (program) delete[] program;
-        program = new VMInstruction[size];
-        if (!program) return false;
-        for (int i = 0; i < size; i++) program[i] = code[i];
-        program_size = size;
-        pc = 0; sp = 0; bp = 0; call_sp = 0;
-        running = true; halted = false; error = false;
-        return true;
-    }
-    
-    void tick() {
-        if (delay_until > 0) {
-            if (g_timer_ticks >= delay_until) {
-                delay_until = 0;
-                running = true;
-            } else return;
-        }
-        
-        if (!running || halted || error) return;
-        
-        instructions_this_tick = 0;
-        while (running && instructions_this_tick < INSTRUCTIONS_PER_TICK) {
-            execute_instruction();
-            instructions_this_tick++;
-        }
-    }
-    
-    bool is_running() const { return running && !halted && !error; }
-};
-
-// =============================================================================
-// C LANGUAGE TOKENIZER
-// =============================================================================
-
-enum TokenType {
-    TOK_EOF, TOK_NUMBER, TOK_IDENT,
-    TOK_INT, TOK_VOID, TOK_IF, TOK_ELSE, TOK_WHILE, TOK_FOR, TOK_RETURN,
-    TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_PERCENT,
-    TOK_EQ, TOK_NE, TOK_LT, TOK_LE, TOK_GT, TOK_GE,
-    TOK_AND, TOK_OR, TOK_NOT,
-    TOK_ASSIGN, TOK_LPAREN, TOK_RPAREN, TOK_LBRACE, TOK_RBRACE,
-    TOK_SEMICOLON, TOK_COMMA,
-    TOK_PLUSPLUS, TOK_MINUSMINUS
-};
-
-struct Token {
-    TokenType type;
-    int value;
-    char text[64];
-};
-
-class Tokenizer {
-private:
-    const char* source;
-    int pos;
-    
-    char peek() { return source[pos]; }
-    char advance() { return source[pos++]; }
-    
-    void skip_whitespace() {
-        while (peek() == ' ' || peek() == '\t' || peek() == '\n' || peek() == '\r') {
-            advance();
-        }
-        // Skip comments
-        if (peek() == '/' && source[pos+1] == '/') {
-            while (peek() && peek() != '\n') advance();
-        }
-    }
-    
-public:
-    Tokenizer(const char* src) : source(src), pos(0) {}
-    
-    Token next() {
-        skip_whitespace();
-        Token tok;
-        tok.type = TOK_EOF;
-        tok.value = 0;
-        tok.text[0] = '\0';
-        
-        if (!peek()) return tok;
-        
-        // Numbers
-        if (peek() >= '0' && peek() <= '9') {
-            tok.type = TOK_NUMBER;
-            tok.value = 0;
-            while (peek() >= '0' && peek() <= '9') {
-                tok.value = tok.value * 10 + (advance() - '0');
-            }
-            return tok;
-        }
-        
-        // Identifiers and keywords
-        if ((peek() >= 'a' && peek() <= 'z') || (peek() >= 'A' && peek() <= 'Z') || peek() == '_') {
-            int i = 0;
-            while (((peek() >= 'a' && peek() <= 'z') || (peek() >= 'A' && peek() <= 'Z') || 
-                    (peek() >= '0' && peek() <= '9') || peek() == '_') && i < 63) {
-                tok.text[i++] = advance();
-            }
-            tok.text[i] = '\0';
-            
-            if (strcmp(tok.text, "int") == 0) tok.type = TOK_INT;
-            else if (strcmp(tok.text, "void") == 0) tok.type = TOK_VOID;
-            else if (strcmp(tok.text, "if") == 0) tok.type = TOK_IF;
-            else if (strcmp(tok.text, "else") == 0) tok.type = TOK_ELSE;
-            else if (strcmp(tok.text, "while") == 0) tok.type = TOK_WHILE;
-            else if (strcmp(tok.text, "for") == 0) tok.type = TOK_FOR;
-            else if (strcmp(tok.text, "return") == 0) tok.type = TOK_RETURN;
-            else tok.type = TOK_IDENT;
-            return tok;
-        }
-        
-        // Operators
-        char c = advance();
-        switch (c) {
-            case '+': 
-                if (peek() == '+') { advance(); tok.type = TOK_PLUSPLUS; }
-                else tok.type = TOK_PLUS; 
-                break;
-            case '-': 
-                if (peek() == '-') { advance(); tok.type = TOK_MINUSMINUS; }
-                else tok.type = TOK_MINUS; 
-                break;
-            case '*': tok.type = TOK_STAR; break;
-            case '/': tok.type = TOK_SLASH; break;
-            case '%': tok.type = TOK_PERCENT; break;
-            case '=':
-                if (peek() == '=') { advance(); tok.type = TOK_EQ; }
-                else tok.type = TOK_ASSIGN;
-                break;
-            case '!':
-                if (peek() == '=') { advance(); tok.type = TOK_NE; }
-                else tok.type = TOK_NOT;
-                break;
-            case '<':
-                if (peek() == '=') { advance(); tok.type = TOK_LE; }
-                else tok.type = TOK_LT;
-                break;
-            case '>':
-                if (peek() == '=') { advance(); tok.type = TOK_GE; }
-                else tok.type = TOK_GT;
-                break;
-            case '&': if (peek() == '&') { advance(); tok.type = TOK_AND; } break;
-            case '|': if (peek() == '|') { advance(); tok.type = TOK_OR; } break;
-            case '(': tok.type = TOK_LPAREN; break;
-            case ')': tok.type = TOK_RPAREN; break;
-            case '{': tok.type = TOK_LBRACE; break;
-            case '}': tok.type = TOK_RBRACE; break;
-            case ';': tok.type = TOK_SEMICOLON; break;
-            case ',': tok.type = TOK_COMMA; break;
-        }
-        return tok;
-    }
-};
-
-// =============================================================================
-// C COMPILER
-// =============================================================================
-
-class CCompiler {
-private:
-    VMInstruction code[4096];
-    int code_size;
-    Tokenizer* tokenizer;
-    Token current_token;
-    
-    struct Variable {
-        char name[64];
-        int offset;
-        bool is_local;
-    };
-    
-    Variable variables[128];
-    int var_count;
-    int local_offset;
-    int global_offset;
-    
-    void emit(VMOpcode op, int32_t arg = 0) {
-        if (code_size >= 4096) return;
-        code[code_size++] = VMInstruction(op, arg);
-    }
-    
-    void advance() {
-        current_token = tokenizer->next();
-    }
-    
-    bool match(TokenType type) {
-        if (current_token.type == type) {
-            advance();
-            return true;
-        }
-        return false;
-    }
-    
-    void expect(TokenType type) {
-        if (!match(type)) {
-            // Error handling
-        }
-    }
-    
-    int find_variable(const char* name) {
-        for (int i = var_count - 1; i >= 0; i--) {
-            if (strcmp(variables[i].name, name) == 0) {
-                return i;
-            }
-        }
+/* Self-hosting: compile and run C code */
+int compile_and_run(const char *source_code) {
+    TCCState *s = tcc_new();
+    if (!s) {
+        print("Error: Failed to create TCC state\n");
         return -1;
     }
     
-    void add_variable(const char* name, bool is_local) {
-        if (var_count >= 128) return;
-        strcpy(variables[var_count].name, name);
-        variables[var_count].is_local = is_local;
-        if (is_local) {
-            variables[var_count].offset = local_offset++;
-        } else {
-            variables[var_count].offset = global_offset++;
-        }
-        var_count++;
+    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
+    
+    if (tcc_compile_string(s, source_code) < 0) {
+        print("Error: Compilation failed\n");
+        tcc_delete(s);
+        return -1;
     }
     
-    // Expression parser (precedence climbing)
-    void parse_primary() {
-        if (current_token.type == TOK_NUMBER) {
-            emit(OP_PUSH, current_token.value);
-            advance();
-        } else if (current_token.type == TOK_IDENT) {
-            char name[64];
-            strcpy(name, current_token.text);
-            advance();
-            
-            if (match(TOK_LPAREN)) {
-                // Function call
-                int arg_count = 0;
-                if (current_token.type != TOK_RPAREN) {
-                    parse_expression();
-                    arg_count++;
-                    while (match(TOK_COMMA)) {
-                        parse_expression();
-                        arg_count++;
-                    }
-                }
-                expect(TOK_RPAREN);
-                
-                // Built-in functions
-                if (strcmp(name, "print") == 0) {
-                    emit(OP_PRINT);
-                } else if (strcmp(name, "setpixel") == 0) {
-                    emit(OP_SETPIXEL);
-                } else if (strcmp(name, "getpixel") == 0) {
-                    emit(OP_GETPIXEL);
-                } else if (strcmp(name, "delay") == 0) {
-                    emit(OP_DELAY);
-                } else if (strcmp(name, "getkey") == 0) {
-                    emit(OP_GETKEY);
-                }
-            } else {
-                // Variable
-                int var_idx = find_variable(name);
-                if (var_idx >= 0) {
-                    if (variables[var_idx].is_local) {
-                        emit(OP_LOADL, variables[var_idx].offset);
-                    } else {
-                        emit(OP_LOADG, variables[var_idx].offset);
-                    }
-                }
-            }
-        } else if (match(TOK_LPAREN)) {
-            parse_expression();
-            expect(TOK_RPAREN);
-        }
+    /* Relocate code into memory */
+    int size = tcc_relocate(s, NULL);
+    void *mem = (void*)0x200000; /* Use memory at 2MB mark */
+    tcc_relocate(s, mem);
+    
+    /* Get main function and execute */
+    int (*func)(void) = tcc_get_symbol(s, "main");
+    if (!func) {
+        print("Error: No main() function found\n");
+        tcc_delete(s);
+        return -1;
     }
     
-    void parse_unary() {
-        if (match(TOK_MINUS)) {
-            parse_unary();
-            emit(OP_NEG);
-        } else if (match(TOK_NOT)) {
-            parse_unary();
-            emit(OP_NOT);
-        } else {
-            parse_primary();
-        }
-    }
+    print("Executing compiled code...\n");
+    int result = func();
     
-    void parse_multiplicative() {
-        parse_unary();
-        while (true) {
-            if (match(TOK_STAR)) {
-                parse_unary();
-                emit(OP_MUL);
-            } else if (match(TOK_SLASH)) {
-                parse_unary();
-                emit(OP_DIV);
-            } else if (match(TOK_PERCENT)) {
-                parse_unary();
-                emit(OP_MOD);
-            } else {
-                break;
-            }
-        }
-    }
-    
-    void parse_additive() {
-        parse_multiplicative();
-        while (true) {
-            if (match(TOK_PLUS)) {
-                parse_multiplicative();
-                emit(OP_ADD);
-            } else if (match(TOK_MINUS)) {
-                parse_multiplicative();
-                emit(OP_SUB);
-            } else {
-                break;
-            }
-        }
-    }
-    
-    void parse_comparison() {
-        parse_additive();
-        while (true) {
-            if (match(TOK_EQ)) {
-                parse_additive();
-                emit(OP_EQ);
-            } else if (match(TOK_NE)) {
-                parse_additive();
-                emit(OP_NE);
-            } else if (match(TOK_LT)) {
-                parse_additive();
-                emit(OP_LT);
-            } else if (match(TOK_LE)) {
-                parse_additive();
-                emit(OP_LE);
-            } else if (match(TOK_GT)) {
-                parse_additive();
-                emit(OP_GT);
-            } else if (match(TOK_GE)) {
-                parse_additive();
-                emit(OP_GE);
-            } else {
-                break;
-            }
-        }
-    }
-    
-    void parse_logical_and() {
-        parse_comparison();
-        while (match(TOK_AND)) {
-            parse_comparison();
-            emit(OP_AND);
-        }
-    }
-    
-    void parse_logical_or() {
-        parse_logical_and();
-        while (match(TOK_OR)) {
-            parse_logical_and();
-            emit(OP_OR);
-        }
-    }
-    
-    void parse_expression() {
-        parse_logical_or();
-    }
-    
-    void parse_statement() {
-        if (match(TOK_IF)) {
-            expect(TOK_LPAREN);
-            parse_expression();
-            expect(TOK_RPAREN);
-            
-            int jz_addr = code_size;
-            emit(OP_JZ, 0); // Placeholder
-            
-            parse_statement();
-            
-            if (match(TOK_ELSE)) {
-                int jmp_addr = code_size;
-                emit(OP_JMP, 0); // Placeholder
-                code[jz_addr].arg = code_size;
-                parse_statement();
-                code[jmp_addr].arg = code_size;
-            } else {
-                code[jz_addr].arg = code_size;
-            }
-        } else if (match(TOK_WHILE)) {
-            int loop_start = code_size;
-            expect(TOK_LPAREN);
-            parse_expression();
-            expect(TOK_RPAREN);
-            
-            int jz_addr = code_size;
-            emit(OP_JZ, 0); // Placeholder
-            
-            parse_statement();
-            emit(OP_JMP, loop_start);
-            code[jz_addr].arg = code_size;
-        } else if (match(TOK_FOR)) {
-            expect(TOK_LPAREN);
-            
-            // Init
-            if (current_token.type == TOK_INT) {
-                parse_declaration();
-            } else if (current_token.type != TOK_SEMICOLON) {
-                parse_expression();
-                emit(OP_POP);
-            }
-            expect(TOK_SEMICOLON);
-            
-            int loop_start = code_size;
-            
-            // Condition
-            int jz_addr = -1;
-            if (current_token.type != TOK_SEMICOLON) {
-                parse_expression();
-                jz_addr = code_size;
-                emit(OP_JZ, 0);
-            }
-            expect(TOK_SEMICOLON);
-            
-            // Jump over increment
-            int jmp_body = code_size;
-            emit(OP_JMP, 0);
-            
-            // Increment
-            int inc_start = code_size;
-            if (current_token.type != TOK_RPAREN) {
-                parse_expression();
-                emit(OP_POP);
-            }
-            emit(OP_JMP, loop_start);
-            expect(TOK_RPAREN);
-            
-            // Body
-            code[jmp_body].arg = code_size;
-            parse_statement();
-            emit(OP_JMP, inc_start);
-            
-            if (jz_addr >= 0) {
-                code[jz_addr].arg = code_size;
-            }
-        } else if (match(TOK_RETURN)) {
-            if (current_token.type != TOK_SEMICOLON) {
-                parse_expression();
-            }
-            emit(OP_RET);
-            expect(TOK_SEMICOLON);
-        } else if (match(TOK_LBRACE)) {
-            while (current_token.type != TOK_RBRACE && current_token.type != TOK_EOF) {
-                parse_statement();
-            }
-            expect(TOK_RBRACE);
-        } else if (current_token.type == TOK_INT) {
-            parse_declaration();
-        } else {
-            // Expression statement or assignment
-            if (current_token.type == TOK_IDENT) {
-                char name[64];
-                strcpy(name, current_token.text);
-                advance();
-                
-                if (match(TOK_ASSIGN)) {
-                    parse_expression();
-                    int var_idx = find_variable(name);
-                    if (var_idx >= 0) {
-                        if (variables[var_idx].is_local) {
-                            emit(OP_STOREL, variables[var_idx].offset);
-                        } else {
-                            emit(OP_STOREG, variables[var_idx].offset);
-                        }
-                    }
-                } else if (match(TOK_PLUSPLUS)) {
-                    int var_idx = find_variable(name);
-                    if (var_idx >= 0) {
-                        if (variables[var_idx].is_local) {
-                            emit(OP_LOADL, variables[var_idx].offset);
-                        } else {
-                            emit(OP_LOADG, variables[var_idx].offset);
-                        }
-                        emit(OP_PUSH, 1);
-                        emit(OP_ADD);
-                        if (variables[var_idx].is_local) {
-                            emit(OP_STOREL, variables[var_idx].offset);
-                        } else {
-                            emit(OP_STOREG, variables[var_idx].offset);
-                        }
-                    }
-                } else if (match(TOK_MINUSMINUS)) {
-                    int var_idx = find_variable(name);
-                    if (var_idx >= 0) {
-                        if (variables[var_idx].is_local) {
-                            emit(OP_LOADL, variables[var_idx].offset);
-                        } else {
-                            emit(OP_LOADG, variables[var_idx].offset);
-                        }
-                        emit(OP_PUSH, 1);
-                        emit(OP_SUB);
-                        if (variables[var_idx].is_local) {
-                            emit(OP_STOREL, variables[var_idx].offset);
-                        } else {
-                            emit(OP_STOREG, variables[var_idx].offset);
-                        }
-                    }
-                }
-            }
-            expect(TOK_SEMICOLON);
-        }
-    }
-    
-    void parse_declaration() {
-        expect(TOK_INT);
-        char name[64];
-        strcpy(name, current_token.text);
-        expect(TOK_IDENT);
-        
-        add_variable(name, true);
-        
-        if (match(TOK_ASSIGN)) {
-            parse_expression();
-            int var_idx = find_variable(name);
-            if (var_idx >= 0) {
-                emit(OP_STOREL, variables[var_idx].offset);
-            }
-        }
-        expect(TOK_SEMICOLON);
-    }
-    
-public:
-    CCompiler() : code_size(0), tokenizer(nullptr), var_count(0), 
-                  local_offset(0), global_offset(0) {}
-    
-    bool compile(const char* source) {
-        code_size = 0;
-        var_count = 0;
-        local_offset = 0;
-        global_offset = 0;
-        
-        tokenizer = new Tokenizer(source);
-        advance();
-        
-        // Parse function (simplified - assumes main() only)
-        if (match(TOK_INT) || match(TOK_VOID)) {
-            expect(TOK_IDENT); // function name
-            expect(TOK_LPAREN);
-            expect(TOK_RPAREN);
-            expect(TOK_LBRACE);
-            
-            while (current_token.type != TOK_RBRACE && current_token.type != TOK_EOF) {
-                parse_statement();
-            }
-            
-            emit(OP_HALT);
-        }
-        
-        delete tokenizer;
-        return true;
-    }
-    
-    VMInstruction* get_code() { return code; }
-    int get_code_size() const { return code_size; }
-};
-
-// =============================================================================
-// GLOBAL VM INSTANCE & INTEGRATION
-// =============================================================================
-
-static ByteVM* g_running_vm = nullptr;
-static CCompiler g_compiler;
-
-// Call this in your main loop's update section (after wm.update_all())
-void bytevm_tick() {
-    if (g_running_vm) {
-        g_running_vm->tick();
-        
-        // Cleanup if finished
-        if (!g_running_vm->is_running()) {
-            delete g_running_vm;
-            g_running_vm = nullptr;
-        }
-    }
+    tcc_delete(s);
+    return result;
 }
-
-// Implementation - place this AFTER all class definitions
-// It uses TerminalWindow so must come after the class is defined
-void handle_run_command(const char* filename, TerminalWindow* term) {
-    // Stop any currently running VM
-    if (g_running_vm) {
-        delete g_running_vm;
-        g_running_vm = nullptr;
-    }
-    
-    // Load program from file
-    char* source = fat32_read_file_as_string(filename);
-    if (!source) {
-        term->console_print("Failed to load file.\n");
-        return;
-    }
-    
-    // Compile
-    term->console_print("Compiling...\n");
-    if (!g_compiler.compile(source)) {
-        term->console_print("Compilation failed.\n");
-        delete[] source;
-        return;
-    }
-    delete[] source;
-    
-    char buf[64];
-    snprintf(buf, 64, "Generated %d instructions.\n", g_compiler.get_code_size());
-    term->console_print(buf);
-    
-    // Create VM and load program
-    g_running_vm = new ByteVM();
-    g_running_vm->set_output(term);
-    
-    if (!g_running_vm->load_program(g_compiler.get_code(), g_compiler.get_code_size())) {
-        term->console_print("Failed to load program into VM.\n");
-        delete g_running_vm;
-        g_running_vm = nullptr;
-        return;
-    }
-    
-    term->console_print("Program started (tick-based execution).\n");
-}
-
-/*
- * ============================================================================
- * INTEGRATION INSTRUCTIONS
- * ============================================================================
- * 
- * 1. Add to TerminalWindow::handle_command() in the "else if" chain:
- * 
- *    else if (strcmp(command, "run") == 0) {
- *        char* filename = get_arg(args, 0);
- *        if (filename) {
- *            handle_run_command(filename, this);
- *        } else {
- *            console_print("Usage: run \"<filename>\"\n");
- *        }
- *    }
- * 
- * 2. Add to your main loop (after wm.update_all(), before drawing cursor):
- * 
- *    bytevm_tick();
- * 
- * 3. Example C programs to test:
- * 
- * ============================================================================
- * EXAMPLE 1: test.c - Simple counter
- * ============================================================================
- */
-
-/*
-int main() {
-    int i = 0;
-    while (i < 10) {
-        print(i);
-        i++;
-    }
-    return 0;
-}
-*/
-
-/*
- * ============================================================================
- * EXAMPLE 2: draw.c - Draw animated line
- * ============================================================================
- */
-
-/*
-int main() {
-    int x = 0;
-    while (x < 800) {
-        setpixel(x, 300, 0xFF0000);
-        x++;
-        if (x % 10 == 0) {
-            delay(1);  // Delay 1 tick every 10 pixels
-        }
-    }
-    return 0;
-}
-*/
-
-/*
- * ============================================================================
- * EXAMPLE 3: animate.c - Bouncing pixel
- * ============================================================================
- */
-
-/*
-int main() {
-    int x = 100;
-    int y = 100;
-    int dx = 2;
-    int dy = 3;
-    int color = 0x00FF00;
-    
-    int i = 0;
-    while (i < 1000) {
-        // Clear old position (draw black)
-        setpixel(x, y, 0x000000);
-        
-        // Update position
-        x = x + dx;
-        y = y + dy;
-        
-        // Bounce off edges
-        if (x > 800) {
-            x = 800;
-            dx = -dx;
-        }
-        if (x < 0) {
-            x = 0;
-            dx = -dx;
-        }
-        if (y > 600) {
-            y = 600;
-            dy = -dy;
-        }
-        if (y < 0) {
-            y = 0;
-            dy = -dy;
-        }
-        
-        // Draw new position
-        setpixel(x, y, color);
-        
-        delay(1);  // One frame delay
-        i++;
-    }
-    return 0;
-}
-*/
-
-/*
- * ============================================================================
- * EXAMPLE 4: pattern.c - Draw pattern
- * ============================================================================
- */
-
-/*
-int main() {
-    int y = 0;
-    while (y < 600) {
-        int x = 0;
-        while (x < 800) {
-            int color = (x * y) % 0xFFFFFF;
-            setpixel(x, y, color);
-            x = x + 4;
-        }
-        y = y + 4;
-        if (y % 20 == 0) {
-            delay(1);  // Yield every 20 lines
-        }
-    }
-    return 0;
-}
-*/
-
-/*
- * ============================================================================
- * EXAMPLE 5: game.c - Simple interactive program
- * ============================================================================
- */
-
-/*
-int main() {
-    int x = 400;
-    int y = 300;
-    int color = 0xFFFF00;
-    
-    int running = 1;
-    while (running) {
-        // Clear old position
-        setpixel(x, y, 0x000000);
-        
-        // Get keyboard input
-        int key = getkey();
-        
-        // Update based on arrow keys
-        if (key == -3) { x = x - 5; }  // Left arrow
-        if (key == -4) { x = x + 5; }  // Right arrow  
-        if (key == -1) { y = y - 5; }  // Up arrow
-        if (key == -2) { y = y + 5; }  // Down arrow
-        
-        // Keep in bounds
-        if (x < 0) { x = 0; }
-        if (x > 800) { x = 800; }
-        if (y < 0) { y = 0; }
-        if (y > 600) { y = 600; }
-        
-        // Draw new position
-        setpixel(x, y, color);
-        
-        delay(2);  // 2 tick delay
-    }
-    return 0;
-}
-*/
-
-/*
- * ============================================================================
- * EXAMPLE 6: mandelbrot.c - Fractal renderer
- * ============================================================================
- */
-
-/*
-int main() {
-    int py = 0;
-    while (py < 400) {
-        int px = 0;
-        while (px < 640) {
-            // Map pixel to complex plane
-            int x0 = (px * 3500) / 640 - 2500;
-            int y0 = (py * 2000) / 400 - 1000;
-            
-            int x = 0;
-            int y = 0;
-            int iteration = 0;
-            int max_iteration = 50;
-            
-            while (x*x + y*y <= 4000000 && iteration < max_iteration) {
-                int xtemp = (x*x - y*y) / 1000 + x0;
-                y = (2*x*y) / 1000 + y0;
-                x = xtemp;
-                iteration++;
-            }
-            
-            // Color based on iteration
-            int color = 0;
-            if (iteration < max_iteration) {
-                color = (iteration * 16777) % 0xFFFFFF;
-            }
-            
-            setpixel(px, py, color);
-            px++;
-        }
-        
-        if (py % 4 == 0) {
-            delay(1);  // Yield every 4 lines
-        }
-        py++;
-    }
-    return 0;
-}
-*/
-
-/*
- * ============================================================================
- * SUPPORTED C FEATURES
- * ============================================================================
- * 
- * Data Types:
- *   - int (32-bit signed integer)
- * 
- * Operators:
- *   - Arithmetic: +, -, *, /, %, ++, --
- *   - Comparison: ==, !=, <, <=, >, >=
- *   - Logical: &&, ||, !
- *   - Bitwise: &, |, ^, ~, <<, >>
- * 
- * Control Flow:
- *   - if / else
- *   - while
- *   - for
- *   - return
- * 
- * Built-in Functions:
- *   - print(int value)              - Print integer to terminal
- *   - setpixel(int x, int y, int c) - Draw pixel (RGB color)
- *   - getpixel(int x, int y)        - Get pixel color
- *   - delay(int ticks)              - Delay execution
- *   - getkey()                      - Get last key pressed
- * 
- * Variables:
- *   - Local variables (in functions)
- *   - Global variables (outside functions) - NOT YET IMPLEMENTED
- * 
- * Limitations:
- *   - Only one function (main) supported
- *   - No arrays or pointers
- *   - No strings
- *   - No function parameters/arguments
- *   - No structs or enums
- * 
- * ============================================================================
- * PERFORMANCE NOTES
- * ============================================================================
- * 
- * The VM executes 500 instructions per tick by default.
- * 
- * To prevent UI freezing:
- *   - Use delay() in long loops
- *   - Break work across multiple frames
- *   - The VM automatically yields at frame boundaries
- * 
- * Adjust INSTRUCTIONS_PER_TICK in ByteVM class for different performance:
- *   - Lower = more responsive UI, slower programs
- *   - Higher = faster programs, potential UI lag
- * 
- * ============================================================================
- * DEBUGGING TIPS
- * ============================================================================
- * 
- * 1. Use print() to output values during execution
- * 2. Add delay(10) at strategic points to slow down execution
- * 3. Check terminal for "VM ERROR" messages
- * 4. Common errors:
- *    - Stack overflow: Too many nested calls or expressions
- *    - Division by zero: Check your math
- *    - Memory OOB: Invalid pixel coordinates
- * 
- * ============================================================================
- * EXTENDING THE COMPILER
- * ============================================================================
- * 
- * To add new built-in functions:
- * 
- * 1. Add opcode to VMOpcode enum
- * 2. Implement in ByteVM::execute_instruction()
- * 3. Add to CCompiler::parse_primary() function call handler
- * 
- * Example - Adding a random() function:
- * 
- *   In VMOpcode: OP_RANDOM,
- *   
- *   In execute_instruction():
- *     case OP_RANDOM: {
- *       int max = pop();
- *       push(g_timer_ticks % max);  // Simple pseudo-random
- *       break;
- *     }
- *   
- *   In parse_primary():
- *     else if (strcmp(name, "random") == 0) {
- *       emit(OP_RANDOM);
- *     }
- * 
- * ============================================================================
- * ADVANCED USAGE
- * ============================================================================
- * 
- * Multiple Programs:
- *   - Currently only one VM can run at a time
- *   - To add multitasking, maintain array of ByteVM instances
- *   - Call tick() on each VM in round-robin fashion
- * 
- * Saving Bytecode:
- *   - Save g_compiler.get_code() array to file as .obj
- *   - Load directly into VM without recompiling
- *   - Much faster startup for large programs
- * 
- * Memory Mapped I/O:
- *   - Use memory[] array as shared memory
- *   - Programs can communicate through shared variables
- *   - Implement semaphores for synchronization
- * 
- * ============================================================================
- */
 
 // =============================================================================
 // KERNEL MAIN - ATOMIC FRAME RENDERING
@@ -5100,7 +6033,6 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // =============================================================================
     for (;;) {
         poll_input_universal();
-        bytevm_tick();
 
         bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
         bool l_button_changed = (mouse_left_down != mouse_left_last_frame);
@@ -5140,7 +6072,9 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
                 // =============================================================================
                 // ATOMIC FRAME RENDERING - PREVENTS ALL TRAILING AND TEARING
                 // =============================================================================
+                
                 g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
+                
                 wm.update_all();
                 
                 draw_cursor(mouse_x, mouse_y, ColorPalette::CURSOR_WHITE);
