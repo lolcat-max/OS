@@ -270,12 +270,9 @@ int tcc_compile_string(TCCState *s, const char *buf) {
             char* str_end = strchr(str_start, '"');
             if (str_end && str_end - str_start < 32) {
                 // **PRINT STRING ONCE - Clean content only**
-                print("\"");
                 for (char* p = str_start; p < str_end; p++) {
                     term_putc(*p);
                 }
-                print("\"\n");
-                
                 // Execute by calling print directly
                 return 0;  // Skip kernel_test_main
             }
@@ -290,7 +287,6 @@ int tcc_compile_string(TCCState *s, const char *buf) {
 void *tcc_get_symbol(TCCState *s, const char *name) {
     // Return print function directly - user code calls OUR print
     if (strcmp(name, "print") == 0) return print;
-    if (strcmp(name, "main") == 0) return (void*)kernel_test_main;
     return NULL;
 }
 
@@ -303,6 +299,7 @@ void run_code(char* code_buf) {
     tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
     tcc_add_symbol(s, "print", print);
     
+    tcc_compile_string(s, code_buf);
     
     int size = tcc_relocate(s, NULL);
     void* mem = tcc_malloc(size);
