@@ -1,28 +1,35 @@
-OUTPUT_FORMAT("elf32-i386")
+/* linker.ld - simple script for i386 multiboot kernel */
+OUTPUT_FORMAT(elf32-i386)
 ENTRY(kernel_main)
 
 SECTIONS
 {
-    . = 0x00100000;
-    
-    .multiboot : {
-        *(.multiboot)
+    /* Put multiboot header at very start (must be within first 8KiB) */
+    . = 0x00100000; /* virtual load address - adjust if you want 1MB */
+
+    .multiboot ALIGN(4) : {
+        KEEP(*(.multiboot))
     }
-    
-    .text : {
-        *(.text)
+
+    .text ALIGN(4) : {
+        *(.text.entry)
+        *(.text.start)
+        *(.text*)
+        *(.init)
     }
-    
-    .rodata : {
-        *(.rodata)
+
+    .rodata ALIGN(4): { *(.rodata*) }
+
+    .data ALIGN(4) : {
+        *(.data*)
     }
-    
-    .data : {
-        *(.data)
-    }
-    
-    .bss : {
+
+    .bss ALIGN(4) : {
+        __bss_start = .;
+        *(.bss*)
         *(COMMON)
-        *(.bss)
+        __bss_end = .;
     }
+
+    /DISCARD/ : { *(.comment) *(.note.GNU-stack) }
 }

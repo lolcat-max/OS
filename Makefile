@@ -200,6 +200,10 @@ headers: tcc-0.9.27
 	# Empty stubs
 	@touch tcc-0.9.27/fake_inc/assert.h tcc-0.9.27/fake_inc/ctype.h tcc-0.9.27/fake_inc/limits.h
 
+# add target compile for libc_extra.o
+libc_extra.o: libc_extra.c
+	$(CC) $(CFLAGS) -c libc_extra.c -o libc_extra.o
+
 # 3. Compile Libtcc
 libtcc.o: headers
 	@echo "[COMPILE] Building libtcc.o..."
