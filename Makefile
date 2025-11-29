@@ -33,19 +33,16 @@ libtcc.a: $(TCC_DIR)/i386-tcc
 	cd $(TCC_DIR) && ../$(TCC_DIR)/i386-tcc -c -m32 -nostdlib -I include \
 		-DTCC_TARGET_I386=1 i386-asm.c
 	cd $(TCC_DIR) && ar rcs ../../libtcc.a i386-asm.o
-# 3. Compile Kernel (with stack protector disabled)
-kernel.o: kernel.c $(TCC_DIR)/i386-tcc
-	$(TCC_DIR)/i386-tcc -c -m32 -nostdlib -fno-stack-protector \
-		-I $(TCC_DIR)/include \
-		kernel.c -o kernel.o
 
 # 3. Compile boot.S
 boot.o: boot.S $(TCC_DIR)/i386-tcc
 	$(TCC_DIR)/i386-tcc -c -m32 -nostdlib boot.S -o boot.o
-	
-# 4. Link Kernel with COMPLETE TCC runtime
-kernel.bin: boot.o kernel.o libtcc.a linker.ld
-	ld -m elf_i386 -T linker.ld -o kernel.bin boot.o kernel.o $(TCC_DIR)/libtcc.a
+kernel.o: kernel.c
+	tcc -c -m32 -nostdlib -nostdinc -fno-stack-protector \
+		-I $(TCC_DIR)/include kernel.c -o kernel.o
+
+kernel.bin: boot.o kernel.o
+	ld -m elf_i386 -T linker.ld boot.o kernel.o tcc_libtcc_i386.a -o kernel.bin
 
 # 5. Create ISO
 main.iso: kernel.bin grub.cfg
