@@ -1,26 +1,30 @@
+/* linker.ld */
 ENTRY(kernel_main)
 
-SECTIONS {
-    /* The kernel starts at 1MB */
-    . = 1M;
-
-    /* Force Multiboot header to be the VERY first thing */
-    .text : {
-        /* Ensure 4-byte alignment for the header */
-        . = ALIGN(4);
-        KEEP(*(.multiboot))
+SECTIONS
+{
+    . = 0x100000;
+    
+    .multiboot : {
+        *(.multiboot)
+    }
+    
+    .text ALIGN(4K) : {
         *(.text)
     }
-
-    .rodata : {
-        *(.rodata)
+    
+    .rodata ALIGN(4K) : {
+        *(.rodata*)
     }
-
-    .data : {
+    
+    .data ALIGN(4K) : {
         *(.data)
     }
-
-    .bss : {
+    
+    .bss ALIGN(4K) : {
+        *(COMMON)
         *(.bss)
     }
+    
+    _end = .;
 }
