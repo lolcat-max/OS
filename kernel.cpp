@@ -5292,9 +5292,10 @@ void handle_command() {
             args++;
         }
     }
-    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, test, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
-    if (strcmp(command, "test") == 0) {
-		compile_and_run("int main(){return 42;}");//test
+
+    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
+    if (strcmp(command, "compile") == 0) {
+        cmd_compile(ahci_base, selected_port, get_arg(args, 0));
     } else if (strcmp(command, "run") == 0) {
         cmd_run(ahci_base, selected_port, get_arg(args, 0));
     } else if (strcmp(command, "exec") == 0) {
@@ -5584,28 +5585,24 @@ public:
             editor_clamp_cursor_to_line();
             editor_ensure_cursor_visible();
         } else {
-        // Terminal input mode
-        if (c == '\n') {
-            prompt_visual_lines = 0;
-            handle_command();
-            line_pos = 0;
-            current_line[0] = '\0';
-            update_prompt_display();
-        } else if (c == '\b') {
-            if (line_pos > 0) {
-                current_line[--line_pos] = '\0';
-                // Lightweight update: just refresh the last buffer line
-                snprintf(buffer[line_count > 0 ? line_count - 1 : 0], TERM_WIDTH, "> %s", current_line);
-            }
-        } else if (c >= 32 && c < 127) {
-            if (line_pos < TERM_WIDTH - 2) {
+            if (c == '\n') {
+                prompt_visual_lines = 0;
+                handle_command();
+                line_pos = 0;
+                current_line[0] = '\0';
+                update_prompt_display();
+            } else if (c == '\b') {
+                if (line_pos > 0) {
+                    line_pos--;
+                    current_line[line_pos] = 0;
+                }
+                update_prompt_display();
+            } else if (c >= 32 && c < 127 && line_pos < TERM_WIDTH - 2) {
                 current_line[line_pos++] = c;
-                current_line[line_pos] = '\0';
-                // Lightweight update: just refresh the last buffer line
-                snprintf(buffer[line_count > 0 ? line_count - 1 : 0], TERM_WIDTH, "> %s", current_line);
+                current_line[line_pos] = 0;
+                update_prompt_display();
             }
         }
-		}
     }
 
      // --- THIS IS THE CORRECTED UPDATE METHOD ---
@@ -5929,41 +5926,7 @@ static void init_screen_timer(uint16_t hz) {
     outb(0x40, (divisor >> 8) & 0xFF);
 }
 
-/* Self-hosting: compile and run C code */
-int compile_and_run(const char *source_code) {
-    TCCState *s = tcc_new();
-    if (!s) {
-        print("Error: Failed to create TCC state\n");
-        return -1;
-    }
-    
-    tcc_set_output_type(s, TCC_OUTPUT_MEMORY);
-    
-    if (tcc_compile_string(s, source_code) < 0) {
-        print("Error: Compilation failed\n");
-        tcc_delete(s);
-        return -1;
-    }
-    
-    /* Relocate code into memory */
-    int size = tcc_relocate(s, NULL);
-    void *mem = (void*)0x200000; /* Use memory at 2MB mark */
-    tcc_relocate(s, mem);
-    
-    /* Get main function and execute */
-    int (*func)(void) = tcc_get_symbol(s, "main");
-    if (!func) {
-        print("Error: No main() function found\n");
-        tcc_delete(s);
-        return -1;
-    }
-    
-    print("Executing compiled code...\n");
-    int result = func();
-    
-    tcc_delete(s);
-    return result;
-}
+
 
 // =============================================================================
 // KERNEL MAIN - ATOMIC FRAME RENDERING
