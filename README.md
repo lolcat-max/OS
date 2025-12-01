@@ -16,3 +16,5 @@ self hosted compiler features these commands:
 
 
 TODO: more GUI features, fix cin, implement smp.
+
+uses sata port 0
