@@ -4245,7 +4245,56 @@ struct TinyVM {
                 case T_PRINT_CHAR:{ int v=pop(); char b[2]; b[0]=(char)(v&0xff); b[1]=0; printf("%s", b); } break;
                 case T_PRINT_STR: { const char* p=(const char*)pop(); if(p) printf("%s", p); } break;
                 case T_PRINT_ENDL:{ printf("\n"); } break;
-                 // --- MODIFIED READ OPERATIONS ---
+                  // --- FILE I/O OPERATIONS ---
+                case T_READ_FILE: {
+                    const char* filename = (const char*)pop();
+                    // Note: fat32_read_file_as_string is blocking, but fast enough for now
+                    char* file_buffer = fat32_read_file_as_string(filename);
+                    if(file_buffer) {
+                        push((int)file_buffer); // Push pointer to loaded string
+                    } else {
+                        push((int)""); // Push empty string on failure
+                    }
+                } break;
+
+                case T_WRITE_FILE: {
+                    const char* content = (const char*)pop();
+                    const char* filename = (const char*)pop();
+                    int len = tcc_strlen(content);
+                    int result = fat32_write_file(filename, (const unsigned char*)content, len);
+                    push(result >= 0 ? 1 : 0); // Push success/fail boolean
+                } break;
+
+                case T_APPEND_FILE: {
+                    const char* content = (const char*)pop();
+                    const char* filename = (const char*)pop();
+                    
+                    // 1. Read existing
+                    char* existing_buffer = fat32_read_file_as_string(filename);
+                    int n = 0;
+                    if(existing_buffer) {
+                        n = tcc_strlen(existing_buffer);
+                    }
+
+                    // 2. Alloc new buffer
+                    int content_len = tcc_strlen(content);
+                    char* new_buffer = new char[n + content_len + 1];
+                    
+                    // 3. Merge
+                    if (existing_buffer) {
+                        simple_memcpy(new_buffer, existing_buffer, n);
+                        delete[] existing_buffer;
+                    }
+                    simple_memcpy(new_buffer + n, content, content_len + 1);
+
+                    // 4. Write back
+                    int result = fat32_write_file(filename, (const unsigned char*)new_buffer, n + content_len);
+                    push(result >= 0 ? 1 : 0);
+                    
+                    delete[] new_buffer;
+                } break;
+				
+				// --- MODIFIED READ OPERATIONS ---
                 case T_READ_INT: {
                     waiting_for_input = true;
                     input_mode = 1;
