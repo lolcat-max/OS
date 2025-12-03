@@ -4166,18 +4166,22 @@ struct TinyVM {
         }
     }
 	
-	    void vm_print(const char* s) {
-        if (bound_window) bound_window->console_print(s);
-        else printf("%s", s);
-    }
+	void vm_print(const char* s) {
+		if (bound_window) {
+			bound_window->console_print(s);  // Route to window!
+		} else {
+			printf(s);  // Fallback if no window
+		}
+	}
 
-    void vm_putc(char c) {
-        if (bound_window) bound_window->put_char(c);
-        else {
-            char tmp[2] = {c,0};
-            printf("%s", tmp);
-        }
-    }
+	void vm_putc(char c) {
+		if (bound_window) {
+			char tmp[2] = {c, 0};
+			bound_window->console_print(tmp);  // Route to window!
+		} else {
+			printf("%c", c);  // Fallback if no window
+		}
+	}
 
     void feed_input(char c) {
         if (!waiting_for_input) return;
@@ -4245,56 +4249,7 @@ struct TinyVM {
                 case T_PRINT_CHAR:{ int v=pop(); char b[2]; b[0]=(char)(v&0xff); b[1]=0; printf("%s", b); } break;
                 case T_PRINT_STR: { const char* p=(const char*)pop(); if(p) printf("%s", p); } break;
                 case T_PRINT_ENDL:{ printf("\n"); } break;
-                  // --- FILE I/O OPERATIONS ---
-                case T_READ_FILE: {
-                    const char* filename = (const char*)pop();
-                    // Note: fat32_read_file_as_string is blocking, but fast enough for now
-                    char* file_buffer = fat32_read_file_as_string(filename);
-                    if(file_buffer) {
-                        push((int)file_buffer); // Push pointer to loaded string
-                    } else {
-                        push((int)""); // Push empty string on failure
-                    }
-                } break;
-
-                case T_WRITE_FILE: {
-                    const char* content = (const char*)pop();
-                    const char* filename = (const char*)pop();
-                    int len = tcc_strlen(content);
-                    int result = fat32_write_file(filename, (const unsigned char*)content, len);
-                    push(result >= 0 ? 1 : 0); // Push success/fail boolean
-                } break;
-
-                case T_APPEND_FILE: {
-                    const char* content = (const char*)pop();
-                    const char* filename = (const char*)pop();
-                    
-                    // 1. Read existing
-                    char* existing_buffer = fat32_read_file_as_string(filename);
-                    int n = 0;
-                    if(existing_buffer) {
-                        n = tcc_strlen(existing_buffer);
-                    }
-
-                    // 2. Alloc new buffer
-                    int content_len = tcc_strlen(content);
-                    char* new_buffer = new char[n + content_len + 1];
-                    
-                    // 3. Merge
-                    if (existing_buffer) {
-                        simple_memcpy(new_buffer, existing_buffer, n);
-                        delete[] existing_buffer;
-                    }
-                    simple_memcpy(new_buffer + n, content, content_len + 1);
-
-                    // 4. Write back
-                    int result = fat32_write_file(filename, (const unsigned char*)new_buffer, n + content_len);
-                    push(result >= 0 ? 1 : 0);
-                    
-                    delete[] new_buffer;
-                } break;
-				
-				// --- MODIFIED READ OPERATIONS ---
+                 // --- MODIFIED READ OPERATIONS ---
                 case T_READ_INT: {
                     waiting_for_input = true;
                     input_mode = 1;
@@ -4473,61 +4428,7 @@ extern "C" void cmd_compile(uint64_t ahci_base, int port, const char* filename){
     printf("Compiling %s...\n", filename);
     int r = tinyvm_compile_to_obj(ahci_base, port, filename, obj);
     if(r==0) { printf("OK -> %s\n", obj); } else { printf("Compilation failed!\n"); }
-}extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename) {
-    // 1. Find a free process slot
-    int pid = -1;
-    for(int i = 0; i < MAX_PROCESSES; i++) {
-        if(!processes[i].is_running) {
-            pid = i;
-            break;
-        }
-    }
-
-    if(pid == -1) {
-        wm.print_to_focused("Error: Max processes (4) reached.\n");
-        return;
-    }
-
-    // Load program
-    int r = TVMObject::load(ahci_base, port, filename, prog_pool[pid]);
-    if(r < 0) { 
-        wm.print_to_focused("Load failed.\n"); 
-        return; 
-    }
-    
-    // Get Focused Window Pointer
-    Window* win = wm.get_window(wm.get_focused_idx());
-
-    // Start Execution
-    static const char* argvv[1] = { filename }; // Simple argv
-    processes[pid].start_execution(prog_pool[pid], 1, argvv, ahci_base, port, win);
-    
-    if(win) win->console_print("Process started...\n");
 }
-
-
-extern "C" void cmd_exec(const char* code_text) {
-    // ... find pid logic (same as above) ...
-    int pid = -1;
-    for(int i = 0; i < MAX_PROCESSES; i++) {
-        if(!processes[i].is_running) { pid = i; break; }
-    }
-    if(pid == -1) return;
-
-    TCompiler C; 
-    if(C.compile(code_text) < 0) return;
-    
-    prog_pool[pid] = C.pr;
-    
-    static const char* argvv[1] = { };
-    
-    // FIX: Get Pointer, not Index
-    Window* win = wm.get_window(wm.get_focused_idx());
-    
-    processes[pid].start_execution(prog_pool[pid], 0, argvv, 0, 0, win);
-    printf("Running inline (PID %d)...\n", pid);
-}
-
 
 
 // --- Command parsing helper ---
@@ -4570,6 +4471,96 @@ char* get_arg(char* args, int n) {
 }
 
 
+    // Separate process tables
+#define MAX_RUN_PROCESSES 4
+#define MAX_EXEC_PROCESSES 4
+
+// Context for RUN processes (disk-based execution)
+struct RunContext {
+    TProgram prog;           // Program code
+    uint64_t ahci_base;      // Disk controller base
+    int port;                // Disk port
+    TinyVM vm;               // VM instance
+    bool active;             // Is this slot in use
+    char filename[64];       // Source filename for debugging
+};
+
+// Context for EXEC processes (memory-based execution)  
+struct ExecContext {
+    TProgram prog;           // Program code
+    TinyVM vm;               // VM instance
+    bool active;             // Is this slot in use
+    int exec_id;             // Unique execution ID
+};
+static RunContext run_contexts[MAX_RUN_PROCESSES];
+static ExecContext exec_contexts[MAX_EXEC_PROCESSES];
+	
+	// List active run processes
+void list_run_processes() {
+    wm.print_to_focused("Active RUN processes:\n");
+    bool found = false;
+    for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+        if (run_contexts[i].active) {
+            char msg[128];
+            snprintf(msg, 128, "  Slot %d: %s (IP=%d)\n", 
+                     i, run_contexts[i].filename, run_contexts[i].vm.ip);
+            wm.print_to_focused(msg);
+            found = true;
+        }
+    }
+    if (!found) {
+        wm.print_to_focused("  (none)\n");
+    }
+}
+
+
+
+
+// List active exec processes
+void list_exec_processes() {
+    wm.print_to_focused("Active EXEC processes:\n");
+    bool found = false;
+    for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+        if (exec_contexts[i].active) {
+            char msg[128];
+            snprintf(msg, 128, "  Slot %d: ID=%d (IP=%d)\n", 
+                     i, exec_contexts[i].exec_id, exec_contexts[i].vm.ip);
+            wm.print_to_focused(msg);
+            found = true;
+        }
+    }
+    if (!found) {
+        wm.print_to_focused("  (none)\n");
+    }
+}
+
+// Kill a run process
+void kill_run_process(int slot) {
+    if (slot >= 0 && slot < MAX_RUN_PROCESSES && run_contexts[slot].active) {
+        run_contexts[slot].active = false;
+        run_contexts[slot].vm.is_running = false;
+        wm.print_to_focused("RUN process killed.\n");
+    } else {
+        wm.print_to_focused("Invalid RUN slot.\n");
+    }
+}
+
+// Kill an exec process
+void kill_exec_process(int slot) {
+    if (slot >= 0 && slot < MAX_EXEC_PROCESSES && exec_contexts[slot].active) {
+        exec_contexts[slot].active = false;
+        exec_contexts[slot].vm.is_running = false;
+        wm.print_to_focused("EXEC process killed.\n");
+    } else {
+        wm.print_to_focused("Invalid EXEC slot.\n");
+    }
+}
+	
+	
+
+	
+	
+	
 // =============================================================================
 // TERMINAL WINDOW IMPLEMENTATION
 // =============================================================================
@@ -4855,7 +4846,8 @@ private:
             push_line(prompt_buffer);
         }
     }
-    
+	
+	
 char startup_command_buffer[256];
 
 // --- Terminal command handler ---
@@ -4887,13 +4879,24 @@ void handle_command() {
         }
     }
 
-    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, ls, edit, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
+    if (strcmp(command, "help") == 0) { console_print("Commands: help, clear, killexec, killrun, ps, ls, edit, run, rm, cp, mv, formatfs, chkdsk ( /r /f), time, version\n"); }
     if (strcmp(command, "compile") == 0) {
         cmd_compile(ahci_base, selected_port, get_arg(args, 0));
-    } else if (strcmp(command, "run") == 0) {
-		cmd_run(ahci_base, selected_port, get_arg(args, 0));  // back to 3 args
-    } else if (strcmp(command, "exec") == 0) {
+    }  else if (strcmp(command, "run") == 0) {
+        cmd_run(ahci_base, selected_port, get_arg(args, 0));
+    }
+    else if (strcmp(command, "exec") == 0) {
         cmd_exec(get_arg(args, 0));
+    }
+    else if (strcmp(command, "ps") == 0) {
+        list_run_processes();
+        list_exec_processes();
+    }
+    else if (strcmp(command, "killrun") == 0) {
+        kill_run_process(simple_atoi(get_arg(args, 0)));
+    }
+    else if (strcmp(command, "killexec") == 0) {
+        kill_exec_process(simple_atoi(get_arg(args, 0)));
     }
     else if (strcmp(command, "clear") == 0) { line_count = 0; memset(buffer, 0, sizeof(buffer)); }
     else if (strcmp(command, "ls") == 0) { fat32_list_files(); }
@@ -5520,12 +5523,364 @@ static void init_screen_timer(uint16_t hz) {
     outb(0x40, (divisor >> 8) & 0xFF);
 }
 
-
-
 // =============================================================================
 // KERNEL MAIN - ATOMIC FRAME RENDERING
 // =============================================================================
 
+	
+// =============================================================================
+// INDEPENDENT RUN AND EXEC IMPLEMENTATION
+// =============================================================================
+// This refactoring completely decouples run and exec processes:
+// - run: manages disk-based object files with full disk I/O context
+// - exec: manages in-memory compiled code with no disk dependencies
+// - Separate process tables, separate resource management
+// - No shared state between the two subsystems
+
+// =============================================================================
+// SECTION 1: SEPARATE PROCESS CONTEXTS
+// =============================================================================
+
+
+// =============================================================================
+// SECTION 2: INDEPENDENT INITIALIZATION
+// =============================================================================
+
+void init_run_subsystem() {
+    for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+        run_contexts[i].active = false;
+        run_contexts[i].ahci_base = 0;
+        run_contexts[i].port = 0;
+        run_contexts[i].filename[0] = '\0';
+    }
+}
+
+void init_exec_subsystem() {
+    for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+        exec_contexts[i].active = false;
+        exec_contexts[i].exec_id = 0;
+    }
+}
+
+// =============================================================================
+// SECTION 3: RUN SUBSYSTEM (Disk-Based Execution)
+// =============================================================================
+
+// Find free run slot
+static int allocate_run_slot() {
+    for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+        if (!run_contexts[i].active) {
+            return i;
+        }
+    }
+    return -1; // No free slots
+}
+
+// Load program from disk into run context
+static int load_program_to_run_context(int slot, uint64_t ahci_base, int port, const char* filename) {
+    RunContext* ctx = &run_contexts[slot];
+    
+    // Load object file from disk
+    int result = TVMObject::load(ahci_base, port, filename, ctx->prog);
+    if (result != 0) {
+        return result;
+    }
+    
+    // Store disk context
+    ctx->ahci_base = ahci_base;
+    ctx->port = port;
+    strncpy(ctx->filename, filename, 63);
+    ctx->filename[63] = '\0';
+    
+    return 0;
+}
+
+static void start_run_execution(int slot, int argc, const char* argv[], Window* win) {
+    RunContext* ctx = &run_contexts[slot];
+    ctx->vm.start_execution(ctx->prog, argc, argv, ctx->ahci_base, ctx->port, win);
+    
+    // ← ADD THIS LINE:
+    ctx->vm.bound_window = win;
+    
+    ctx->active = true;
+}
+
+static void start_exec_execution(int slot, int argc, const char* argv[], Window* win) {
+    ExecContext* ctx = &exec_contexts[slot];
+    ctx->vm.start_execution(ctx->prog, argc, argv, 0, 0, win);
+    
+    // ← ADD THIS LINE:
+    ctx->vm.bound_window = win;
+    
+    ctx->active = true;
+}
+
+
+// Tick run processes (called from main loop)
+void tick_run_processes(int steps_per_process) {
+    for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+        if (run_contexts[i].active) {
+            int still_running = run_contexts[i].vm.tick(steps_per_process);
+            if (!still_running) {
+                run_contexts[i].active = false;
+                // Optionally report exit code
+                printf("RUN process %d exited with code: %d\n", i, run_contexts[i].vm.exit_code);
+            }
+        }
+    }
+}
+
+// Feed input to run process
+void feed_run_input(int slot, char c) {
+    if (slot >= 0 && slot < MAX_RUN_PROCESSES && run_contexts[slot].active) {
+        run_contexts[slot].vm.feed_input(c);
+    }
+}
+
+// Check if any run process is waiting for input
+bool run_process_waiting_for_input() {
+    for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+        if (run_contexts[i].active && run_contexts[i].vm.waiting_for_input) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// =============================================================================
+// SECTION 4: EXEC SUBSYSTEM (Memory-Based Execution)
+// =============================================================================
+
+// Find free exec slot
+static int allocate_exec_slot() {
+    static int next_exec_id = 1;
+    
+    for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+        if (!exec_contexts[i].active) {
+            exec_contexts[i].exec_id = next_exec_id++;
+            return i;
+        }
+    }
+    return -1; // No free slots
+}
+
+// Compile and load program into exec context
+static int compile_to_exec_context(int slot, const char* code_text) {
+    ExecContext* ctx = &exec_contexts[slot];
+    
+    // Compile source code in memory
+    TCompiler C;
+    int result = C.compile(code_text);
+    if (result != 0) {
+        return -1; // Compilation failed
+    }
+    
+    // Copy compiled program to context
+    ctx->prog = C.pr;
+    
+    return 0;
+}
+
+// Tick exec processes (called from main loop)
+void tick_exec_processes(int steps_per_process) {
+    for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+        if (exec_contexts[i].active) {
+            int still_running = exec_contexts[i].vm.tick(steps_per_process);
+            if (!still_running) {
+                exec_contexts[i].active = false;
+                // Optionally report exit code
+                // printf("EXEC process %d (id=%d) exited with code: %d\n", 
+                //        i, exec_contexts[i].exec_id, exec_contexts[i].vm.exitcode);
+            }
+        }
+    }
+}
+
+// Feed input to exec process
+void feed_exec_input(int slot, char c) {
+    if (slot >= 0 && slot < MAX_EXEC_PROCESSES && exec_contexts[slot].active) {
+        exec_contexts[slot].vm.feed_input(c);
+    }
+}
+
+// Check if any exec process is waiting for input
+bool exec_process_waiting_for_input() {
+    for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+        if (exec_contexts[i].active && exec_contexts[i].vm.waiting_for_input) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// =============================================================================
+// SECTION 5: INDEPENDENT COMMAND HANDLERS
+// =============================================================================
+
+// RUN command - completely independent, only uses RunContext
+extern "C" void cmd_run(uint64_t ahci_base, int port, const char* filename) {
+    // 1. Allocate run slot
+    int slot = allocate_run_slot();
+    if (slot == -1) {
+        wm.print_to_focused("Error: Max RUN processes reached.\n");
+        return;
+    }
+    
+    // 2. Load program from disk
+    int load_result = load_program_to_run_context(slot, ahci_base, port, filename);
+    if (load_result != 0) {
+        wm.print_to_focused("Error: Failed to load object file.\n");
+        return;
+    }
+    
+    // 3. Get window for output
+    Window* win = wm.get_window(wm.get_focused_idx());
+    
+    // 4. Start execution with disk context
+    static const char* argv[] = {filename};
+    start_run_execution(slot, 1, argv, win);
+    
+    // 5. Report success
+    if (win) {
+        char msg[128];
+        snprintf(msg, 128, "RUN: Started '%s' in slot %d\n", filename, slot);
+        win->console_print(msg);
+    }
+}
+
+// EXEC command - completely independent, only uses ExecContext
+extern "C" void cmd_exec(const char* code_text) {
+    // 1. Allocate exec slot
+    int slot = allocate_exec_slot();
+    if (slot == -1) {
+        wm.print_to_focused("Error: Max EXEC processes reached.\n");
+        return;
+    }
+    
+    // 2. Compile code in memory
+    int compile_result = compile_to_exec_context(slot, code_text);
+    if (compile_result != 0) {
+        wm.print_to_focused("Error: Compilation failed.\n");
+        return;
+    }
+    
+    // 3. Get window for output
+    Window* win = wm.get_window(wm.get_focused_idx());
+    
+    // 4. Start execution without disk context
+    static const char* argv[] = {"<inline>"};
+    start_exec_execution(slot, 1, argv, win);
+    
+    // 5. Report success
+    if (win) {
+        char msg[128];
+        snprintf(msg, 128, "EXEC: Started inline code in slot %d (id=%d)\n", 
+                 slot, exec_contexts[slot].exec_id);
+        win->console_print(msg);
+    }
+}
+
+// =============================================================================
+// SECTION 6: MAIN LOOP INTEGRATION
+// =============================================================================
+
+void handle_vm_input(char c) {
+    // Feed to all waiting run processes
+    if (run_process_waiting_for_input()) {
+        for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+            if (run_contexts[i].active && run_contexts[i].vm.waiting_for_input) {
+                feed_run_input(i, c);
+            }
+        }
+    }
+    
+    // Feed to all waiting exec processes
+    if (exec_process_waiting_for_input()) {
+        for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+            if (exec_contexts[i].active && exec_contexts[i].vm.waiting_for_input) {
+                feed_exec_input(i, c);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// SECTION 7: INITIALIZATION (Call from kernel_main)
+// =============================================================================
+
+void initialize_vm_subsystems() {
+    init_run_subsystem();
+    init_exec_subsystem();
+}
+
+// =============================================================================
+// SECTION 8: OPTIONAL MANAGEMENT FUNCTIONS
+// =============================================================================
+
+
+
+// =============================================================================
+// IMPLEMENTATION NOTES:
+// =============================================================================
+/*
+KEY BENEFITS OF THIS REFACTORING:
+
+1. COMPLETE INDEPENDENCE
+   - run and exec have their own process tables
+   - No shared state between subsystems
+   - Can be developed/debugged independently
+
+2. SEPARATE RESOURCE MANAGEMENT
+   - run manages disk I/O resources (ahci_base, port)
+   - exec manages memory resources only
+   - Different lifecycle management
+
+3. DIFFERENT EXECUTION CONTEXTS
+   - run: Full disk access, can load files during execution
+   - exec: No disk access, pure in-memory execution
+   - Clear separation of capabilities
+
+4. SCALABILITY
+   - Can easily increase MAX_RUN_PROCESSES independently of MAX_EXEC_PROCESSES
+   - Can add different tick rates for each subsystem
+   - Can prioritize one over the other
+
+5. DEBUGGING
+   - Easier to trace issues (separate process lists)
+   - Can disable one subsystem without affecting the other
+   - Clear ownership of resources
+
+6. FUTURE EXTENSIONS
+   - Easy to add run-specific features (disk caching, persistent processes)
+   - Easy to add exec-specific features (JIT compilation, sandboxing)
+   - Can add inter-process communication within each subsystem
+
+USAGE EXAMPLE:
+
+
+In terminal command handler:
+   
+
+MIGRATION PATH:
+
+1. Add the new context structures above your current code
+2. Implement init_run_subsystem() and init_exec_subsystem()
+3. Refactor cmd_run() to use RunContext
+4. Refactor cmd_exec() to use ExecContext
+5. Update kernel_main() to call process_all_vms()
+6. Remove old shared process table (processes[], progpool[])
+7. Test independently: run-only, exec-only, then both together
+
+*/
+
+// Add to your kernel_main() loop:
+void process_all_vms() {
+    // Process run VMs (disk-based)
+    tick_run_processes(100);  // 100 instructions per tick
+    
+    // Process exec VMs (memory-based)
+    tick_exec_processes(100); // 100 instructions per tick
+}
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // --- INITIALIZATION ---
     static uint8_t kernelheap[1024 * 1024 * 8];
@@ -5544,7 +5899,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     backbuffer = new uint32_t[fb_info.width * fb_info.height];
     
     g_gfx.init(false);
-    
+    initialize_vm_subsystems();
     launch_new_terminal();
     
     enable_usb_legacy_support();
@@ -5592,7 +5947,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     for (;;) {
         // 1. Poll Hardware Input
         poll_input_universal();
-
+		process_all_vms();
         // 2. Detect Changes
         bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
         bool l_button_changed = (mouse_left_down != mouse_left_last_frame);
@@ -5630,7 +5985,7 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 						processes[i].waiting_for_input &&
 						processes[i].bound_window == focused_win)   // pointer compare
 					{
-						processes[i].feed_input(last_key_press);
+						handle_vm_input(last_key_press);
 						input_consumed = true;
 						break;
 					}
@@ -5651,39 +6006,9 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
 
         wm.cleanup_closed_windows();
 
-        // --- MULTI-PROCESS SCHEDULER ---
-        bool any_process_running = false;
-        for(int i = 0; i < MAX_PROCESSES; i++) {
-            if (processes[i].is_running) {
-                any_process_running = true;
-                
-                // Round-robin scheduling: Tick each process
-                int status = processes[i].tick(1000); 
-                
-                if (status == 0) {
-                    // Process Exited
-                    char b[16]; 
-                    int_to_string(processes[i].exit_code, b); 
-                    
-                    int win = processes[i].bound_window_idx;
-                    wm.print_to_window(win, "\n[PID ");
-                    char pid_str[4]; int_to_string(i, pid_str);
-                    wm.print_to_window(win, pid_str);
-                    wm.print_to_window(win, " exited: ");
-                    wm.print_to_window(win, b);
-                    wm.print_to_window(win, "]\n> "); // Restore prompt
-                    
-                    g_evt_dirty = true;
-                } else {
-                    // Still running, might have printed output
-                    g_evt_dirty = true; 
-                }
-            }
-        }
-
         // --- RENDER ---
         if (g_evt_timer && (g_timer_ticks - last_paint_tick) >= TICKS_PER_FRAME) {
-            if (g_evt_dirty || g_input_state.hasNewInput || any_process_running) {
+            if (g_evt_dirty || g_input_state.hasNewInput) {
                 last_paint_tick = g_timer_ticks;
                 g_evt_dirty = false;
                 g_input_state.hasNewInput = false;
