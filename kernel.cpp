@@ -321,6 +321,22 @@ void operator delete[](void* ptr, size_t size) noexcept {
     (void)size;
     operator delete[](ptr);
 }
+// Add these struct definitions before kernel_main
+struct multiboot_tag {
+    uint32_t type;
+    uint32_t size;
+};
+
+struct multiboot_tag_framebuffer {
+    struct multiboot_tag common;
+    uint64_t framebuffer_addr;
+    uint32_t framebuffer_pitch;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    uint8_t framebuffer_bpp;
+    uint8_t framebuffer_type;
+    uint16_t reserved;
+};
 
 
 // =============================================================================
@@ -4245,56 +4261,7 @@ struct TinyVM {
                 case T_PRINT_CHAR:{ int v=pop(); char b[2]; b[0]=(char)(v&0xff); b[1]=0; printf("%s", b); } break;
                 case T_PRINT_STR: { const char* p=(const char*)pop(); if(p) printf("%s", p); } break;
                 case T_PRINT_ENDL:{ printf("\n"); } break;
-                  // --- FILE I/O OPERATIONS ---
-                case T_READ_FILE: {
-                    const char* filename = (const char*)pop();
-                    // Note: fat32_read_file_as_string is blocking, but fast enough for now
-                    char* file_buffer = fat32_read_file_as_string(filename);
-                    if(file_buffer) {
-                        push((int)file_buffer); // Push pointer to loaded string
-                    } else {
-                        push((int)""); // Push empty string on failure
-                    }
-                } break;
-
-                case T_WRITE_FILE: {
-                    const char* content = (const char*)pop();
-                    const char* filename = (const char*)pop();
-                    int len = tcc_strlen(content);
-                    int result = fat32_write_file(filename, (const unsigned char*)content, len);
-                    push(result >= 0 ? 1 : 0); // Push success/fail boolean
-                } break;
-
-                case T_APPEND_FILE: {
-                    const char* content = (const char*)pop();
-                    const char* filename = (const char*)pop();
-                    
-                    // 1. Read existing
-                    char* existing_buffer = fat32_read_file_as_string(filename);
-                    int n = 0;
-                    if(existing_buffer) {
-                        n = tcc_strlen(existing_buffer);
-                    }
-
-                    // 2. Alloc new buffer
-                    int content_len = tcc_strlen(content);
-                    char* new_buffer = new char[n + content_len + 1];
-                    
-                    // 3. Merge
-                    if (existing_buffer) {
-                        simple_memcpy(new_buffer, existing_buffer, n);
-                        delete[] existing_buffer;
-                    }
-                    simple_memcpy(new_buffer + n, content, content_len + 1);
-
-                    // 4. Write back
-                    int result = fat32_write_file(filename, (const unsigned char*)new_buffer, n + content_len);
-                    push(result >= 0 ? 1 : 0);
-                    
-                    delete[] new_buffer;
-                } break;
-				
-				// --- MODIFIED READ OPERATIONS ---
+                 // --- MODIFIED READ OPERATIONS ---
                 case T_READ_INT: {
                     waiting_for_input = true;
                     input_mode = 1;
@@ -5530,17 +5497,31 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     // --- INITIALIZATION ---
     static uint8_t kernelheap[1024 * 1024 * 8];
     g_allocator.init(kernelheap, sizeof(kernelheap));
-    
-    multiboot_info* mbi = (multiboot_info*)multiboot_addr;
-    if (!(mbi->flags & (1 << 12))) return;
 
-    fb_info = { 
-        (uint32_t*)(uint64_t)mbi->framebuffer_addr, 
-        mbi->framebuffer_width, 
-        mbi->framebuffer_height, 
-        mbi->framebuffer_pitch 
-    };
-    
+    // Verify Magic Number (0x36d76289 is Multiboot 2)
+    if (magic != 0x36d76289) {
+        // If magic is wrong, we might be in a bad state, but try to continue anyway
+        // or just return. Ideally, print an error if possible.
+    }
+
+    // Parse Tags
+    struct multiboot_tag *tag;
+    for (tag = (struct multiboot_tag *)(uintptr_t)(multiboot_addr + 8);
+         tag->type != 0;
+         tag = (struct multiboot_tag *) ((uint8_t *)tag + ((tag->size + 7) & ~7))) 
+    {
+        if (tag->type == 8) { // Tag 8 = Framebuffer
+            struct multiboot_tag_framebuffer *tagfb = (struct multiboot_tag_framebuffer *)tag;
+            fb_info = { 
+                (uint32_t*)(uintptr_t)tagfb->framebuffer_addr, 
+                tagfb->framebuffer_width, 
+                tagfb->framebuffer_height, 
+                tagfb->framebuffer_pitch 
+            };
+        }
+    }
+
+    // Alloc backbuffer
     backbuffer = new uint32_t[fb_info.width * fb_info.height];
     
     g_gfx.init(false);
