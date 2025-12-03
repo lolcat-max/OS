@@ -3057,38 +3057,6 @@ char get_char() {
     }
 }
 
-// CORRECTED: read_line with timeout and proper handling
-static void read_line(char* buffer, int max_len) {
-    int i = 0;
-    int timeout_count = 0;
-    const int TIMEOUT_THRESHOLD = 100000; // Prevent infinite wait
-
-    while (i < max_len - 1 && timeout_count < TIMEOUT_THRESHOLD) {
-        char c = get_char();
-
-        if (c == 0) {
-            // No character available, continue waiting
-            timeout_count++;
-            continue;
-        }
-
-        timeout_count = 0; // Reset timeout on character received
-
-        if (c == '\n' || c == '\r') {
-            break;
-        }
-        if (c == '\b') {
-            if (i > 0) {
-                i--;
-            }
-        } else if (c >= 32 && c <= 126) {
-            buffer[i++] = c;
-        }
-    }
-
-    buffer[i] = 0;
-    vga_print_char('\n');
-}
 
 // ============================================================
 // Integer Conversion Functions
@@ -3916,33 +3884,41 @@ struct TCompiler {
             return;
         }
         if (tk.t==TT_KW && simple_strcmp(tk.v,"cin")==0) {
-            adv();
-            for (;;) {
-                expect(">>");
-                if (tk.t != TT_ID) {
-                    printf("cin expects identifier\n");
-                    return;
-                }
-                int idx = pr.get_local(tk.v);
-                int ty  = pr.get_local_type(idx);
-                adv(); // past identifier
+			adv();
+			for (;;) {
+				expect(">>");
+				if (tk.t != TT_ID) {
+					printf("cin expects identifier\n");
+					return;
+				}
+				int idx = pr.get_local(tk.v);
+				int ty  = pr.get_local_type(idx);
+				adv(); // past identifier
 
-                // Read into scalar variable based on its type
-                if (ty == 2)      pr.emit1(T_READ_STR);   // string
-                else if (ty == 1) pr.emit1(T_READ_CHAR);  // char
-                else              pr.emit1(T_READ_INT);   // int (default)
+				// CRITICAL FIX: Emit the variable index with the READ instruction
+				// so the VM knows WHERE to store the result
+				if (ty == 2) {
+					pr.emit1(T_READ_STR);
+					pr.emit4(idx);  // Index to store into
+				}
+				else if (ty == 1) {
+					pr.emit1(T_READ_CHAR);
+					pr.emit4(idx);
+				}
+				else {
+					pr.emit1(T_READ_INT);
+					pr.emit4(idx);
+				}
 
-                pr.emit1(T_STORE_LOCAL);
-                pr.emit4(idx);
+				// DO NOT emit T_STORE_LOCAL - the READ instruction handles storage
 
-                // End the chain only at a semicolon; otherwise continue parsing >>
-                if (tk.t == TT_PUNC && tk.v[0] == ';') {
-                    adv();
-                    break;
-                }
-            }
-            return;
-        }
+				if (tk.t == TT_PUNC && tk.v[0] == ';') {
+					adv();
+					break;
+				}
+			}
+			return;
+		}
 
         if(tk.t==TT_ID){
             int idx = pr.get_local(tk.v);
@@ -4056,6 +4032,7 @@ struct TinyVM {
     char str_in[256];
     uint64_t ahci_base; int port; // for file I/O
     int bound_window_idx = -1; 
+	int pending_store_idx = 0;  // Where to store READ result
 
     // --- EXECUTION STATE FOR PARTIAL COMPUTING ---
     int ip = 0;             // Instruction Pointer (Persistent)
@@ -4176,38 +4153,48 @@ struct TinyVM {
 
 	void vm_putc(char c) {
 		if (bound_window) {
-			char tmp[2] = {c, 0};
-			bound_window->console_print(tmp);  // Route to window!
+			// Use put_char directly, which adds to current line without wrapping
+			bound_window->put_char(c);
 		} else {
-			printf("%c", c);  // Fallback if no window
+			printf("%c", c);  // Fallback
 		}
 	}
 
     void feed_input(char c) {
-        if (!waiting_for_input) return;
-        if (c == '\n' || c == '\r') {
-            input_buffer[input_pos] = 0;
-            vm_putc('\n');
-            if (input_mode == 1) push(simple_atoi(input_buffer));
-            else if (input_mode == 2) push((unsigned char)input_buffer[0]);
-            else if (input_mode == 3) {
-                simple_strcpy(str_in, input_buffer);
-                push((int)str_in);
-            }
-            waiting_for_input = false;
-            input_pos = 0;
-            input_mode = 0;
-        } else if (c == '\b') {
-            if (input_pos > 0) {
-                input_pos--;
-                input_buffer[input_pos] = 0;
-                vm_putc('\b');
-            }
-        } else if (c >= 32 && c <= 126 && input_pos < 255) {
-            input_buffer[input_pos++] = c;
-            vm_putc(c);
-        }
-    }
+		if (!waiting_for_input) return;
+		
+		if (c == '\n' || c == '\r') {
+			input_buffer[input_pos] = 0;
+			vm_putc('\n');
+			
+			if (input_mode == 1) {
+				locals[pending_store_idx] = simple_atoi(input_buffer);
+			}
+			else if (input_mode == 2) {
+				locals[pending_store_idx] = (unsigned char)input_buffer[0];
+			}
+			else if (input_mode == 3) {
+				simple_strcpy(str_in, input_buffer);
+				locals[pending_store_idx] = (int)str_in;
+			}
+			
+			waiting_for_input = false;
+			input_pos = 0;
+			input_mode = 0;
+			pending_store_idx = 0;
+			
+		} else if (c == '\b') {
+			if (input_pos > 0) {
+				input_pos--;
+				input_buffer[input_pos] = 0;
+				vm_putc('\b');
+			}
+		} else if (c >= 32 && c <= 126 && input_pos < 255) {
+			input_buffer[input_pos++] = c;
+			vm_putc(c);
+		}
+	}
+
 
 
     // --- NEW: TICK FUNCTION (Runs 'steps' instructions) ---
@@ -4245,31 +4232,72 @@ struct TinyVM {
                 case T_JMP: { int t=*(int*)&P->code[ip]; ip=t; } break;
                 case T_JZ:  { int t=*(int*)&P->code[ip]; ip+=4; int v=pop(); if(v==0) ip=t; } break;
                 case T_JNZ: { int t=*(int*)&P->code[ip]; ip+=4; int v=pop(); if(v!=0) ip=t; } break;
-                case T_PRINT_INT: { int v=pop(); char b[16]; int_to_string(v,b); printf("%s", b); } break;
-                case T_PRINT_CHAR:{ int v=pop(); char b[2]; b[0]=(char)(v&0xff); b[1]=0; printf("%s", b); } break;
-                case T_PRINT_STR: { const char* p=(const char*)pop(); if(p) printf("%s", p); } break;
-                case T_PRINT_ENDL:{ printf("\n"); } break;
-                 // --- MODIFIED READ OPERATIONS ---
-                case T_READ_INT: {
-                    waiting_for_input = true;
-                    input_mode = 1;
-                    input_pos = 0;
-                    return 1; // Yield immediately
-                } break;
+                case T_PRINT_INT: {
+					int v = pop();
+					char buf[16];
+					int_to_string(v, buf);
+					printf("%s", buf);
+				} break;
 
-                case T_READ_CHAR: {
-                    waiting_for_input = true;
-                    input_mode = 2;
-                    input_pos = 0;
-                    return 1;
-                } break;
+				case T_PRINT_CHAR: {
+					int v = pop();
+					char buf[2] = { (char)(v & 0xFF), 0 };
+					printf("%s", buf);
+				} break;
 
-                case T_READ_STR: {
-                    waiting_for_input = true;
-                    input_mode = 3;
-                    input_pos = 0;
-                    return 1;
-                } break;
+				case T_PRINT_STR: {
+					const char* p = (const char*)pop();
+					if (p) printf("%s", p);
+				} break;
+
+				case T_PRINT_ENDL: {
+					printf("\n");
+				} break;
+
+				case T_PRINT_INT_ARRAY: {
+					int handle = pop();
+					Array* arr = get_array(handle);
+					if (arr) {
+						for (int i = 0; i < arr->size; i++) {
+							char buf[16];
+							int_to_string(arr->data[i], buf);
+							printf("%s", buf);
+							if (i < arr->size - 1) printf(", ");
+						}
+					}
+				} break;
+
+				case T_PRINT_STRING_ARRAY: {
+					int handle = pop();
+					// Handle string array printing
+				} break;
+
+				case T_READ_INT: {
+					int idx = *(int*)&P->code[ip]; ip+=4;  // READ the variable index
+					waiting_for_input = true;
+					input_mode = 1;
+					input_pos = 0;
+					pending_store_idx = idx;  // Store where to write the result
+					return 1;
+				} break;
+
+				case T_READ_CHAR: {
+					int idx = *(int*)&P->code[ip]; ip+=4;
+					waiting_for_input = true;
+					input_mode = 2;
+					input_pos = 0;
+					pending_store_idx = idx;
+					return 1;
+				} break;
+
+				case T_READ_STR: {
+					int idx = *(int*)&P->code[ip]; ip+=4;
+					waiting_for_input = true;
+					input_mode = 3;
+					input_pos = 0;
+					pending_store_idx = idx;
+					return 1;
+				} break;
                 // CRITICAL CHANGE: RETURN HANDLING
                 case T_RET: { 
                     int rv=pop(); 
@@ -5614,21 +5642,28 @@ static void start_exec_execution(int slot, int argc, const char* argv[], Window*
     
     ctx->active = true;
 }
-
-
-// Tick run processes (called from main loop)
 void tick_run_processes(int steps_per_process) {
     for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
         if (run_contexts[i].active) {
+            // Check FIRST if waiting for input - don't call tick yet
+            if (run_contexts[i].vm.waiting_for_input) {
+                continue;  // Skip this process, it's paused waiting
+            }
+            
             int still_running = run_contexts[i].vm.tick(steps_per_process);
-            if (!still_running) {
+            
+            // Only deactivate if process is truly done (not waiting)
+            if (!still_running && !run_contexts[i].vm.waiting_for_input) {
                 run_contexts[i].active = false;
-                // Optionally report exit code
-                printf("RUN process %d exited with code: %d\n", i, run_contexts[i].vm.exit_code);
+                char msg[128];
+                snprintf(msg, 128, "RUN process exited with code: %d\n", 
+                        run_contexts[i].vm.exit_code);
+                wm.print_to_focused(msg);
             }
         }
     }
 }
+
 
 // Feed input to run process
 void feed_run_input(int slot, char c) {
@@ -5680,17 +5715,23 @@ static int compile_to_exec_context(int slot, const char* code_text) {
     
     return 0;
 }
-
-// Tick exec processes (called from main loop)
 void tick_exec_processes(int steps_per_process) {
     for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
         if (exec_contexts[i].active) {
+            // Check FIRST if waiting for input
+            if (exec_contexts[i].vm.waiting_for_input) {
+                continue;  // Skip, paused waiting
+            }
+            
             int still_running = exec_contexts[i].vm.tick(steps_per_process);
-            if (!still_running) {
+            
+            // Only deactivate if truly done AND not waiting
+            if (!still_running && !exec_contexts[i].vm.waiting_for_input) {
                 exec_contexts[i].active = false;
-                // Optionally report exit code
-                // printf("EXEC process %d (id=%d) exited with code: %d\n", 
-                //        i, exec_contexts[i].exec_id, exec_contexts[i].vm.exitcode);
+                char msg[128];
+                snprintf(msg, 128, "EXEC process exited with code: %d\n", 
+                        exec_contexts[i].vm.exit_code);
+                wm.print_to_focused(msg);
             }
         }
     }
@@ -5975,32 +6016,37 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             bool leftClickedThisFrame = mouse_left_down && !mouse_left_last_frame;
             bool rightClickedThisFrame = mouse_right_down && !mouse_right_last_frame;
 
-            if (key_pressed) {
-				int focused_idx = wm.get_focused_idx();
-				Window* focused_win = wm.get_window(focused_idx);
+            // In kernel_main, replace the VM input feeding section:
 
-				bool input_consumed = false;
-				for (int i = 0; i < MAX_PROCESSES; ++i) {
-					if (processes[i].is_running &&
-						processes[i].waiting_for_input &&
-						processes[i].bound_window == focused_win)   // pointer compare
-					{
-						handle_vm_input(last_key_press);
-						input_consumed = true;
-						break;
+			if (last_key_press != 0) {
+				bool fed_to_any_vm = false;
+				
+				// Feed input to ALL waiting RUN processes
+				for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+					if (run_contexts[i].active && run_contexts[i].vm.waiting_for_input) {
+						run_contexts[i].vm.feed_input(last_key_press);
+						fed_to_any_vm = true;
+						// DON'T break - feed to all waiting VMs
 					}
 				}
-
-				if (!input_consumed) {
-					wm.handle_input(last_key_press, mouse_x, mouse_y,
-									mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
+				
+				// Feed input to ALL waiting EXEC processes
+				for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+					if (exec_contexts[i].active && exec_contexts[i].vm.waiting_for_input) {
+						exec_contexts[i].vm.feed_input(last_key_press);
+						fed_to_any_vm = true;
+						// DON'T break - feed to all waiting VMs
+					}
 				}
-				last_key_press = 0;
+				
+				// If input wasn't consumed by any VM, route to window manager
+				if (!fed_to_any_vm) {
+					wm.handle_input(last_key_press, mouse_x, mouse_y, mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
+				}
+				
+				last_key_press = 0; // Clear the key
 			}
-			 else {
-                // Mouse events always go to WM
-                wm.handle_input(0, mouse_x, mouse_y, mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
-            }
+
             g_evt_dirty = true;
         }
 
