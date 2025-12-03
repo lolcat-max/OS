@@ -1,68 +1,60 @@
-# boot.S - Multiboot 2 Entry Point
+# Declare constants for the Multiboot 1 header.
+.set ALIGN,    1<<0             # align loaded modules on page boundaries
+.set MEMINFO,  1<<1             # provide memory map
+.set GFX,      1<<2             # request graphics mode
+.set FLAGS,    ALIGN | MEMINFO | GFX
+.set MAGIC,    0x1BADB002       # 'magic number' lets bootloader find the header
+.set CHECKSUM, -(MAGIC + FLAGS) # checksum of above
 
-# Constants for Multiboot 2
-.set MB2_MAGIC, 0xE85250D6
-.set MB2_ARCH, 0            # 0 = i386 protected mode
-.set MB2_LEN, (header_end - header_start)
-.set MB2_CHECKSUM, -(MB2_MAGIC + MB2_ARCH + MB2_LEN)
-
+# Declare a multiboot header that marks the program as a kernel.
 .section .multiboot
-.align 8
-header_start:
-    .long MB2_MAGIC
-    .long MB2_ARCH
-    .long MB2_LEN
-    .long MB2_CHECKSUM
+.align 4
+.long MAGIC
+.long FLAGS
+.long CHECKSUM
 
-    # Tag: Information Request (Explicitly ask for Framebuffer info)
-    .align 8
-    .short 1      # Type: Information Request
-    .short 0      # Flags
-    .long  12     # Size
-    .long  8      # Request: Framebuffer Tag
-    
-    # Tag: Framebuffer Request
-    .align 8
-    .short 5      # Type: Framebuffer
-    .short 1      # Flags
-    .long  20     # Size
-    .long  1024   # Width
-    .long  768    # Height
-    .long  32     # Depth
+# These fields are required by the Multiboot 1 graphics specification.
+.long 0  # header_addr (optional)
+.long 0  # load_addr (optional)
+.long 0  # load_end_addr (optional)
+.long 0  # bss_end_addr (optional)
+.long _start # entry_addr (optional, but good practice)
 
-    # Tag: End
-    .align 8
-    .short 0
-    .short 0
-    .long  8
-header_end:
+.long 0  # mode_type: 0 for linear framebuffer graphics
+.long 1024 # width
+.long 768  # height
+.long 32   # depth
 
-# Kernel Entry Point
+# Reserve space for a temporary stack.
 .section .bootstrap_stack, "aw", @nobits
-.align 16
 stack_bottom:
-.skip 16384
+.skip 16384 # 16 KiB stack
 stack_top:
 
+# The kernel's entry point.
 .section .text
 .global _start
 .type _start, @function
 _start:
-    cli
-    movl $stack_top, %esp
+	# Disable interrupts initially.
+	cli
 
-    # Multiboot 2 passes:
-    # EAX = Magic (0x36d76289)
-    # EBX = Address of Multiboot Information Structure
-    
-    # Push arguments for kernel_main(magic, addr)
-    pushl %ebx
-    pushl %eax
-    
-    call kernel_main
+	# Set up the stack pointer.
+	movl $stack_top, %esp
 
+	# The bootloader places the magic number in EAX and a pointer to the 
+	# Multiboot info structure in EBX. We pass them as arguments to kernel_main.
+	# Arguments are pushed in reverse order (right to left).
+	pushl %ebx # Push multiboot_addr
+	pushl %eax # Push magic
+
+	# Call the C++ part of our kernel.
+	call kernel_main
+
+	# If kernel_main returns, halt the system.
 .Lhang:
-    hlt
-    jmp .Lhang
+	hlt
+	jmp .Lhang
 
 .size _start, . - _start
+
