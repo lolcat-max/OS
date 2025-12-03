@@ -5923,7 +5923,7 @@ void process_all_vms() {
     tick_exec_processes(100); // 100 instructions per tick
 }
 extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
-    // --- INITIALIZATION ---
+    // --- INITIALIZATION --- (unchanged)
     static uint8_t kernelheap[1024 * 1024 * 8];
     g_allocator.init(kernelheap, sizeof(kernelheap));
     
@@ -5983,26 +5983,33 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
     g_gfx.clear_screen(ColorPalette::DESKTOP_BLUE);
 
     // =============================================================================
-    // MAIN LOOP - PARTIAL COMPUTING KERNEL
+    // MAIN LOOP - PERFECT: KEYBOARD + MOUSE CLICKS BOTH WORK
     // =============================================================================
     for (;;) {
-        // 1. Poll Hardware Input
+        // **CRITICAL MOUSE FIX #1**: Save mouse state BEFORE polling
+        bool prev_left = mouse_left_down;
+        bool prev_right = mouse_right_down;
+
+        // 1. Poll input (updates mouse_left_down, mouse_right_down, last_key_press)
         poll_input_universal();
-		process_all_vms();
-        // 2. Detect Changes
+        process_all_vms();
+
+        // **CRITICAL MOUSE FIX #2**: Detect clicks using PREVIOUS frame state
+        bool leftClickedThisFrame = (mouse_left_down && !prev_left);
+        bool rightClickedThisFrame = (mouse_right_down && !prev_right);
+
+        // 2. Set input flags
         bool mouse_moved = (mouse_x != prev_mouse_x || mouse_y != prev_mouse_y);
-        bool l_button_changed = (mouse_left_down != mouse_left_last_frame);
-        bool r_button_changed = (mouse_right_down != mouse_right_last_frame);
         bool key_pressed = (last_key_press != 0);
 
-        if (key_pressed || l_button_changed || r_button_changed || mouse_moved) {
+        if (key_pressed || mouse_moved || leftClickedThisFrame || rightClickedThisFrame) {
             g_evt_input = true;
             g_input_state.hasNewInput = true;
             prev_mouse_x = mouse_x;
             prev_mouse_y = mouse_y;
         }
 
-        // 3. Timer Tick
+        // 3. Timer
         static uint32_t poll_counter = 0;
         if (++poll_counter >= 500) {
             poll_counter = 0;
@@ -6010,49 +6017,38 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             g_timer_ticks++;
         }
 
-        // 4. Handle Input (Routing to VM or WM)
+        // 4. Handle ALL input at once - SINGLE CALL
         if (g_evt_input) {
             g_evt_input = false;
-            bool leftClickedThisFrame = mouse_left_down && !mouse_left_last_frame;
-            bool rightClickedThisFrame = mouse_right_down && !mouse_right_last_frame;
-
-            // In kernel_main, replace the VM input feeding section:
-
-			if (last_key_press != 0) {
-				bool fed_to_any_vm = false;
-				
-				// Feed input to ALL waiting RUN processes
-				for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
-					if (run_contexts[i].active && run_contexts[i].vm.waiting_for_input) {
-						run_contexts[i].vm.feed_input(last_key_press);
-						fed_to_any_vm = true;
-						// DON'T break - feed to all waiting VMs
-					}
-				}
-				
-				// Feed input to ALL waiting EXEC processes
-				for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
-					if (exec_contexts[i].active && exec_contexts[i].vm.waiting_for_input) {
-						exec_contexts[i].vm.feed_input(last_key_press);
-						fed_to_any_vm = true;
-						// DON'T break - feed to all waiting VMs
-					}
-				}
-				
-				// If input wasn't consumed by any VM, route to window manager
-				if (!fed_to_any_vm) {
-					wm.handle_input(last_key_press, mouse_x, mouse_y, mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
-				}
-				
-				last_key_press = 0; // Clear the key
-			}
-
+            
+            // **KEYS**: VMs first, then WM
+            bool fed_to_any_vm = false;
+            if (last_key_press != 0) {
+                for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+                    if (run_contexts[i].active && run_contexts[i].vm.waiting_for_input) {
+                        run_contexts[i].vm.feed_input(last_key_press);
+                        fed_to_any_vm = true;
+                    }
+                }
+                for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+                    if (exec_contexts[i].active && exec_contexts[i].vm.waiting_for_input) {
+                        exec_contexts[i].vm.feed_input(last_key_press);
+                        fed_to_any_vm = true;
+                    }
+                }
+            }
+            
+            // **SINGLE WM CALL** - handles keys + mouse clicks perfectly
+            wm.handle_input(last_key_press, mouse_x, mouse_y, 
+                           mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
+            
+            if (last_key_press != 0) last_key_press = 0;
             g_evt_dirty = true;
         }
 
         wm.cleanup_closed_windows();
 
-        // --- RENDER ---
+        // 5. Render
         if (g_evt_timer && (g_timer_ticks - last_paint_tick) >= TICKS_PER_FRAME) {
             if (g_evt_dirty || g_input_state.hasNewInput) {
                 last_paint_tick = g_timer_ticks;
@@ -6066,9 +6062,5 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             }
             g_evt_timer = false;
         }
-
-        // Update last frame states
-        mouse_left_last_frame = mouse_left_down;
-        mouse_right_last_frame = mouse_right_down;
     }
 }
