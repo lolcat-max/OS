@@ -24,7 +24,7 @@ header_start:
     # Tag: Framebuffer Request
     .align 8
     .short 5      # Type: Framebuffer
-    .short 0      # Flags
+    .short 1      # Flags
     .long  20     # Size
     .long  1024   # Width
     .long  768    # Height
