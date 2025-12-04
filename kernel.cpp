@@ -5154,70 +5154,154 @@ public:
     }
 
     void on_key_press(char c) override {
-        if (in_editor) {
-            if (!edit_lines || edit_current_line >= edit_line_count) return;
+    if (in_editor) {
+        if (!edit_lines || edit_current_line >= edit_line_count) return;
 
-            char* current_line_ptr = edit_lines[edit_current_line];
-            size_t current_len = strlen(current_line_ptr);
+        char* current_line_ptr = edit_lines[edit_current_line];
+        size_t current_len = strlen(current_line_ptr);
 
-            if (c == 17 || c == 27) { // Ctrl+Q or ESC to save and exit
-                int total_len = 0;
-                for (int i = 0; i < edit_line_count; i++) {
-                    total_len += strlen(edit_lines[i]) + 1;
-                }
-                char* file_content = new char[total_len + 1];
-                if (!file_content) return;
-                file_content[0] = '\0';
-                for (int i = 0; i < edit_line_count; i++) {
-                    strcat(file_content, edit_lines[i]);
-                    if (i < edit_line_count - 1) {
-                       strcat(file_content, "\n");
-                    }
-                }
-                fat32_write_file(edit_filename, file_content, strlen(file_content));
-                delete[] file_content;
-                in_editor = false;
-                console_print("File saved.\n");
-                return;
-            } else if (c == KEY_UP) {
-                if (edit_current_line > 0) edit_current_line--;
-            } else if (c == KEY_DOWN) {
-                if (edit_current_line < edit_line_count - 1) edit_current_line++;
-            } else if (c == KEY_LEFT) {
-                if (edit_cursor_col > 0) edit_cursor_col--;
-            } else if (c == KEY_RIGHT) {
-                if (edit_cursor_col < current_len) edit_cursor_col++;
-            } else if (c == '\n') { // Enter key
-                const char* right_part_text = &current_line_ptr[edit_cursor_col];
-                editor_insert_line_at(edit_current_line + 1, right_part_text);
-                current_line_ptr[edit_cursor_col] = '\0';
-                edit_current_line++;
-                edit_cursor_col = 0;
-            } else if (c == '\b') { // Backspace
-                if (edit_cursor_col > 0) {
-                    memmove(&current_line_ptr[edit_cursor_col - 1], &current_line_ptr[edit_cursor_col], current_len - edit_cursor_col + 1);
-                    edit_cursor_col--;
-                } else if (edit_current_line > 0) {
-                    int prev_line_idx = edit_current_line - 1;
-                    char* prev_line_ptr = edit_lines[prev_line_idx];
-                    int prev_len = strlen(prev_line_ptr);
-                    if (prev_len + current_len < TERM_WIDTH - 1) {
-                        strcat(prev_line_ptr, current_line_ptr);
-                        editor_delete_line_at(edit_current_line);
-                        edit_current_line = prev_line_idx;
-                        edit_cursor_col = prev_len;
-                    }
-                }
-            } else if (c >= 32 && c < 127) { // Printable characters
-                if (current_len < TERM_WIDTH - 2) {
-                    memmove(&current_line_ptr[edit_cursor_col + 1], &current_line_ptr[edit_cursor_col], current_len - edit_cursor_col + 1);
-                    current_line_ptr[edit_cursor_col] = c;
-                    edit_cursor_col++;
+        if (c == 17 || c == 27) { // Ctrl+Q or ESC to save and exit
+            int total_len = 0;
+            for (int i = 0; i < edit_line_count; i++) {
+                total_len += strlen(edit_lines[i]) + 1;
+            }
+            char* file_content = new char[total_len + 1];
+            if (!file_content) return;
+            file_content[0] = '\0';
+            for (int i = 0; i < edit_line_count; i++) {
+                strcat(file_content, edit_lines[i]);
+                if (i < edit_line_count - 1) {
+                   strcat(file_content, "\n");
                 }
             }
-            editor_clamp_cursor_to_line();
-            editor_ensure_cursor_visible();
-        } else {
+            fat32_write_file(edit_filename, file_content, strlen(file_content));
+            delete[] file_content;
+            in_editor = false;
+            console_print("File saved.\n");
+            return;
+        } 
+        else if (c == KEY_UP) {
+            if (edit_current_line > 0) edit_current_line--;
+        } 
+        else if (c == KEY_DOWN) {
+            if (edit_current_line < edit_line_count - 1) edit_current_line++;
+        } 
+        else if (c == KEY_LEFT) {
+            if (edit_cursor_col > 0) edit_cursor_col--;
+        } 
+        else if (c == KEY_RIGHT) {
+            if (edit_cursor_col < (int)current_len) edit_cursor_col++;
+        } 
+        else if (c == KEY_HOME) {
+            edit_cursor_col = 0;
+        }
+        else if (c == KEY_END) {
+            edit_cursor_col = current_len;
+        }
+        else if (c == KEY_DELETE) {
+            if (edit_cursor_col < (int)current_len) {
+                memmove(&current_line_ptr[edit_cursor_col], 
+                       &current_line_ptr[edit_cursor_col + 1], 
+                       current_len - edit_cursor_col);
+            } else if (edit_current_line < edit_line_count - 1) {
+                // Delete at end of line - join with next line
+                char* next_line_ptr = edit_lines[edit_current_line + 1];
+                if (current_len + strlen(next_line_ptr) < TERM_WIDTH - 1) {
+                    strcat(current_line_ptr, next_line_ptr);
+                    editor_delete_line_at(edit_current_line + 1);
+                }
+            }
+        }
+        else if (c == '\n') { // Enter key
+            const char* right_part_text = &current_line_ptr[edit_cursor_col];
+            editor_insert_line_at(edit_current_line + 1, right_part_text);
+            current_line_ptr[edit_cursor_col] = '\0';
+            edit_current_line++;
+            edit_cursor_col = 0;
+        } 
+        else if (c == '\b') { // Backspace
+            if (edit_cursor_col > 0) {
+                memmove(&current_line_ptr[edit_cursor_col - 1], 
+                       &current_line_ptr[edit_cursor_col], 
+                       current_len - edit_cursor_col + 1);
+                edit_cursor_col--;
+            } else if (edit_current_line > 0) {
+                int prev_line_idx = edit_current_line - 1;
+                char* prev_line_ptr = edit_lines[prev_line_idx];
+                int prev_len = strlen(prev_line_ptr);
+                if (prev_len + current_len < TERM_WIDTH - 1) {
+                    strcat(prev_line_ptr, current_line_ptr);
+                    editor_delete_line_at(edit_current_line);
+                    edit_current_line = prev_line_idx;
+                    edit_cursor_col = prev_len;
+                }
+            }
+        } 
+        else if (c >= 32 && c < 127) { // Printable characters
+            // **WORD WRAP IMPLEMENTATION**
+            const int MAX_LINE_WIDTH = 75; // Characters before wrap
+            
+            if (current_len < TERM_WIDTH - 2) {
+                // Insert character
+                memmove(&current_line_ptr[edit_cursor_col + 1], 
+                       &current_line_ptr[edit_cursor_col], 
+                       current_len - edit_cursor_col + 1);
+                current_line_ptr[edit_cursor_col] = c;
+                edit_cursor_col++;
+                
+                // Check if line is too long and needs wrapping
+                int new_len = strlen(current_line_ptr);
+                if (new_len > MAX_LINE_WIDTH) {
+                    // Find last space to wrap at
+                    int wrap_pos = MAX_LINE_WIDTH;
+                    bool found_space = false;
+                    
+                    for (int i = MAX_LINE_WIDTH; i > MAX_LINE_WIDTH - 20 && i > 0; i--) {
+                        if (current_line_ptr[i] == ' ') {
+                            wrap_pos = i;
+                            found_space = true;
+                            break;
+                        }
+                    }
+                    
+                    // If no space found near margin, force wrap at max width
+                    if (!found_space) {
+                        wrap_pos = MAX_LINE_WIDTH;
+                    }
+                    
+                    // Create wrapped text for next line
+                    char wrapped_text[TERM_WIDTH];
+                    memset(wrapped_text, 0, TERM_WIDTH);
+                    strcpy(wrapped_text, &current_line_ptr[wrap_pos]);
+                    
+                    // Trim leading space from wrapped text
+                    char* trimmed = wrapped_text;
+                    while (*trimmed == ' ') trimmed++;
+                    
+                    // Truncate current line at wrap point
+                    current_line_ptr[wrap_pos] = '\0';
+                    
+                    // Insert wrapped text as new line
+                    editor_insert_line_at(edit_current_line + 1, trimmed);
+                    
+                    // Move cursor to next line if it was past wrap point
+                    if (edit_cursor_col > wrap_pos) {
+                        edit_current_line++;
+                        edit_cursor_col = edit_cursor_col - wrap_pos;
+                        // Account for trimmed spaces
+                        while (edit_cursor_col > 0 && wrapped_text[0] == ' ') {
+                            edit_cursor_col--;
+                        }
+                        if (edit_cursor_col < 0) edit_cursor_col = 0;
+                    }
+                }
+            }
+        }
+        
+        editor_clamp_cursor_to_line();
+        editor_ensure_cursor_visible();
+        return; // END OF EDITOR HANDLING
+    } else {
             if (c == '\n' && run_contexts[wm.get_focused_idx()].active) {
                 prompt_visual_lines = 0;
                 line_pos = 0;
@@ -6024,34 +6108,54 @@ extern "C" void kernel_main(uint32_t magic, uint32_t multiboot_addr) {
             g_timer_ticks++;
         }
 
-        // 4. Handle ALL input at once - SINGLE CALL
-        if (g_evt_input) {
-            g_evt_input = false;
-            
-            // **KEYS**: VMs first, then WM
-            bool fed_to_any_vm = false;
-            if (last_key_press != 0) {
-                for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
-                    if (run_contexts[i].active && run_contexts[i].vm.waiting_for_input) {
-                        run_contexts[i].vm.feed_input(last_key_press);
-                        fed_to_any_vm = true;
-                    }
-                }
-                for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
-                    if (exec_contexts[i].active && exec_contexts[i].vm.waiting_for_input) {
-                        exec_contexts[i].vm.feed_input(last_key_press);
-                        fed_to_any_vm = true;
-                    }
-                }
-            }
-            
-            // **SINGLE WM CALL** - handles keys + mouse clicks perfectly
-            wm.handle_input(last_key_press, mouse_x, mouse_y, 
-                           mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
-            
-            if (last_key_press != 0) last_key_press = 0;
-            g_evt_dirty = true;
-        }
+        // 4. Handle input with proper isolation
+		if (g_evt_input) {
+			g_evt_input = false;
+			
+			// **CRITICAL FIX**: Only feed to VMs if they're ACTIVELY waiting
+			// AND the focused window is the one that started the VM
+			bool fed_to_vm = false;
+			
+			if (last_key_press != 0) {
+				// Check RUN processes - only feed if they're waiting AND bound to focused window
+				for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+					if (run_contexts[i].active && 
+						run_contexts[i].vm.waiting_for_input &&
+						run_contexts[i].vm.bound_window == wm.get_window(wm.get_focused_idx())) {
+						run_contexts[i].vm.feed_input(last_key_press);
+						fed_to_vm = true;
+						break; // Only feed to ONE VM
+					}
+				}
+				
+				// Check EXEC processes - only if no RUN process consumed it
+				if (!fed_to_vm) {
+					for (int i = 0; i < MAX_EXEC_PROCESSES; i++) {
+						if (exec_contexts[i].active && 
+							exec_contexts[i].vm.waiting_for_input &&
+							exec_contexts[i].vm.bound_window == wm.get_window(wm.get_focused_idx())) {
+							exec_contexts[i].vm.feed_input(last_key_press);
+							fed_to_vm = true;
+							break; // Only feed to ONE VM
+						}
+					}
+				}
+			}
+			
+			// **KEY FIX**: Only send to WM if VM didn't consume it
+			// This allows terminal commands while no VM is waiting
+			if (!fed_to_vm) {
+				wm.handle_input(last_key_press, mouse_x, mouse_y, 
+							   mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
+			} else {
+				// VM consumed keyboard, but still process mouse for WM
+				wm.handle_input(0, mouse_x, mouse_y, 
+							   mouse_left_down, leftClickedThisFrame, rightClickedThisFrame);
+			}
+			
+			if (last_key_press != 0) last_key_press = 0;
+			g_evt_dirty = true;
+		}
 
         wm.cleanup_closed_windows();
 
