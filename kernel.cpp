@@ -4587,7 +4587,15 @@ void kill_exec_process(int slot) {
 	
 
 	
-	
+bool run_process_waiting_for_input() {
+    for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
+        if (run_contexts[i].active && run_contexts[i].vm.waiting_for_input) {
+            return true;
+        }
+    }
+    return false;
+}
+		
 	
 // =============================================================================
 // TERMINAL WINDOW IMPLEMENTATION
@@ -5210,13 +5218,20 @@ public:
             editor_clamp_cursor_to_line();
             editor_ensure_cursor_visible();
         } else {
-            if (c == '\n') {
+            if (c == '\n' && run_contexts[wm.get_focused_idx()].active) {
+                prompt_visual_lines = 0;
+                line_pos = 0;
+                current_line[0] = '\0';
+                update_prompt_display();
+            } else if (c == '\n' && !run_contexts[wm.get_focused_idx()].active) {
                 prompt_visual_lines = 0;
                 handle_command();
                 line_pos = 0;
                 current_line[0] = '\0';
                 update_prompt_display();
-            } else if (c == '\b') {
+            }
+			
+			else if (c == '\b') {
                 if (line_pos > 0) {
                     line_pos--;
                     current_line[line_pos] = 0;
@@ -5673,14 +5688,6 @@ void feed_run_input(int slot, char c) {
 }
 
 // Check if any run process is waiting for input
-bool run_process_waiting_for_input() {
-    for (int i = 0; i < MAX_RUN_PROCESSES; i++) {
-        if (run_contexts[i].active && run_contexts[i].vm.waiting_for_input) {
-            return true;
-        }
-    }
-    return false;
-}
 
 // =============================================================================
 // SECTION 4: EXEC SUBSYSTEM (Memory-Based Execution)
