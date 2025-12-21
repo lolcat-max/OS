@@ -1,25 +1,28 @@
 .POSIX:
 
-ISODIR := iso
-MULTIBOOT := $(ISODIR)/boot/main.elf
-MAIN := main.iso
-CXXFLAGS = -ffreestanding -O2 -Wall -Wextra -std=c++17 -fno-exceptions -fno-rtti -Iinclude
-.PHONY: clean run
+TARGET = gtk_app.iso
+APP = gtk_app
 
-$(MAIN):
-	as -32 boot.S -o boot.o
+CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Iinclude
 
-	gcc -c kernel.cpp -ffreestanding -m32 -o kernel.o 
+.PHONY: all clean run iso
 
-	gcc -ffreestanding -m32 -nostdlib -o '$(MULTIBOOT)' -T linker.ld boot.o kernel.o -lgcc
+all: $(APP)
 
-	grub-mkrescue -o '$@' '$(ISODIR)'
+$(APP): gtk_app.cpp
+	$(CXX) $(CXXFLAGS) -o $(APP) gtk_app.cpp $(shell pkg-config --cflags --libs gtk+-3.0)
 
 clean:
-	rm -f *.o '$(MULTIBOOT)' '$(MAIN)'
+	rm -f $(APP) $(TARGET)
 
-run: $(MAIN)
-	qemu-system-i386 -cdrom '$(MAIN)'
-	# Would also work.
-	#qemu-system-i386 -hda '$(MAIN)'
-	#qemu-system-i386 -kernel '$(MULTIBOOT)'
+run: $(TARGET)
+	qemu-system-x86_64 -cdrom $(TARGET)
+
+iso: $(APP)
+	mkdir -p iso_root/boot/grub
+	cp $(APP) iso_root/
+	cp /boot/vmlinuz iso_root/boot/
+	cp /boot/initrd.img iso_root/boot/
+	echo 'set timeout=0\nset default=0\n\nmenuentry "GTK App" {\n  linux /boot/vmlinuz root=/dev/sr0\n  initrd /boot/initrd.img\n}' > iso_root/boot/grub/grub.cfg
+	genisoimage -o $(TARGET) -b boot/grub/eltorito.img -no-emul-boot -boot-load-size 4 -boot-info-table iso_root/
+	rm -rf iso_root
