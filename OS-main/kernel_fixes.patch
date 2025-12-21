@@ -1,0 +1,114 @@
+--- blk-iocost.c.orig
++++ blk-iocost.c
+@@ -3032,7 +3032,7 @@
+ 	struct ioc_gq *iocg = pd_to_iocg(pd);
+ 
+ 	if (dname && iocg->cfg_weight)
+-		seq_printf(sf, "%s %u\n", dname, iocg->cfg_weight / WEIGHT_ONE);
++		seq_printf(sf, "%s %lu\n", dname, iocg->cfg_weight / WEIGHT_ONE);
+ 	return 0;
+ }
+ 
+@@ -3042,7 +3042,7 @@
+ 	struct blkcg *blkcg = css_to_blkcg(seq_css(sf));
+ 	struct ioc_cgrp *iocc = blkcg_to_iocc(blkcg);
+ 
+-	seq_printf(sf, "default %u\n", iocc->dfl_weight / WEIGHT_ONE);
++	seq_printf(sf, "default %lu\n", iocc->dfl_weight / WEIGHT_ONE);
+ 	blkcg_print_blkgs(sf, blkcg, ioc_weight_prfill,
+ 			  &blkcg_policy_iocost, seq_cft(sf)->private, false);
+ 	return 0;
+	
+--- tg3.c	2025-12-21 23:37:51.919202453 +0000
++++ /home/claude/tg3-full.c	2025-12-21 23:35:44.250514315 +0000
+@@ -998,7 +998,7 @@
+ 
+ 	tw32(TG3PCI_MISC_HOST_CTRL,
+ 	     (tp->misc_host_ctrl | MISC_HOST_CTRL_MASK_PCI_INT));
+-	for (i = 0; i < tp->irq_max; i++)
++	for (i = 0; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++)
+ 		tw32_mailbox_f(tp->napi[i].int_mbox, 0x00000001);
+ }
+ 
+@@ -8600,7 +8600,7 @@
+ {
+ 	int i;
+ 
+-	for (i = 0; i < tp->irq_max; i++) {
++	for (i = 0; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++) {
+ 		struct tg3_napi *tnapi = &tp->napi[i];
+ 
+ 		if (tnapi->tx_ring) {
+@@ -8651,7 +8651,7 @@
+ {
+ 	int i;
+ 
+-	for (i = 0; i < tp->irq_max; i++) {
++	for (i = 0; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++) {
+ 		struct tg3_napi *tnapi = &tp->napi[i];
+ 
+ 		tg3_rx_prodring_fini(tp, &tnapi->prodring);
+@@ -9528,7 +9528,7 @@
+ 	if (tg3_flag(tp, ENABLE_TSS))
+ 		i++;
+ 
+-	for (; i < tp->irq_max; i++, txrcb += TG3_BDINFO_SIZE) {
++	for (; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++, txrcb += TG3_BDINFO_SIZE) {
+ 		struct tg3_napi *tnapi = &tp->napi[i];
+ 
+ 		if (!tnapi->tx_ring)
+@@ -9572,7 +9572,7 @@
+ 	if (tg3_flag(tp, ENABLE_RSS))
+ 		i++;
+ 
+-	for (; i < tp->irq_max; i++, rxrcb += TG3_BDINFO_SIZE) {
++	for (; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++, rxrcb += TG3_BDINFO_SIZE) {
+ 		struct tg3_napi *tnapi = &tp->napi[i];
+ 
+ 		if (!tnapi->rx_rcb)
+@@ -9603,7 +9603,7 @@
+ 
+ 	/* Zero mailbox registers. */
+ 	if (tg3_flag(tp, SUPPORT_MSIX)) {
+-		for (i = 1; i < tp->irq_max; i++) {
++		for (i = 1; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++) {
+ 			tp->napi[i].tx_prod = 0;
+ 			tp->napi[i].tx_cons = 0;
+ 			if (tg3_flag(tp, ENABLE_TSS))
+@@ -11462,7 +11462,7 @@
+ 
+ 	tp->irq_cnt = tg3_irq_count(tp);
+ 
+-	for (i = 0; i < tp->irq_max; i++) {
++	for (i = 0; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++) {
+ 		msix_ent[i].entry  = i;
+ 		msix_ent[i].vector = 0;
+ 	}
+@@ -11479,7 +11479,7 @@
+ 			tp->txq_cnt = min(tp->rxq_cnt, tp->txq_max);
+ 	}
+ 
+-	for (i = 0; i < tp->irq_max; i++)
++	for (i = 0; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++)
+ 		tp->napi[i].irq_vec = msix_ent[i].vector;
+ 
+ 	if (netif_set_real_num_rx_queues(tp->dev, tp->rxq_cnt)) {
+@@ -12448,7 +12448,7 @@
+ 	if (tg3_flag(tp, JUMBO_RING_ENABLE))
+ 		tp->rx_jumbo_pending = ering->rx_jumbo_pending;
+ 
+-	for (i = 0; i < tp->irq_max; i++)
++	for (i = 0; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++)
+ 		tp->napi[i].tx_pending = ering->tx_pending;
+ 
+ 	if (netif_running(dev)) {
+@@ -17791,7 +17791,7 @@
+ 	intmbx = MAILBOX_INTERRUPT_0 + TG3_64BIT_REG_LOW;
+ 	rcvmbx = MAILBOX_RCVRET_CON_IDX_0 + TG3_64BIT_REG_LOW;
+ 	sndmbx = MAILBOX_SNDHOST_PROD_IDX_0 + TG3_64BIT_REG_LOW;
+-	for (i = 0; i < tp->irq_max; i++) {
++	for (i = 0; i < tp->irq_max && i < TG3_IRQ_MAX_VECS; i++) {
+ 		struct tg3_napi *tnapi = &tp->napi[i];
+ 
+ 		tnapi->tp = tp;
+
