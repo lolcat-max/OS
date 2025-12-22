@@ -5,7 +5,7 @@
 # Builds a complete Linux system with Sway (Wayland compositor) and GUI apps
 ################################################################################
 set -e
-
+apt-get install tar gzip
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -197,7 +197,7 @@ create_rootfs() {
     mkdir -p "$ROOTFS_DIR"
     
     # Create minimal Debian system
-    debootstrap --arch=amd64 --variant=minbase bookworm "$ROOTFS_DIR" http://deb.debian.org/debian/
+	debootstrap --arch=amd64 --variant=minbase bookworm "$ROOTFS_DIR" https://ftp.au.debian.org/debian/
     
     print_status "Base system created"
     
