@@ -4,8 +4,6 @@
 # WSL CUSTOM LINUX BUILD WITH WAYLAND GUI
 # Builds a complete Linux system with Sway (Wayland compositor) and GUI apps
 ################################################################################
-sudo apt update && sudo apt install parted
-
 set -e
 
 # Colors
