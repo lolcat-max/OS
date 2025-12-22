@@ -56,7 +56,7 @@ initramfs_dir:
 	mkdir -p initramfs/{bin,sbin,etc,proc,sys,dev,usr/bin}
 
 initramfs_copy: initramfs_dir
-	cp $(GTK_APP) initramfs)/usr/bin/
+	cp $(GTK_APP) initramfs/usr/bin/
 	chmod +x initramfs/usr/bin/$(GTK_APP)
 	chmod +x initramfs/usr/bin/$(GTK_APP)
 
