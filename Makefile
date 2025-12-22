@@ -36,22 +36,15 @@ kernel:
 	$(WGET) $(KERNEL_URL)
 	$(TAR) -xf linux-$(KERNEL_VERSION).tar.xz
 	cd $(KERNEL_DIR) && \
-	sed -i 's/for (i = 0; i < tp->irq_max; i++)/for (i = 0; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++)/g' block/blk-iocost.c && \
-	sed -i 's/for (i = 1; i < tp->irq_max; i++)/for (i = 1; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++)/g' block/blk-iocost.c && \
-	sed -i 's/for (; i < tp->irq_max; i++,/for (; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++,/g' block/blk-iocost.c && \
-	sed -i 's/for (; i < tp->irq_max; i++)/for (; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++)/g' block/blk-iocost.c
-
-	# Fix drivers/net/ethernet/broadcom/tg3.c
+	sed -i 's/seq_printf(sf, "%s %u\\n", dname, iocg->cfg_weight \/ WEIGHT_ONE);/seq_printf(sf, "%s %lu\\n", dname, iocg->cfg_weight \/ WEIGHT_ONE);/g' block/blk-iocost.c && \
+	sed -i 's/seq_printf(sf, "default %u\\n", iocc->dfl_weight \/ WEIGHT_ONE);/seq_printf(sf, "default %lu\\n", iocc->dfl_weight \/ WEIGHT_ONE);/g' block/blk-iocost.c
+	
 	cd $(KERNEL_DIR) && \
-	cp drivers/net/ethernet/broadcom/tg3.c drivers/net/ethernet/broadcom/tg3.c.backup && \
 	sed -i 's/for (i = 0; i < tp->irq_max; i++)/for (i = 0; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++)/g' drivers/net/ethernet/broadcom/tg3.c && \
 	sed -i 's/for (i = 1; i < tp->irq_max; i++)/for (i = 1; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++)/g' drivers/net/ethernet/broadcom/tg3.c && \
 	sed -i 's/for (; i < tp->irq_max; i++,/for (; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++,/g' drivers/net/ethernet/broadcom/tg3.c && \
 	sed -i 's/for (; i < tp->irq_max; i++)/for (; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++)/g' drivers/net/ethernet/broadcom/tg3.c && \
 	sed -i 's/xt_TCPMSS/xt_tcpmss/g' net/netfilter/Makefile
-
-	@echo "Kernel patching complete. Now recompile with:"
-	@echo "  cd $(KERNEL_DIR) && make drivers/net/ethernet/broadcom/tg3.o"
 
 # Compile kernel
 kernel_compile:
