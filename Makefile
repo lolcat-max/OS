@@ -53,11 +53,11 @@ kernel_compile:
 
 # Create initramfs directory
 initramfs_dir:
-	mkdir -p $(INITRAMFS_DIR)/{bin,sbin,etc,proc,sys,dev}
+	mkdir -p $(INITRAMFS_DIR)/{bin,sbin,etc,proc,sys,dev,usr/bin}
 
-# Copy GTK application to initramfs
-initramfs_copy:
+initramfs_copy: initramfs_dir
 	cp $(GTK_APP) $(INITRAMFS_DIR)/usr/bin/
+	chmod +x $(INITRAMFS_DIR)/usr/bin/$(GTK_APP)
 	chmod +x $(INITRAMFS_DIR)/usr/bin/$(GTK_APP)
 
 # Create init script
