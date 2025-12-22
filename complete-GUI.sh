@@ -79,6 +79,7 @@ install_dependencies() {
         cpio \
         git \
         wget \
+		parted \
         syslinux \
         dosfstools \
         qemu-system-x86 \
