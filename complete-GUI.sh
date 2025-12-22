@@ -61,38 +61,35 @@ check_root() {
         exit 1
     fi
 }
-
 install_dependencies() {
     print_step 1 "Installing Build Dependencies"
     
     print_info "Updating package lists..."
     apt-get update -qq
     
-    print_info "Installing kernel build tools..."
+    print_info "Installing kernel build tools (minimal set)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
         build-essential \
-        libncurses-dev \
-        bison \
         flex \
+        bison \
+        libncurses-dev \
         libssl-dev \
         libelf-dev \
         bc \
+        dwarves \
+        pahole \
         cpio \
-        git \
+        rsync \
         wget \
-        syslinux \
-        dosfstools \
-        qemu-system-x86 \
-        debootstrap \
-        busybox-static \
-        rsync 2>&1 | grep -E "(Setting up|Unpacking)" || true
+        git \
+        busybox-static 2>&1 | grep -E "(Setting up|Unpacking)" || true
     
     print_status "Dependencies installed"
 }
 
 clone_kernel() {
     print_step 2 "Downloading Linux Kernel"
-    
+    rm -rf "$WORK_DIR"
     mkdir -p "$WORK_DIR"
     cd "$WORK_DIR"
     
@@ -442,7 +439,20 @@ create_disk_image() {
     cd "$BOOT_FILES_DIR"
     
     print_info "Creating 4GB disk image..."
-    dd if=/dev/zero of=linux-gui.img bs=1M count=4096 2>&1 | grep "copied" || true
+    dd if=/dev/zero of=linux-gui.img bs=1M count=4096 2>/dev/null
+    
+    # Install parted only for this step, then remove
+    if ! command -v parted >/dev/null 2>&1; then
+        print_info "Installing parted temporarily..."
+        apt-get install -y parted || true
+    fi
+    
+    print_info "Creating partition..."
+    parted -s linux-gui.img mklabel msdos
+    parted -s linux-gui.img mkpart primary ext4 1MiB 100%
+    
+    # Clean up parted after use
+    apt-get remove --purge -y parted -qq 2>/dev/null || true
     
     print_info "Creating partition..."
     parted -s linux-gui.img mklabel msdos
