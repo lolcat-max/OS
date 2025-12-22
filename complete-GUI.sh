@@ -61,29 +61,15 @@ check_root() {
 }
 install_dependencies() {
     print_step 1 "Installing Build Dependencies"
-    
-    print_info "Updating package lists..."
     apt-get update -qq
-    
-    print_info "Installing kernel build tools (minimal set)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        build-essential \
-        flex \
-        bison \
-        libncurses-dev \
-        libssl-dev \
-        libelf-dev \
-        bc \
-        dwarves \
-        pahole \
-        cpio \
-        rsync \
-        wget \
-        git \
-        busybox-static 2>&1 | grep -E "(Setting up|Unpacking)" || true
-    
+        build-essential flex bison libncurses-dev libssl-dev libelf-dev \
+        bc dwarves pahole cpio rsync wget git busybox-static \
+        mmdebstrap zstd binutils dpkg-dev qemu-system-x86
     print_status "Dependencies installed"
 }
+
+
 
 clone_kernel() {
     print_step 2 "Downloading Linux Kernel"
