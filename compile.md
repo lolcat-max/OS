@@ -64,6 +64,33 @@ echo ""
 echo "Checking for init at root:"
 gunzip -c initramfs.cpio.gz | cpio -t | grep "^init$" && echo "SUCCESS!" || echo "FAILED!"
 
-ls -lh initramfs.cpio.gz
+# Navigate to your project directory first
+cd ~/Desktop/OS-main  # or wherever your project is
+
+# Clean everything
+rm -rf initramfs initramfs.cpio.gz
+
+# Create directories one at a time
+mkdir initramfs
+mkdir initramfs/bin
+mkdir initramfs/dev
+mkdir initramfs/proc
+mkdir initramfs/sys
+mkdir initramfs/usr
+mkdir initramfs/usr/bin
+
+# Verify directories exist
+ls -la initramfs/
+ls -la initramfs/bin/
+
+# Find busybox
+which busybox
+
+# If that shows a path, copy it:
+cp $(which busybox) initramfs/bin/busybox
+chmod +x initramfs/bin/busybox
+
+# Verify it's there
+ls -la initramfs/bin/busybox
 
 make iso
