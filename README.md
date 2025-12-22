@@ -1,3 +1,3 @@
-a simple GUI interface OS with terminal windows.
+A Linux GUI interface OS with essential applications.
 
-command to compile, 'make'.
+Script works on WSL.
