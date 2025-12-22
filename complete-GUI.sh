@@ -468,7 +468,9 @@ create_disk_image() {
     mount "${LOOP_DEV}p1" /mnt/guiroot
     
     rsync -a "$ROOTFS_DIR/" /mnt/guiroot/
-    
+	
+    find "$ROOTFS_DIR" -type f ! -readable -exec chmod +r {} +
+	
     print_info "Installing bootloader..."
     # Copy kernel
     cp "$WORK_DIR/linux/arch/x86/boot/bzImage" /mnt/guiroot/boot/
