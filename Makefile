@@ -35,10 +35,6 @@ $(GTK_APP): $(GTK_APP).c
 kernel:
 	$(WGET) $(KERNEL_URL)
 	$(TAR) -xf linux-$(KERNEL_VERSION).tar.xz
-
-# Apply patch to kernel (direct sed fixes)
-kernel_patch:
-	# Fix block/blk-iocost.c
 	cd $(KERNEL_DIR) && \
 	sed -i 's/for (i = 0; i < tp->irq_max; i++)/for (i = 0; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++)/g' block/blk-iocost.c && \
 	sed -i 's/for (i = 1; i < tp->irq_max; i++)/for (i = 1; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++)/g' block/blk-iocost.c && \
@@ -113,6 +109,6 @@ clean:
 	rm -rf $(KERNEL_DIR) $(INITRAMFS_DIR) $(ISO_ROOT) $(INITRAMFS) $(ISO) $(GTK_APP)
 
 # Default target: build GTK app, patch, compile kernel, package ISO
-all: $(GTK_APP) kernel kernel_patch kernel_compile initramfs_dir initramfs_copy initramfs_init initramfs iso_dir iso_copy iso_grub iso
+all: $(GTK_APP) kernel kernel_compile initramfs_dir initramfs_copy initramfs_init initramfs iso_dir iso_copy iso_grub iso
 
-.PHONY: all $(GTK_APP) kernel kernel_patch kernel_compile initramfs_dir initramfs_copy initramfs_init initramfs iso_dir iso_copy iso_grub iso clean
+.PHONY: all $(GTK_APP) kernel kernel_compile initramfs_dir initramfs_copy initramfs_init initramfs iso_dir iso_copy iso_grub iso clean
