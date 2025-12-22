@@ -71,8 +71,8 @@ initramfs_init:
 	chmod +x $(INITRAMFS_DIR)/init
 
 # Create initramfs
-initramfs:
-	cd $(INITRAMFS_DIR) && find . | cpio -o -H newc | gzip > ../$(INITRAMFS)
+initramfs_dir:
+	mkdir -p $(INITRAMFS_DIR)/{bin,sbin,etc,proc,sys,dev,usr/bin}
 
 # Create ISO directory
 iso_dir:
