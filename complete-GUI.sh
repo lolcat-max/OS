@@ -187,27 +187,22 @@ build_kernel() {
         exit 1
     fi
 }
-
 create_rootfs() {
-    print_step 5 "Creating Root Filesystem with GUI"
-    
-    print_info "Creating Debian-based root filesystem..."
-    print_warning "This will download ~300MB of packages"
-    
+    print_step 5 "Creating Root Filesystem (Extractor: ar)"
     mkdir -p "$ROOTFS_DIR"
     
-    # Create minimal Debian system
-    debootstrap --arch=amd64 --variant=minbase bookworm --extractor=ar  "$ROOTFS_DIR" http://deb.debian.org/debian/
+    # 2. Run debootstrap with clean arguments
+
+	# Usage inside your create_rootfs function
+	mmdebstrap --architecture=amd64 \
+		--variant=minbase \
+		--include=sway,foot,firefox-esr,network-manager,sudo \
+		bookworm "$ROOTFS_DIR" http://deb.debian.org/debian/
     
-    print_status "Base system created"
-    
-    print_info "Installing GUI components..."
-    
-    # Mount necessary filesystems for chroot
+    # Mount necessary filesystems
     mount -t proc none "$ROOTFS_DIR/proc"
     mount -t sysfs none "$ROOTFS_DIR/sys"
     mount -o bind /dev "$ROOTFS_DIR/dev"
-    mount -t devpts none "$ROOTFS_DIR/dev/pts"
     
     # Install GUI packages in chroot
     cat > "$ROOTFS_DIR/install_gui.sh" << 'INSTALLSCRIPT'
