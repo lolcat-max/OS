@@ -1,8 +1,8 @@
 #!/bin/bash
 
 ################################################################################
-# COMPLETE AUTOMATED CUSTOM LINUX BUILD SCRIPT
-# One script to rule them all - fully automated from start to finish
+# COMPLETE AUTOMATED CUSTOM LINUX BUILD SCRIPT - VERBOSE VERSION
+# Shows real-time build output so you know what's happening
 ################################################################################
 
 set -e  # Exit on any error
@@ -24,20 +24,19 @@ WORK_DIR=${WORK_DIR:-$(pwd)/custom-linux-build}
 BOOT_FILES_DIR="/boot-files"
 AUTO_MODE=false
 SKIP_DEPS=false
-SKIP_TESTS=false
 
 ################################################################################
 # Helper Functions
 ################################################################################
 
 print_banner() {
+    clear
     echo -e "${CYAN}"
     cat << 'EOF'
 ╔═══════════════════════════════════════════════════════════════╗
 ║                                                               ║
 ║     CUSTOM LINUX KERNEL & BUSYBOX BUILD AUTOMATION          ║
-║                                                               ║
-║     Build a minimal Linux system from scratch                ║
+║              (VERBOSE MODE - Shows Progress)                 ║
 ║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 EOF
@@ -45,7 +44,11 @@ EOF
 }
 
 print_step() {
-    echo -e "\n${MAGENTA}▶ STEP $1${NC}: ${CYAN}$2${NC}\n"
+    echo ""
+    echo -e "${MAGENTA}════════════════════════════════════════════════════════${NC}"
+    echo -e "${MAGENTA}▶ STEP $1${NC}: ${CYAN}$2${NC}"
+    echo -e "${MAGENTA}════════════════════════════════════════════════════════${NC}"
+    echo ""
 }
 
 print_status() {
@@ -64,43 +67,10 @@ print_info() {
     echo -e "${BLUE}[ℹ]${NC} $1"
 }
 
-progress_bar() {
-    local duration=$1
-    local message=$2
-    local progress=0
-    local bar_length=50
-    
-    while [ $progress -le 100 ]; do
-        local filled=$((progress * bar_length / 100))
-        local empty=$((bar_length - filled))
-        printf "\r${BLUE}[ℹ]${NC} $message ["
-        printf "%${filled}s" | tr ' ' '='
-        printf "%${empty}s" | tr ' ' '-'
-        printf "] ${progress}%%"
-        progress=$((progress + 2))
-        sleep $(echo "$duration / 50" | bc -l)
-    done
-    echo ""
-}
-
-spinner() {
-    local pid=$1
-    local message=$2
-    local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-    local i=0
-    
-    while kill -0 $pid 2>/dev/null; do
-        i=$(( (i+1) %10 ))
-        printf "\r${BLUE}[${spin:$i:1}]${NC} $message"
-        sleep .1
-    done
-    printf "\r"
-}
-
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "This script must be run as root"
-        print_warning "Please run: sudo $0"
+        print_warning "Please run: sudo bash $0"
         exit 1
     fi
 }
@@ -109,7 +79,6 @@ detect_distro() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         DISTRO=$ID
-        DISTRO_VERSION=$VERSION_ID
         print_info "Detected: $NAME $VERSION_ID"
     else
         print_error "Cannot detect distribution"
@@ -126,12 +95,12 @@ check_disk_space() {
         exit 1
     fi
     
-    print_status "Disk space check: ${available_gb}GB available (${required_gb}GB required)"
+    print_status "Disk space: ${available_gb}GB available (need ${required_gb}GB)"
 }
 
 check_internet() {
     print_info "Checking internet connectivity..."
-    if ping -c 1 github.com >/dev/null 2>&1 || ping -c 1 google.com >/dev/null 2>&1; then
+    if ping -c 1 -W 2 github.com >/dev/null 2>&1 || ping -c 1 -W 2 google.com >/dev/null 2>&1; then
         print_status "Internet connection: OK"
         return 0
     else
@@ -141,23 +110,17 @@ check_internet() {
 }
 
 ################################################################################
-# STEP 1: System Preparation
+# Build Steps
 ################################################################################
 
 prepare_system() {
     print_step 1 "System Preparation"
-    
     check_root
     detect_distro
     check_disk_space
     check_internet
-    
     print_status "System preparation complete"
 }
-
-################################################################################
-# STEP 2: Install Dependencies
-################################################################################
 
 install_dependencies() {
     print_step 2 "Installing Dependencies"
@@ -169,34 +132,22 @@ install_dependencies() {
     
     case $DISTRO in
         debian|ubuntu)
-            print_info "Installing packages for Debian/Ubuntu..."
-            apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            print_info "Updating package lists..."
+            apt-get update
+            print_info "Installing build dependencies..."
+            DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 bzip2 git vim make gcc libncurses-dev flex bison \
-                bc cpio libelf-dev libssl-dev syslinux dosfstools \
-                nano wget curl > /dev/null 2>&1 &
-            spinner $! "Installing dependencies"
-            wait $!
+                bc cpio libelf-dev libssl-dev syslinux dosfstools nano wget curl
             ;;
         fedora|rhel|centos)
-            print_info "Installing packages for Fedora/RHEL..."
-            dnf install -y -q \
+            print_info "Installing dependencies..."
+            dnf install -y \
                 bzip2 git vim make gcc ncurses-devel flex bison \
                 bc cpio elfutils-libelf-devel openssl-devel \
-                syslinux dosfstools nano wget curl > /dev/null 2>&1 &
-            spinner $! "Installing dependencies"
-            wait $!
-            ;;
-        arch)
-            print_info "Installing packages for Arch Linux..."
-            pacman -Sy --noconfirm --quiet \
-                base-devel git vim bc cpio syslinux dosfstools > /dev/null 2>&1 &
-            spinner $! "Installing dependencies"
-            wait $!
+                syslinux dosfstools nano wget curl
             ;;
         *)
             print_error "Unsupported distribution: $DISTRO"
-            print_warning "Please install dependencies manually"
             exit 1
             ;;
     esac
@@ -204,42 +155,28 @@ install_dependencies() {
     print_status "Dependencies installed successfully"
 }
 
-################################################################################
-# STEP 3: Clone Repositories
-################################################################################
-
 clone_repositories() {
     print_step 3 "Cloning Source Repositories"
     
     mkdir -p "$WORK_DIR"
     cd "$WORK_DIR"
     
-    # Clone Linux kernel
     if [ -d "linux" ]; then
         print_warning "Linux kernel directory exists, skipping clone"
     else
-        print_info "Cloning Linux kernel (this may take a few minutes)..."
-        git clone --depth 1 https://github.com/torvalds/linux.git > /dev/null 2>&1 &
-        spinner $! "Cloning Linux kernel repository"
-        wait $!
+        print_info "Cloning Linux kernel (this may take 2-5 minutes)..."
+        git clone --depth 1 https://github.com/torvalds/linux.git
         print_status "Linux kernel cloned successfully"
     fi
     
-    # Clone Busybox
     if [ -d "busybox" ]; then
         print_warning "Busybox directory exists, skipping clone"
     else
         print_info "Cloning Busybox..."
-        git clone --depth 1 https://git.busybox.net/busybox > /dev/null 2>&1 &
-        spinner $! "Cloning Busybox repository"
-        wait $!
+        git clone --depth 1 https://git.busybox.net/busybox
         print_status "Busybox cloned successfully"
     fi
 }
-
-################################################################################
-# STEP 4: Configure Kernel (Automated)
-################################################################################
 
 configure_kernel() {
     print_step 4 "Configuring Linux Kernel"
@@ -247,91 +184,66 @@ configure_kernel() {
     cd "$WORK_DIR/linux"
     
     if [ -f .config ]; then
-        print_warning "Kernel configuration exists, using existing config"
+        print_warning "Using existing kernel configuration"
         return
     fi
     
-    print_info "Using default configuration with minimal settings..."
+    print_info "Creating default configuration..."
+    make defconfig
     
-    # Create a minimal config
-    make defconfig > /dev/null 2>&1
-    
-    # Enable essential options
+    print_info "Enabling essential options..."
     scripts/config --enable CONFIG_DEVTMPFS
     scripts/config --enable CONFIG_DEVTMPFS_MOUNT
     scripts/config --enable CONFIG_BLK_DEV_INITRD
-    scripts/config --enable CONFIG_RD_GZIP
-    scripts/config --enable CONFIG_RD_BZIP2
-    scripts/config --enable CONFIG_RD_LZMA
-    scripts/config --enable CONFIG_RD_XZ
-    scripts/config --enable CONFIG_RD_LZO
-    scripts/config --enable CONFIG_RD_LZ4
-    
-    # Disable unnecessary features for smaller kernel
     scripts/config --disable CONFIG_DEBUG_KERNEL
     scripts/config --disable CONFIG_DEBUG_INFO
     
     make olddefconfig > /dev/null 2>&1
     
-    print_status "Kernel configured with minimal settings"
+    print_status "Kernel configured successfully"
 }
-
-################################################################################
-# STEP 5: Build Kernel
-################################################################################
 
 build_kernel() {
     print_step 5 "Building Linux Kernel"
     
     cd "$WORK_DIR/linux"
     
-    if [ -f arch/x86/boot/bzImage ]; then
-        print_warning "Kernel image exists, rebuilding..."
-    fi
-    
-    print_info "Building kernel with $KERNEL_JOBS parallel jobs..."
-    print_warning "This will take 10-30 minutes depending on your system"
+    print_info "Starting kernel compilation with $KERNEL_JOBS parallel jobs..."
+    print_warning "This will take 10-30 minutes. You'll see compilation output below."
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
     
     local start_time=$(date +%s)
     
-    make -j "$KERNEL_JOBS" > /tmp/kernel-build.log 2>&1 &
-    local build_pid=$!
-    
-    spinner $build_pid "Compiling kernel ($(nproc) cores active)"
-    wait $build_pid
-    
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    local minutes=$((duration / 60))
-    local seconds=$((duration % 60))
-    
-    if [ -f arch/x86/boot/bzImage ]; then
+    # Show actual build output
+    if make -j "$KERNEL_JOBS" 2>&1 | tee /tmp/kernel-build.log | grep --line-buffered -E '(CC|LD|AR|HOSTCC|OBJCOPY)'; then
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        local minutes=$((duration / 60))
+        local seconds=$((duration % 60))
+        
+        echo ""
+        echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo ""
         print_status "Kernel built successfully in ${minutes}m ${seconds}s"
-        local size=$(du -h arch/x86/boot/bzImage | cut -f1)
-        print_info "Kernel size: $size"
+        
+        if [ -f arch/x86/boot/bzImage ]; then
+            local size=$(du -h arch/x86/boot/bzImage | cut -f1)
+            print_info "Kernel size: $size"
+        fi
     else
-        print_error "Kernel build failed"
-        print_error "Check log: /tmp/kernel-build.log"
+        print_error "Kernel build failed! Check /tmp/kernel-build.log"
         exit 1
     fi
 }
 
-################################################################################
-# STEP 6: Copy Kernel Image
-################################################################################
-
 copy_kernel() {
     print_step 6 "Copying Kernel Image"
-    
     mkdir -p "$BOOT_FILES_DIR"
     cp "$WORK_DIR/linux/arch/x86/boot/bzImage" "$BOOT_FILES_DIR/"
-    
-    print_status "Kernel image copied to $BOOT_FILES_DIR/bzImage"
+    print_status "Kernel copied to $BOOT_FILES_DIR/bzImage"
 }
-
-################################################################################
-# STEP 7: Configure Busybox (Automated)
-################################################################################
 
 configure_busybox() {
     print_step 7 "Configuring Busybox"
@@ -339,25 +251,20 @@ configure_busybox() {
     cd "$WORK_DIR/busybox"
     
     if [ -f .config ]; then
-        print_warning "Busybox configuration exists, using existing config"
+        print_warning "Using existing busybox configuration"
         return
     fi
     
-    print_info "Creating static busybox configuration..."
-    
+    print_info "Creating default configuration..."
     make defconfig > /dev/null 2>&1
     
-    # Enable static build
+    print_info "Enabling static build..."
     sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
     
     make oldconfig > /dev/null 2>&1
     
-    print_status "Busybox configured for static build"
+    print_status "Busybox configured successfully"
 }
-
-################################################################################
-# STEP 8: Build Busybox
-################################################################################
 
 build_busybox() {
     print_step 8 "Building Busybox"
@@ -365,109 +272,77 @@ build_busybox() {
     cd "$WORK_DIR/busybox"
     
     print_info "Building busybox with $BUSYBOX_JOBS parallel jobs..."
+    echo ""
     
     local start_time=$(date +%s)
     
-    make -j "$BUSYBOX_JOBS" > /tmp/busybox-build.log 2>&1 &
-    local build_pid=$!
-    
-    spinner $build_pid "Compiling busybox"
-    wait $build_pid
-    
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
-    if [ -f busybox ]; then
-        print_status "Busybox built successfully in ${duration}s"
-        local size=$(du -h busybox | cut -f1)
-        print_info "Busybox size: $size"
+    if make -j "$BUSYBOX_JOBS" 2>&1 | tee /tmp/busybox-build.log; then
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        
+        echo ""
+        print_status "Busybox built in ${duration}s"
+        
+        if [ -f busybox ]; then
+            local size=$(du -h busybox | cut -f1)
+            print_info "Busybox size: $size"
+        fi
     else
-        print_error "Busybox build failed"
-        print_error "Check log: /tmp/busybox-build.log"
+        print_error "Busybox build failed! Check /tmp/busybox-build.log"
         exit 1
     fi
 }
 
-################################################################################
-# STEP 9: Create Initramfs
-################################################################################
-
 create_initramfs() {
     print_step 9 "Creating Initial RAM Filesystem"
     
-    print_info "Installing busybox to initramfs..."
+    print_info "Installing busybox..."
     mkdir -p "$BOOT_FILES_DIR/initramfs"
-    
     cd "$WORK_DIR/busybox"
     make CONFIG_PREFIX="$BOOT_FILES_DIR/initramfs" install > /dev/null 2>&1
     
     cd "$BOOT_FILES_DIR/initramfs"
-    
-    # Remove linuxrc
     [ -f linuxrc ] && rm linuxrc
     
     print_info "Creating init script..."
     cat > init << 'INITSCRIPT'
 #!/bin/sh
 
-# Mount essential filesystems
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev
 
-# Create additional mount points
 mkdir -p /dev/pts /dev/shm /tmp /run
-
-# Mount additional filesystems
 mount -t devpts devpts /dev/pts
 mount -t tmpfs tmpfs /dev/shm
 mount -t tmpfs tmpfs /tmp
 mount -t tmpfs tmpfs /run
 
-# Set up hostname
 echo "custom-linux" > /proc/sys/kernel/hostname
 
-# Clear screen and show banner
 clear
 cat << 'EOF'
 
 ╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
 ║              Welcome to Custom Linux System                  ║
-║                                                               ║
-║              Built from scratch with love                    ║
-║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 
 EOF
 
-echo "System Information:"
-echo "  Kernel: $(uname -r)"
-echo "  Architecture: $(uname -m)"
-echo "  Hostname: $(hostname)"
-echo "  Memory: $(free -h | grep Mem | awk '{print $2}') total"
-echo ""
-echo "Available commands: Type 'busybox --list' to see all"
+echo "Kernel: $(uname -r)"
+echo "Memory: $(free -h | grep Mem | awk '{print $2}')"
 echo ""
 
-# Start shell
 exec /bin/sh
 INITSCRIPT
     
     chmod +x init
     
     print_info "Creating initramfs archive..."
-    find . | cpio -o -H newc 2>/dev/null | gzip > ../init.cpio.gz
-    
-    # Also create uncompressed version
-    find . | cpio -o -H newc > ../init.cpio 2>/dev/null
+    find . | cpio -o -H newc 2>/dev/null > ../init.cpio
     
     print_status "Initramfs created successfully"
 }
-
-################################################################################
-# STEP 10: Create Bootable Image
-################################################################################
 
 create_bootable_image() {
     print_step 10 "Creating Bootable Disk Image"
@@ -475,22 +350,19 @@ create_bootable_image() {
     cd "$BOOT_FILES_DIR"
     
     print_info "Creating ${BOOT_SIZE_MB}MB disk image..."
-    dd if=/dev/zero of=boot bs=1M count="$BOOT_SIZE_MB" 2>/dev/null
+    dd if=/dev/zero of=boot bs=1M count="$BOOT_SIZE_MB" 2>&1 | grep -E "(copied|MB)"
     
-    print_info "Formatting as FAT filesystem..."
-    mkfs.fat boot > /dev/null 2>&1
+    print_info "Formatting filesystem..."
+    mkfs.fat boot
     
-    print_info "Installing bootloader (syslinux)..."
+    print_info "Installing bootloader..."
     syslinux boot
     
-    print_info "Mounting disk image..."
+    print_info "Mounting and copying files..."
     mkdir -p m
     mount boot m
-    
-    print_info "Copying kernel and initramfs..."
     cp bzImage init.cpio m/
     
-    print_info "Creating bootloader configuration..."
     cat > m/syslinux.cfg << 'SYSLINUXCFG'
 DEFAULT linux
 PROMPT 0
@@ -501,322 +373,102 @@ LABEL linux
     APPEND initrd=init.cpio quiet
 SYSLINUXCFG
     
-    print_info "Unmounting disk image..."
     umount m
     rmdir m
     
-    local size=$(du -h boot | cut -f1)
-    print_status "Bootable image created: $BOOT_FILES_DIR/boot ($size)"
+    print_status "Boot image created successfully"
 }
-
-################################################################################
-# STEP 11: Generate Boot Scripts
-################################################################################
 
 generate_scripts() {
     print_step 11 "Generating Helper Scripts"
     
     cd "$BOOT_FILES_DIR"
     
-    # Test script
     cat > test-qemu.sh << 'TESTSCRIPT'
 #!/bin/bash
-
-echo "Testing Custom Linux with QEMU..."
-echo ""
-
 if ! command -v qemu-system-x86_64 &> /dev/null; then
     echo "ERROR: QEMU not installed"
-    echo "Install with: sudo apt-get install qemu-system-x86"
+    echo "Install: sudo apt-get install qemu-system-x86"
     exit 1
 fi
-
-echo "Starting VM with 512MB RAM..."
-echo "Press Ctrl+Alt+G to release mouse, then close window to exit"
-echo ""
-
-qemu-system-x86_64 \
-    -kernel /boot-files/bzImage \
-    -initrd /boot-files/init.cpio \
-    -m 512M \
-    -append "console=tty0"
+echo "Starting QEMU test..."
+qemu-system-x86_64 -kernel /boot-files/bzImage -initrd /boot-files/init.cpio -m 512M
 TESTSCRIPT
     
     chmod +x test-qemu.sh
-    
-    # Boot from image script
-    cat > test-boot-image.sh << 'BOOTSCRIPT'
-#!/bin/bash
-
-echo "Testing Boot Image with QEMU..."
-echo ""
-
-if ! command -v qemu-system-x86_64 &> /dev/null; then
-    echo "ERROR: QEMU not installed"
-    exit 1
-fi
-
-qemu-system-x86_64 \
-    -drive file=/boot-files/boot,format=raw \
-    -m 512M
-BOOTSCRIPT
-    
-    chmod +x test-boot-image.sh
-    
-    # USB writer script
-    cat > write-to-usb.sh << 'USBSCRIPT'
-#!/bin/bash
-
-if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root: sudo $0"
-    exit 1
-fi
-
-echo "WARNING: This will ERASE ALL DATA on the target device!"
-echo ""
-lsblk
-echo ""
-read -p "Enter device (e.g., /dev/sdb): " DEVICE
-
-if [ ! -b "$DEVICE" ]; then
-    echo "ERROR: $DEVICE is not a valid block device"
-    exit 1
-fi
-
-read -p "Are you ABSOLUTELY SURE you want to write to $DEVICE? (type 'yes'): " CONFIRM
-
-if [ "$CONFIRM" != "yes" ]; then
-    echo "Aborted"
-    exit 0
-fi
-
-echo "Writing to $DEVICE..."
-dd if=/boot-files/boot of=$DEVICE bs=4M status=progress
-sync
-
-echo "Done! You can now boot from $DEVICE"
-USBSCRIPT
-    
-    chmod +x write-to-usb.sh
-    
     print_status "Helper scripts created"
 }
-
-################################################################################
-# STEP 12: Run Tests
-################################################################################
-
-run_tests() {
-    print_step 12 "System Verification"
-    
-    if [ "$SKIP_TESTS" = true ]; then
-        print_warning "Skipping tests"
-        return
-    fi
-    
-    print_info "Verifying build outputs..."
-    
-    local all_good=true
-    
-    # Check kernel
-    if [ -f "$BOOT_FILES_DIR/bzImage" ]; then
-        print_status "Kernel image: OK"
-    else
-        print_error "Kernel image: MISSING"
-        all_good=false
-    fi
-    
-    # Check initramfs
-    if [ -f "$BOOT_FILES_DIR/init.cpio" ]; then
-        print_status "Initramfs: OK"
-    else
-        print_error "Initramfs: MISSING"
-        all_good=false
-    fi
-    
-    # Check boot image
-    if [ -f "$BOOT_FILES_DIR/boot" ]; then
-        print_status "Boot image: OK"
-    else
-        print_error "Boot image: MISSING"
-        all_good=false
-    fi
-    
-    # Check scripts
-    if [ -f "$BOOT_FILES_DIR/test-qemu.sh" ]; then
-        print_status "Test scripts: OK"
-    else
-        print_error "Test scripts: MISSING"
-        all_good=false
-    fi
-    
-    if [ "$all_good" = true ]; then
-        print_status "All verifications passed!"
-    else
-        print_error "Some verifications failed"
-        return 1
-    fi
-}
-
-################################################################################
-# Final Summary
-################################################################################
 
 show_summary() {
     echo ""
     echo -e "${GREEN}"
     cat << 'EOF'
 ╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
 ║              🎉 BUILD COMPLETED SUCCESSFULLY! 🎉             ║
-║                                                               ║
 ╚═══════════════════════════════════════════════════════════════╝
 EOF
     echo -e "${NC}"
     
-    echo -e "${CYAN}Build Summary:${NC}"
+    echo -e "${CYAN}Output Files:${NC}"
     echo ""
-    echo "  📁 Output Directory: $BOOT_FILES_DIR"
-    echo "  📁 Source Directory: $WORK_DIR"
-    echo ""
-    
     if [ -f "$BOOT_FILES_DIR/bzImage" ]; then
-        local kernel_size=$(du -h "$BOOT_FILES_DIR/bzImage" | cut -f1)
-        echo "  🐧 Kernel Image:     $BOOT_FILES_DIR/bzImage ($kernel_size)"
+        echo "  🐧 Kernel:    $(du -h "$BOOT_FILES_DIR/bzImage" | cut -f1) - $BOOT_FILES_DIR/bzImage"
     fi
-    
     if [ -f "$BOOT_FILES_DIR/init.cpio" ]; then
-        local initramfs_size=$(du -h "$BOOT_FILES_DIR/init.cpio" | cut -f1)
-        echo "  📦 Initramfs:        $BOOT_FILES_DIR/init.cpio ($initramfs_size)"
+        echo "  📦 Initramfs: $(du -h "$BOOT_FILES_DIR/init.cpio" | cut -f1) - $BOOT_FILES_DIR/init.cpio"
     fi
-    
     if [ -f "$BOOT_FILES_DIR/boot" ]; then
-        local boot_size=$(du -h "$BOOT_FILES_DIR/boot" | cut -f1)
-        echo "  💾 Boot Image:       $BOOT_FILES_DIR/boot ($boot_size)"
+        echo "  💾 Boot Image: $(du -h "$BOOT_FILES_DIR/boot" | cut -f1) - $BOOT_FILES_DIR/boot"
     fi
     
     echo ""
-    echo -e "${CYAN}Next Steps:${NC}"
-    echo ""
-    echo "  1. Test with QEMU:"
-    echo "     ${YELLOW}cd $BOOT_FILES_DIR && ./test-qemu.sh${NC}"
-    echo ""
-    echo "  2. Test boot image:"
-    echo "     ${YELLOW}cd $BOOT_FILES_DIR && ./test-boot-image.sh${NC}"
-    echo ""
-    echo "  3. Write to USB drive:"
-    echo "     ${YELLOW}cd $BOOT_FILES_DIR && sudo ./write-to-usb.sh${NC}"
-    echo ""
-    echo "  4. Customize init script:"
-    echo "     ${YELLOW}nano $BOOT_FILES_DIR/initramfs/init${NC}"
-    echo ""
-    echo -e "${GREEN}Happy Hacking! 🚀${NC}"
+    echo -e "${CYAN}Test Your Build:${NC}"
+    echo "  cd $BOOT_FILES_DIR && bash test-qemu.sh"
     echo ""
 }
-
-################################################################################
-# Usage and Main
-################################################################################
 
 show_usage() {
     cat << EOF
 Usage: $0 [OPTIONS]
 
-Build a complete custom Linux system from scratch automatically.
-
 Options:
-    --auto              Fully automatic mode (no interaction)
+    --auto              Fully automatic mode
     --skip-deps         Skip dependency installation
-    --skip-tests        Skip verification tests
-    --kernel-jobs N     Parallel jobs for kernel (default: $(nproc))
-    --busybox-jobs N    Parallel jobs for busybox (default: $(nproc))
-    --boot-size N       Boot image size in MB (default: 50)
-    --work-dir DIR      Working directory (default: ./custom-linux-build)
-    --help              Show this help
-
-Environment Variables:
-    KERNEL_JOBS         Same as --kernel-jobs
-    BUSYBOX_JOBS        Same as --busybox-jobs
-    BOOT_SIZE_MB        Same as --boot-size
-    WORK_DIR            Same as --work-dir
-
-Examples:
-    # Fully automatic build
-    sudo $0 --auto
-
-    # Use all CPU cores
-    sudo $0 --kernel-jobs \$(nproc)
-
-    # Custom directory and size
-    sudo $0 --work-dir /tmp/build --boot-size 100
+    --kernel-jobs N     Parallel jobs (default: $(nproc))
+    --boot-size N       Boot size in MB (default: 50)
+    --work-dir DIR      Working directory
+    --help              Show help
 
 EOF
 }
 
 main() {
-    # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --auto)
-                AUTO_MODE=true
-                shift
-                ;;
-            --skip-deps)
-                SKIP_DEPS=true
-                shift
-                ;;
-            --skip-tests)
-                SKIP_TESTS=true
-                shift
-                ;;
-            --kernel-jobs)
-                KERNEL_JOBS="$2"
-                shift 2
-                ;;
-            --busybox-jobs)
-                BUSYBOX_JOBS="$2"
-                shift 2
-                ;;
-            --boot-size)
-                BOOT_SIZE_MB="$2"
-                shift 2
-                ;;
-            --work-dir)
-                WORK_DIR="$2"
-                shift 2
-                ;;
-            --help)
-                show_usage
-                exit 0
-                ;;
-            *)
-                print_error "Unknown option: $1"
-                show_usage
-                exit 1
-                ;;
+            --auto) AUTO_MODE=true; shift ;;
+            --skip-deps) SKIP_DEPS=true; shift ;;
+            --kernel-jobs) KERNEL_JOBS="$2"; shift 2 ;;
+            --boot-size) BOOT_SIZE_MB="$2"; shift 2 ;;
+            --work-dir) WORK_DIR="$2"; shift 2 ;;
+            --help) show_usage; exit 0 ;;
+            *) echo "Unknown: $1"; show_usage; exit 1 ;;
         esac
     done
     
-    # Show banner
-    clear
     print_banner
     
     print_info "Configuration:"
-    echo "  Working Directory:  $WORK_DIR"
-    echo "  Output Directory:   $BOOT_FILES_DIR"
-    echo "  Kernel Jobs:        $KERNEL_JOBS"
-    echo "  Busybox Jobs:       $BUSYBOX_JOBS"
-    echo "  Boot Image Size:    ${BOOT_SIZE_MB}MB"
-    echo "  Auto Mode:          $AUTO_MODE"
+    echo "  Working Directory: $WORK_DIR"
+    echo "  Kernel Jobs: $KERNEL_JOBS"
+    echo "  Boot Size: ${BOOT_SIZE_MB}MB"
     echo ""
     
     if [ "$AUTO_MODE" = false ]; then
-        read -p "Press Enter to continue or Ctrl+C to cancel..."
+        read -p "Press Enter to start or Ctrl+C to cancel..."
     fi
     
     local total_start=$(date +%s)
     
-    # Execute build steps
     prepare_system
     install_dependencies
     clone_repositories
@@ -828,18 +480,14 @@ main() {
     create_initramfs
     create_bootable_image
     generate_scripts
-    run_tests
     
     local total_end=$(date +%s)
     local total_duration=$((total_end - total_start))
     local total_minutes=$((total_duration / 60))
     local total_seconds=$((total_duration % 60))
     
-    echo ""
-    print_info "Total build time: ${total_minutes}m ${total_seconds}s"
-    
+    print_info "Total time: ${total_minutes}m ${total_seconds}s"
     show_summary
 }
 
-# Run main function
 main "$@"
