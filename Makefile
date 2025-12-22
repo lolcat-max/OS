@@ -45,6 +45,7 @@ kernel:
 	sed -i 's/for (; i < tp->irq_max; i++,/for (; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++,/g' drivers/net/ethernet/broadcom/tg3.c && \
 	sed -i 's/for (; i < tp->irq_max; i++)/for (; i < tp->irq_max \&\& i < TG3_IRQ_MAX_VECS; i++)/g' drivers/net/ethernet/broadcom/tg3.c && \
 	sed -i 's/xt_TCPMSS/xt_tcpmss/g' net/netfilter/Makefile
+	find . | cpio -o -H newc | gzip > ../initramfs.cpio.gz
 
 # Compile kernel
 kernel_compile:
@@ -59,16 +60,15 @@ initramfs_copy: initramfs_dir
 	cp $(GTK_APP) initramfs/usr/bin/
 	chmod +x initramfs/usr/bin/$(GTK_APP)
 	chmod +x initramfs/usr/bin/$(GTK_APP)
-
-# Create init script
-initramfs_init:
-	echo '#!/bin/sh' > initramfs/init
-	echo 'mount -t proc proc /proc' >> initramfs/init
-	echo 'mount -t sysfs sysfs /sys' >> initramfs/init
-	echo 'mount -t devtmpfs devtmpfs /dev' >> initramfs/init
-	echo 'export GDK_BACKEND=fb' >> initramfs/init
-	echo 'exec /usr/bin/$(GTK_APP)' >> initramfs/init
-	chmod +x initramfs/init
+	
+initramfs_init: initramfs_dir
+	echo '#!/bin/sh' > $(INITRAMFS_DIR)/init
+	echo '/bin/busybox mount -t proc proc /proc' >> $(INITRAMFS_DIR)/init
+	echo '/bin/busybox mount -t sysfs sysfs /sys' >> $(INITRAMFS_DIR)/init
+	echo '/bin/busybox mount -t devtmpfs devtmpfs /dev' >> $(INITRAMFS_DIR)/init
+	echo 'export GDK_BACKEND=fb' >> $(INITRAMFS_DIR)/init
+	echo 'exec /usr/bin/$(GTK_APP)' >> $(INITRAMFS_DIR)/init
+	chmod +x $(INITRAMFS_DIR)/init
 
 # Create initramfs
 initramfs_dir:
@@ -93,6 +93,14 @@ iso_grub:
 	echo '  initrd /$(INITRAMFS)' >> $(ISO_ROOT)/boot/grub/$(GRUB_CFG)
 	echo '}' >> $(ISO_ROOT)/boot/grub/$(GRUB_CFG)
 
+BUSYBOX := $(shell command -v busybox 2>/dev/null)
+
+initramfs_busybox: initramfs_dir
+	@test -n "$(BUSYBOX)" || (echo "busybox not found. Install busybox/busybox-static."; exit 1)
+	cp "$(BUSYBOX)" $(INITRAMFS_DIR)/bin/busybox
+	chmod +x $(INITRAMFS_DIR)/bin/busybox
+	ln -sf busybox $(INITRAMFS_DIR)/bin/sh
+	ln -sf busybox $(INITRAMFS_DIR)/bin/mount
 # Create ISO
 iso:
 	$(GRUB_MKRESCUE) -o $(ISO) $(ISO_ROOT)
@@ -101,7 +109,5 @@ iso:
 clean:
 	rm -rf $(KERNEL_DIR) initramfs $(ISO_ROOT) $(INITRAMFS) $(ISO) $(GTK_APP)
 
-# Default target: build GTK app, patch, compile kernel, package ISO
-all: $(GTK_APP) kernel kernel_compile initramfs_dir initramfs_copy initramfs_init initramfs iso_dir iso_copy iso_grub iso
-
+all: $(GTK_APP) kernel kernel_compile initramfs_dir initramfs_busybox initramfs_copy initramfs_init initramfs iso_dir iso_copy iso_grub iso
 .PHONY: all $(GTK_APP) kernel kernel_compile initramfs_dir initramfs_copy initramfs_init initramfs iso_dir iso_copy iso_grub iso clean
