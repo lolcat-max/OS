@@ -21,10 +21,10 @@ KERNEL_JOBS=${KERNEL_JOBS:-$(nproc)}
 BUSYBOX_JOBS=${BUSYBOX_JOBS:-$(nproc)}
 BOOT_SIZE_MB=${BOOT_SIZE_MB:-500}  # Increased for GUI
 
-# Use Linux native paths
-WORK_DIR="/tmp/custom-linux-build"
-BOOT_FILES_DIR="/tmp/boot-files"
-ROOTFS_DIR="/tmp/custom-rootfs"
+# Use Linux native paths (avoid /tmp on Windows mount)
+WORK_DIR="$HOME/custom-linux-build"
+BOOT_FILES_DIR="$HOME/boot-files"
+ROOTFS_DIR="$HOME/custom-rootfs"
 
 print_banner() {
     clear
@@ -82,7 +82,9 @@ install_dependencies() {
         syslinux \
         dosfstools \
         qemu-system-x86 \
-        debootstrap 2>&1 | grep -E "(Setting up|Unpacking)" || true
+        debootstrap \
+        busybox-static \
+        rsync 2>&1 | grep -E "(Setting up|Unpacking)" || true
     
     print_status "Dependencies installed"
 }
@@ -402,20 +404,30 @@ INITSCRIPT
     # Copy necessary binaries
     mkdir -p "$BOOT_FILES_DIR/initramfs"/{bin,sbin,proc,sys,dev,newroot}
     
-    # Use busybox for utilities
-    print_info "Installing busybox in initramfs..."
-    
-    cd "$WORK_DIR"
-    if [ ! -d "busybox" ]; then
-        git clone --depth 1 https://git.busybox.net/busybox
+    # Use busybox-static package or static binary
+    print_info "Installing busybox-static in initramfs..."
+    if command -v busybox >/dev/null 2>&1; then
+        cp /bin/busybox "$BOOT_FILES_DIR/initramfs/bin/"
+    else
+        apt-get install -y busybox-static 2>/dev/null || true
+        cp /bin/busybox-static "$BOOT_FILES_DIR/initramfs/bin/busybox" 2>/dev/null || true
     fi
-    
-    cd busybox
-    make defconfig > /dev/null 2>&1
-    sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
-    make -j "$BUSYBOX_JOBS" > /dev/null 2>&1
-    make CONFIG_PREFIX="$BOOT_FILES_DIR/initramfs" install > /dev/null 2>&1
-    
+
+    # Fallback: Download static busybox binary
+    if [ ! -f "$BOOT_FILES_DIR/initramfs/bin/busybox" ]; then
+        print_warning "Downloading static busybox binary..."
+        wget -qO- https://busybox.net/downloads/binaries/1.36.1-x86_64-linux-musl/busybox \
+            > "$BOOT_FILES_DIR/initramfs/bin/busybox"
+        chmod +x "$BOOT_FILES_DIR/initramfs/bin/busybox"
+    fi
+
+    # Create all symlinks
+    cd "$BOOT_FILES_DIR/initramfs/bin"
+    ./busybox --install -s .
+
+    # Create /init symlink
+    ln -sf busybox "$BOOT_FILES_DIR/initramfs/init"
+
     # Create initramfs archive
     cd "$BOOT_FILES_DIR/initramfs"
     find . | cpio -o -H newc 2>/dev/null | gzip > ../initramfs.cpio.gz
@@ -505,7 +517,7 @@ echo "Starting in 3 seconds..."
 sleep 3
 
 qemu-system-x86_64 \
-    -drive file=/tmp/boot-files/linux-gui.img,format=raw \
+    -drive file=linux-gui.img,format=raw \
     -m 2048M \
     -smp 2 \
     -vga virtio \
@@ -513,7 +525,7 @@ qemu-system-x86_64 \
     -device virtio-tablet-pci \
     -enable-kvm 2>/dev/null || \
     qemu-system-x86_64 \
-        -drive file=/tmp/boot-files/linux-gui.img,format=raw \
+        -drive file=linux-gui.img,format=raw \
         -m 2048M \
         -smp 2 \
         -vga virtio \
@@ -534,7 +546,7 @@ FILES:
   test-gui.sh    - Launch in QEMU
   
 TO TEST:
-  cd /tmp/boot-files
+  cd $BOOT_FILES_DIR
   bash test-gui.sh
 
 LOGIN:
@@ -561,7 +573,7 @@ KEYBOARD SHORTCUTS:
   Super+Shift+E    - Exit
 
 TO COPY TO WINDOWS:
-  cp -r /tmp/boot-files /mnt/c/Users/YOUR_USERNAME/Desktop/
+  cp -r $BOOT_FILES_DIR /mnt/c/Users/YOUR_USERNAME/Desktop/
 
 TO BOOT ON REAL HARDWARE:
   dd if=linux-gui.img of=/dev/sdX bs=4M status=progress
