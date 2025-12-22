@@ -197,7 +197,7 @@ create_rootfs() {
     mkdir -p "$ROOTFS_DIR"
     
     # Create minimal Debian system
-	debootstrap --arch=amd64 --variant=minbase bookworm "$ROOTFS_DIR" https://ftp.au.debian.org/debian/
+    debootstrap --arch=amd64 --variant=minbase bookworm "$ROOTFS_DIR" http://deb.debian.org/debian/
     
     print_status "Base system created"
     
