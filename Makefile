@@ -53,26 +53,26 @@ kernel_compile:
 
 # Create initramfs directory
 initramfs_dir:
-	mkdir -p $(INITRAMFS_DIR)/{bin,sbin,etc,proc,sys,dev,usr/bin}
+	mkdir -p initramfs/{bin,sbin,etc,proc,sys,dev,usr/bin}
 
 initramfs_copy: initramfs_dir
-	cp $(GTK_APP) $(INITRAMFS_DIR)/usr/bin/
-	chmod +x $(INITRAMFS_DIR)/usr/bin/$(GTK_APP)
-	chmod +x $(INITRAMFS_DIR)/usr/bin/$(GTK_APP)
+	cp $(GTK_APP) initramfs)/usr/bin/
+	chmod +x initramfs/usr/bin/$(GTK_APP)
+	chmod +x initramfs/usr/bin/$(GTK_APP)
 
 # Create init script
 initramfs_init:
-	echo '#!/bin/sh' > $(INITRAMFS_DIR)/init
-	echo 'mount -t proc proc /proc' >> $(INITRAMFS_DIR)/init
-	echo 'mount -t sysfs sysfs /sys' >> $(INITRAMFS_DIR)/init
-	echo 'mount -t devtmpfs devtmpfs /dev' >> $(INITRAMFS_DIR)/init
-	echo 'export GDK_BACKEND=fb' >> $(INITRAMFS_DIR)/init
-	echo 'exec /usr/bin/$(GTK_APP)' >> $(INITRAMFS_DIR)/init
-	chmod +x $(INITRAMFS_DIR)/init
+	echo '#!/bin/sh' > initramfs/init
+	echo 'mount -t proc proc /proc' >> initramfs/init
+	echo 'mount -t sysfs sysfs /sys' >> initramfs/init
+	echo 'mount -t devtmpfs devtmpfs /dev' >> initramfs/init
+	echo 'export GDK_BACKEND=fb' >> initramfs/init
+	echo 'exec /usr/bin/$(GTK_APP)' >> initramfs/init
+	chmod +x initramfs/init
 
 # Create initramfs
 initramfs_dir:
-	mkdir -p $(INITRAMFS_DIR)/{bin,sbin,etc,proc,sys,dev,usr/bin}
+	mkdir -p initramfs/{bin,sbin,etc,proc,sys,dev,usr/bin}
 
 # Create ISO directory
 iso_dir:
@@ -99,7 +99,7 @@ iso:
 
 # Clean up
 clean:
-	rm -rf $(KERNEL_DIR) $(INITRAMFS_DIR) $(ISO_ROOT) $(INITRAMFS) $(ISO) $(GTK_APP)
+	rm -rf $(KERNEL_DIR) initramfs $(ISO_ROOT) $(INITRAMFS) $(ISO) $(GTK_APP)
 
 # Default target: build GTK app, patch, compile kernel, package ISO
 all: $(GTK_APP) kernel kernel_compile initramfs_dir initramfs_copy initramfs_init initramfs iso_dir iso_copy iso_grub iso
