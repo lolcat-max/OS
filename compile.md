@@ -3,4 +3,3 @@ sudo apt-get install -y debootstrap ca-certificates gnupg xz-utils parted
 sudo apt-get install debian-archive-keyring
 sudo update-ca-certificates
 apt-get install -y dpkg-dev binutils zstd 
-# Usage inside your create_rootfs function mmdebstrap
