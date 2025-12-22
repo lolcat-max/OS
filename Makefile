@@ -51,7 +51,8 @@ kernel:
 kernel_compile:
 	cd $(KERNEL_DIR) && make defconfig
 	cd $(KERNEL_DIR) && make -j$(shell nproc) WERROR=0
-
+initramfs:
+	cd $(INITRAMFS_DIR) && find . | cpio -o -H newc | gzip > ../$(INITRAMFS)
 # Create initramfs directory
 initramfs_dir:
 	mkdir -p initramfs/{bin,sbin,etc,proc,sys,dev,usr/bin}
