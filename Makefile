@@ -63,12 +63,15 @@ initramfs_copy: initramfs_dir
 	chmod +x initramfs/usr/bin/$(GTK_APP)
 	
 initramfs_init: initramfs_dir
-	echo '#!/bin/sh' > $(INITRAMFS_DIR)/init
-	echo '/bin/busybox mount -t proc proc /proc' >> $(INITRAMFS_DIR)/init
-	echo '/bin/busybox mount -t sysfs sysfs /sys' >> $(INITRAMFS_DIR)/init
-	echo '/bin/busybox mount -t devtmpfs devtmpfs /dev' >> $(INITRAMFS_DIR)/init
+
+	#!/bin/sh
+
+	echo 'mount -t proc proc /proc' > $(INITRAMFS_DIR)/init
+	echo 'mount -t sysfs sysfs /sys' >> $(INITRAMFS_DIR)/init
+	echo 'mount -t devtmpfs devtmpfs /dev' >> $(INITRAMFS_DIR)/init
+	echo 'startx /usr/bin/gtk_app' >> $(INITRAMFS_DIR)/init
 	echo 'export GDK_BACKEND=fb' >> $(INITRAMFS_DIR)/init
-	echo 'exec /usr/bin/$(GTK_APP)' >> $(INITRAMFS_DIR)/init
+	echo 'exec /usr/bin/gtk_app' >> $(INITRAMFS_DIR)/init
 	chmod +x $(INITRAMFS_DIR)/init
 
 # Create initramfs
