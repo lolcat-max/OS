@@ -457,7 +457,7 @@ main() {
     build_kernel
     create_rootfs
     create_initramfs
-    create_disk_image
+    create_iso_image
     create_test_scripts
     print_status "Linux build with Wayland GUI completed successfully!"
 }
