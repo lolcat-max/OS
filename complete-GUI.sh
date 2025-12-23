@@ -221,8 +221,7 @@ apt-get install -y \
     slurp \
     imv \
     mpv \
-    htop \
-    neofetch
+    htop
 
 # Clean up
 apt-get clean
