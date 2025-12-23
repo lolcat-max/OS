@@ -9,7 +9,7 @@ set -euo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Initial minimal deps (in case they are missing)
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y tar gzip coreutils
+DEBIAN_FRONTEND=noninteractive apt-get install -y tar gzip coreutils xorriso
 
 # Colors
 RED='\033[0;31m'
@@ -364,58 +364,38 @@ INITSCRIPT
 
     print_status "Initramfs created"
 }
-
-create_disk_image() {
-    print_step 7 "Creating Bootable Disk Image"
+create_iso_image() {
+    print_step 7 "Creating UEFI bootable ISO"
 
     mkdir -p "$BOOT_FILES_DIR"
-    cd "$BOOT_FILES_DIR"
+    ISO_STAGING="$BOOT_FILES_DIR/iso-root"
+    ISO_OUTPUT="$BOOT_FILES_DIR/linux-gui-efi.iso"
 
-    print_info "Creating 4GB disk image..."
-    dd if=/dev/zero of=linux-gui.img bs=1M count=4096 status=none
+    rm -rf "$ISO_STAGING"
+    mkdir -p "$ISO_STAGING/EFI/boot" \
+             "$ISO_STAGING/boot/grub"
 
-    print_info "Creating partition..."
-    parted -s linux-gui.img mklabel msdos
-    parted -s linux-gui.img mkpart primary ext4 1MiB 100%
+    # Copy kernel and initramfs
+    cp "$WORK_DIR/linux/arch/x86/boot/bzImage" "$ISO_STAGING/boot/"
+    cp "$BOOT_FILES_DIR/initramfs.cpio.gz" "$ISO_STAGING/boot/"
 
-    print_info "Setting up loop device..."
-    LOOP_DEV=$(losetup -f --show linux-gui.img)
-    partprobe "$LOOP_DEV"
-
-    print_info "Formatting partition..."
-    mkfs.ext4 -F "${LOOP_DEV}p1" > /dev/null
-
-    print_info "Mounting and copying rootfs..."
-    mkdir -p /mnt/guiroot
-    mount "${LOOP_DEV}p1" /mnt/guiroot
-
-    rsync -a "$ROOTFS_DIR/" /mnt/guiroot/
-
-    find "$ROOTFS_DIR" -type f ! -readable -exec chmod +r {} + || true
-
-    print_info "Installing bootloader..."
-    mkdir -p /mnt/guiroot/boot
-    cp "$WORK_DIR/linux/arch/x86/boot/bzImage" /mnt/guiroot/boot/
-    cp "$BOOT_FILES_DIR/initramfs.cpio.gz" /mnt/guiroot/boot/
-
-    grub-install --target=i386-pc --boot-directory=/mnt/guiroot/boot "$LOOP_DEV"
-
-    cat > /mnt/guiroot/boot/grub/grub.cfg << 'GRUBCFG'
+    # Create minimal grub.cfg
+    cat > "$ISO_STAGING/boot/grub/grub.cfg" << 'GRUBCFG'
 set timeout=5
 set default=0
 
-menuentry "Custom Linux with Wayland GUI" {
-    linux /boot/bzImage root=/dev/sda1 rw quiet
+menuentry "Custom Linux with Wayland GUI (ISO)" {
+    linux /boot/bzImage root=/dev/ram0 rw quiet
     initrd /boot/initramfs.cpio.gz
 }
 GRUBCFG
 
-    sync
-    umount /mnt/guiroot
-    losetup -d "$LOOP_DEV"
+    # Create the ISO using grub-mkrescue (needs xorriso)
+    grub-mkrescue -o "$ISO_OUTPUT" "$ISO_STAGING"
 
-    print_status "Bootable disk image created: $BOOT_FILES_DIR/linux-gui.img"
+    print_status "Bootable ISO created: $ISO_OUTPUT"
 }
+
 
 create_test_scripts() {
     print_step 8 "Creating Test Scripts"
