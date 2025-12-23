@@ -379,6 +379,9 @@ create_iso_image() {
     cp "$WORK_DIR/linux/arch/x86/boot/bzImage" "$ISO_STAGING/boot/"
     cp "$BOOT_FILES_DIR/initramfs.cpio.gz" "$ISO_STAGING/boot/"
 
+
+    rsync -a "$ROOTFS_DIR/" "$ISO_STAGING/"
+    
     # Create minimal grub.cfg
     cat > "$ISO_STAGING/boot/grub/grub.cfg" << 'GRUBCFG'
 set timeout=5
