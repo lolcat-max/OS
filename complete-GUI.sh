@@ -5,7 +5,7 @@
 # Builds a complete Linux system with Sway (Wayland compositor) and GUI apps
 ################################################################################
 set -e
-apt-get install tar gzip
+apt-get install tar gzip coreutils
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
