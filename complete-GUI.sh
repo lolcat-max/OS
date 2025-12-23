@@ -231,7 +231,7 @@ echo "GUI components installed"
 INSTALLSCRIPT
     
     chmod +x "$ROOTFS_DIR/install_gui.sh"
-    chroot "$ROOTFS_DIR" /install_gui.sh
+    chroot "$ROOTFS_DIR"/install_gui.sh
     rm "$ROOTFS_DIR/install_gui.sh"
     
     print_status "GUI components installed"
