@@ -9,7 +9,7 @@ set -euo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # Initial minimal deps (in case they are missing)
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y tar gzip coreutils xorriso
+DEBIAN_FRONTEND=noninteractive apt-get install -y tar gzip coreutils
 
 # Colors
 RED='\033[0;31m'
@@ -72,7 +72,7 @@ install_dependencies() {
         build-essential flex bison libncurses-dev libssl-dev libelf-dev \
         bc dwarves pahole cpio rsync wget git \
         busybox-static mmdebstrap zstd binutils dpkg-dev \
-        qemu-system-x86 parted grub-pc-bin
+        qemu-system-x86 parted grub-pc-bin xorriso mtools
     print_status "Dependencies installed"
 }
 
