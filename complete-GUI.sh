@@ -155,29 +155,30 @@ cat <<'EOF' | sudo tee "$ISO_DIR/init" >/dev/null
 #!/bin/sh
 set -e
 
+# Create mount points FIRST
+mkdir -p /dev /proc /sys /run
+
 # Minimal early mounts
 mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 
 # Our Debian tree is embedded in the initramfs under /rootfs
-# Make it the real root via bind mount to preserve metadata
 mkdir -p /newroot
 mount --bind /rootfs /newroot
 
 # Prepare required mount points for systemd
 mkdir -p /newroot/{dev,proc,sys,run}
+
 mount --move /dev  /newroot/dev
 mount --move /proc /newroot/proc
 mount --move /sys  /newroot/sys
 
-# systemd expects /run to be a tmpfs
+# systemd expects /run to be tmpfs
 mount -t tmpfs tmpfs /newroot/run
 
-# Optional: make boot logs visible
 echo "initramfs: switching to real root..." > /newroot/dev/kmsg 2>/dev/null || true
 
-# Hand off to systemd
 exec switch_root /newroot /sbin/init
 EOF
 sudo chmod +x "$ISO_DIR/init"
