@@ -49,7 +49,7 @@ sudo mmdebstrap --architecture=amd64 --variant=minbase \
     bookworm "$ROOTFS_DIR" http://deb.debian.org/debian/
 
 # Configure User and Autologin
-sudo chroot "$ROOTFS_DIR" useradd -m -s /bin/bash -G video,render,seat user
+sudo chroot "$ROOTFS_DIR" useradd -m -s /bin/bash -G video,render,user
 echo "user:password" | sudo chroot "$ROOTFS_DIR" chpasswd
 
 # Setup Systemd Autologin on TTY1
