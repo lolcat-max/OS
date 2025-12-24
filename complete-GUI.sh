@@ -1,15 +1,9 @@
 #!/bin/bash
 ################################################################################
-# MINIMAL WAYLAND LIVE ISO (systemd + sway) — FIXED (initramfs shell + virtio + modules)
+# MINIMAL WAYLAND LIVE ISO - PROPER APPROACH WITH SQUASHFS
 #
-# Fixes common kernel panics:
-#   - /init has #!/bin/sh but initramfs had no /bin/sh  -> panic
-#   - virtio-gpu needs virtio core config               -> early crash/panic
-#   - modprobe needs modules present                    -> failures later
-#
-# Notes:
-# - This builds a Debian bookworm rootfs, bundles it *inside* initramfs under /rootfs,
-#   then bind-mounts it as /newroot and switch_root into systemd.
+# This version uses squashfs for the rootfs (like real live CDs do)
+# instead of embedding everything in initramfs which causes OOM
 ################################################################################
 set -euo pipefail
 
@@ -27,11 +21,11 @@ sudo rm -rf "$WORK_DIR" "$ROOTFS_DIR" "$ISO_DIR" "$ISO_OUT"
 sudo apt-get update
 sudo apt-get install -y \
   build-essential flex bison libncurses-dev libssl-dev bc dwarves pahole \
-  git rsync cpio xorriso grub-pc-bin mtools \
+  git rsync cpio xorriso grub-pc-bin mtools squashfs-tools \
   mmdebstrap busybox-static kmod coreutils
 
 ###############################################################################
-# 2) Kernel (DRM + Virtio + Initramfs support)
+# 2) Kernel (DRM + Virtio + Initramfs + SquashFS support)
 ###############################################################################
 mkdir -p "$WORK_DIR"
 cd "$WORK_DIR"
@@ -66,9 +60,18 @@ make defconfig
 ./scripts/config --enable CONFIG_FB
 ./scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
 
+# SquashFS support (CRITICAL for live CD)
+./scripts/config --enable CONFIG_SQUASHFS
+./scripts/config --enable CONFIG_SQUASHFS_XZ
+./scripts/config --enable CONFIG_SQUASHFS_ZLIB
+
+# ISO9660 / loop device support
+./scripts/config --enable CONFIG_ISO9660_FS
+./scripts/config --enable CONFIG_JOLIET
+./scripts/config --enable CONFIG_BLK_DEV_LOOP
+
 make olddefconfig
 make -j"$JOBS" bzImage modules
-
 
 ###############################################################################
 # 3) Root filesystem (Wayland + Sway)
@@ -86,7 +89,7 @@ kmod coreutils bash \
 " \
   bookworm "$ROOTFS_DIR"
 
-# Install kernel modules into the rootfs so modprobe works later (CRITICAL)
+# Install kernel modules into the rootfs
 sudo make modules_install -C "$WORK_DIR/linux" INSTALL_MOD_PATH="$ROOTFS_DIR"
 
 ###############################################################################
@@ -124,109 +127,146 @@ EOF
 sudo chroot "$ROOTFS_DIR" chown user:user /home/user/.bash_profile
 
 ###############################################################################
-# 6) ISO staging + initramfs (with a real /bin/sh in initramfs root)
+# 6) Create SquashFS image (compressed rootfs)
 ###############################################################################
-mkdir -p "$ISO_DIR"/{boot,rootfs}
-cp "$WORK_DIR/linux/arch/x86/boot/bzImage" "$ISO_DIR/boot/vmlinuz"
-sudo rsync -a "$ROOTFS_DIR/" "$ISO_DIR/rootfs/"
-sudo apt-get install -y busybox-static
-BUSYBOX_HOST=$(command -v busybox)
+mkdir -p "$ISO_DIR/live"
+echo "=== Creating SquashFS image (this may take a few minutes) ==="
+sudo mksquashfs "$ROOTFS_DIR" "$ISO_DIR/live/filesystem.squashfs" -comp xz -b 1M
+echo "=== SquashFS created ==="
+ls -lh "$ISO_DIR/live/filesystem.squashfs"
 
-# Put static BusyBox in initramfs root and provide /bin/sh so /init can run
-BUSYBOX_HOST="$(command -v busybox || true)"
-if [ -z "$BUSYBOX_HOST" ]; then
-  # busybox-static typically installs /bin/busybox
-  BUSYBOX_HOST="/bin/busybox"
-fi
+###############################################################################
+# 7) Create minimal initramfs
+###############################################################################
+# Create boot directory first
+mkdir -p "$ISO_DIR/boot"
 
-# For initramfs /bin/sh etc.
-sudo cp "$BUSYBOX_HOST" "$ISO_DIR/busybox"
-sudo chmod +x "$ISO_DIR/busybox"
-sudo mkdir -p "$ISO_DIR/bin" "$ISO_DIR/sbin"
-sudo ln -sf /busybox "$ISO_DIR/bin/sh"
-sudo ln -sf /busybox "$ISO_DIR/sbin/switch_root"
+INITRAMFS_DIR=$(mktemp -d)
+cd "$INITRAMFS_DIR"
 
-# For embedded rootfs: make sure /bin/busybox exists there too
-sudo mkdir -p "$ROOTFS_DIR/bin"
-sudo cp "$BUSYBOX_HOST" "$ROOTFS_DIR/bin/busybox"
-sudo chmod +x "$ROOTFS_DIR/bin/busybox"
+# Get busybox
+BUSYBOX_HOST="$(command -v busybox || echo /bin/busybox)"
+cp "$BUSYBOX_HOST" busybox
+chmod +x busybox
 
-# The kernel executes /init; the shebang needs /bin/sh in the initramfs
-sudo ln -sf /busybox "$ISO_DIR/bin/sh"
-# Ensure these work even before we switch_root (busybox applets)
-sudo ln -sf /busybox "$ISO_DIR/bin/mount"
-sudo ln -sf /busybox "$ISO_DIR/bin/mkdir"
-sudo ln -sf /busybox "$ISO_DIR/bin/cp"
-sudo ln -sf /busybox "$ISO_DIR/bin/ln"
-sudo ln -sf /busybox "$ISO_DIR/sbin/switch_root"
+# Create directory structure
+mkdir -p bin sbin dev proc sys mnt/root newroot
 
-# Init script: use /rootfs directly as the new root
-cat <<'EOF' | sudo tee "$ISO_DIR/init" >/dev/null
+# Create symlinks for busybox applets
+ln -s /busybox bin/sh
+ln -s /busybox bin/mount
+ln -s /busybox bin/mkdir
+ln -s /busybox bin/sleep
+ln -s /busybox bin/ls
+ln -s /busybox bin/cat
+ln -s /busybox sbin/switch_root
+
+# Create init script
+cat <<'INIT_EOF' > init
 #!/bin/sh
+# Minimal init for live CD
 
-# Mount essential filesystems
+# Create and mount essential filesystems
+mkdir -p /dev /proc /sys /mnt/cdrom /mnt/squash /mnt/root
+
+mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
 
-# Prepare rootfs
-cd /rootfs
-mkdir -p dev proc sys run tmp
+echo "Scanning for CD-ROM..."
+sleep 2
 
-# Mount filesystems in new root
-mount -t proc proc proc
-mount -t sysfs sysfs sys
-mount -t devtmpfs devtmpfs dev
-mount -t tmpfs tmpfs run
-mount -t tmpfs tmpfs tmp
+# Find and mount the CD-ROM
+for dev in /dev/sr0 /dev/cdrom /dev/scd0; do
+    if [ -b "$dev" ]; then
+        echo "Trying to mount $dev..."
+        if mount -t iso9660 -o ro "$dev" /mnt/cdrom 2>/dev/null; then
+            echo "Mounted CD-ROM from $dev"
+            break
+        fi
+    fi
+done
 
-# Verify init exists
-if [ ! -x /rootfs/sbin/init ]; then
-    echo "FATAL: /rootfs/sbin/init not found!"
+# Check if we found the squashfs
+if [ ! -f /mnt/cdrom/live/filesystem.squashfs ]; then
+    echo "ERROR: Could not find filesystem.squashfs on CD-ROM"
+    echo "Dropping to shell for debugging..."
     exec /bin/sh
 fi
 
-# Clean old root (required for switch_root)
-# Note: we must be outside of old root
-cd /rootfs
-for i in /bin /sbin /busybox /init /lib /lib64 /usr /etc; do
-    [ -e "$i" ] && rm -rf "$i" 2>/dev/null || true
+# Mount the squashfs
+echo "Mounting squashfs filesystem..."
+mount -t squashfs -o loop,ro /mnt/cdrom/live/filesystem.squashfs /mnt/squash
+
+# Copy to tmpfs root (overlay would be better but more complex)
+echo "Setting up root filesystem..."
+mount -t tmpfs tmpfs /mnt/root
+mkdir -p /mnt/root/{dev,proc,sys,run,tmp}
+
+# Copy essential directories from squashfs
+for dir in bin sbin lib lib64 usr etc opt var home root; do
+    if [ -d "/mnt/squash/$dir" ]; then
+        cp -a "/mnt/squash/$dir" /mnt/root/ 2>/dev/null || true
+    fi
 done
 
-# Use chroot + exec as an alternative to switch_root
-exec chroot . /sbin/init
-EOF
-sudo chmod +x "$ISO_DIR/init"
+# Prepare new root
+mount -t proc proc /mnt/root/proc
+mount -t sysfs sysfs /mnt/root/sys
+mount -t devtmpfs devtmpfs /mnt/root/dev
+mount -t tmpfs tmpfs /mnt/root/run
+mount -t tmpfs tmpfs /mnt/root/tmp
 
-# Build initrd
-cd "$ISO_DIR"
-sudo find . -path ./boot -prune -o -print | cpio -o -H newc | gzip > boot/initrd.img
+echo "Switching to new root..."
+exec switch_root /mnt/root /sbin/init
+
+# Should never reach here
+echo "ERROR: switch_root failed"
+exec /bin/sh
+INIT_EOF
+
+chmod +x init
+
+# Build initramfs
+echo "=== Building initramfs ==="
+find . | cpio -o -H newc | gzip > "$ISO_DIR/boot/initrd.img"
+cd /
+rm -rf "$INITRAMFS_DIR"
+
+echo "=== Initramfs created ==="
+ls -lh "$ISO_DIR/boot/initrd.img"
 
 ###############################################################################
-# 7) GRUB config (ISO only)
+# 8) Copy kernel
 ###############################################################################
-mkdir -p boot/grub
-cat <<'EOF' > boot/grub/grub.cfg
+mkdir -p "$ISO_DIR/boot"
+cp "$WORK_DIR/linux/arch/x86/boot/bzImage" "$ISO_DIR/boot/vmlinuz"
+
+###############################################################################
+# 9) GRUB config
+###############################################################################
+mkdir -p "$ISO_DIR/boot/grub"
+cat <<'EOF' > "$ISO_DIR/boot/grub/grub.cfg"
 set default=0
-set timeout=0
+set timeout=3
 
-menuentry "Sway Wayland" {
-  linux /boot/vmlinuz console=tty1 console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 loglevel=7 panic=30
+menuentry "Sway Wayland Live" {
+  linux /boot/vmlinuz console=tty1 console=ttyS0,115200 loglevel=7
   initrd /boot/initrd.img
 }
 EOF
 
 ###############################################################################
-# 8) Build ISO
+# 10) Build ISO
 ###############################################################################
+cd "$ISO_DIR"
 grub-mkrescue -o "$ISO_OUT" .
 
 echo
 echo "✓ ISO built: $ISO_OUT"
 echo
-echo "Boot with QEMU (serial enabled so you can SEE panics):"
+echo "ISO size:"
+ls -lh "$ISO_OUT"
 echo
-echo "qemu-system-x86_64 \\"
-echo "  -m 2G -cdrom \"$ISO_OUT\" -boot d \\"
-echo "  -enable-kvm -cpu host -smp 2 -vga virtio \\"
-echo "  -serial mon:stdio -no-reboot"
+echo "Boot with QEMU:"
+echo "qemu-system-x86_64 -m 2G -cdrom \"$ISO_OUT\" -boot d -enable-kvm -cpu host -smp 2 -vga virtio -serial mon:stdio"
