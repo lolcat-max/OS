@@ -1,7 +1,6 @@
 #!/bin/bash
 ################################################################################
-# CUSTOM LINUX BUILD WITH WAYLAND (SWAY) - FIXED VERSION
-# Resolves Kernel Panic (0x9), black screen, and enables GUI via proper initramfs
+# CUSTOM LINUX BUILD WITH WAYLAND (SWAY)
 ################################################################################
 
 set -euo pipefail
@@ -61,9 +60,7 @@ sudo mmdebstrap --architecture=amd64 --variant=minbase \
 
 # Create required groups and user
 echo "Configuring user and groups..."
-sudo chroot "$ROOTFS_DIR" groupadd -g 44 video
-sudo chroot "$ROOTFS_DIR" groupadd -g 109 render
-sudo chroot "$ROOTFS_DIR" groupadd -g 24 input
+
 sudo chroot "$ROOTFS_DIR" useradd -m -u 1000 -g users -s /bin/bash -G video,render,input user
 echo "user:password" | sudo chroot "$ROOTFS_DIR" chpasswd
 
