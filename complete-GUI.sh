@@ -36,6 +36,17 @@ make defconfig
 ./scripts/config --enable CONFIG_TMPFS
 ./scripts/config --enable CONFIG_TMPFS_POSIX_ACL
 ./scripts/config --enable CONFIG_BLK_DEV_INITRD
+# SCSI and Disk Support for VMware
+./scripts/config --enable CONFIG_SCSI
+./scripts/config --enable CONFIG_BLK_DEV_SD
+./scripts/config --enable CONFIG_SCSI_VMW_PVSCSI
+./scripts/config --enable CONFIG_VMWARE_PVSCSI
+./scripts/config --enable CONFIG_VMW_BALLOON
+./scripts/config --enable CONFIG_NVME_CORE
+./scripts/config --enable CONFIG_BLK_DEV_NVME
+
+# Intel/VMware Graphics support
+./scripts/config --enable CONFIG_DRM_VMWGFX
 
 make olddefconfig
 make -j"$KERNEL_JOBS" bzImage
@@ -82,9 +93,11 @@ cd "$ROOTFS_DIR"
 sudo find . | sudo cpio -o -H newc | gzip > "$ISO_DIR/boot/initrd.img"
 
 cat <<EOF > "$ISO_DIR/boot/grub/grub.cfg"
-set timeout=0
+set timeout=5
+set default=0
+
 menuentry "Custom Linux Wayland" {
-    linux /boot/vmlinuz quiet splash root=/dev/ram0 rw
+    linux /boot/vmlinuz quiet splash root=/dev/ram0 rw initrd=/boot/initrd.img
     initrd /boot/initrd.img
 }
 EOF
