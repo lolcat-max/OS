@@ -155,27 +155,24 @@ cat <<'EOF' | sudo tee "$ISO_DIR/init" >/dev/null
 #!/bin/sh
 set -e
 
-# Create early mount points
 mkdir -p /dev /proc /sys /run
-
-# Early mounts
 mount -t devtmpfs devtmpfs /dev
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 
-# Bind embedded rootfs
+# NEW ROOT MUST BE A REAL MOUNTPOINT
 mkdir -p /newroot
-mount --bind /rootfs /newroot
+mount -t tmpfs tmpfs /newroot
 
-# CRITICAL: create target dirs inside new root BEFORE move
+# Copy embedded Debian rootfs
+cp -a /rootfs/. /newroot/
+
+# Prepare mountpoints inside new root
 mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run
 
-# Move mounts into new root
 mount --move /dev  /newroot/dev
 mount --move /proc /newroot/proc
 mount --move /sys  /newroot/sys
-
-# systemd requires /run as tmpfs
 mount -t tmpfs tmpfs /newroot/run
 
 echo "initramfs: switching to real root" > /newroot/dev/kmsg 2>/dev/null || true
