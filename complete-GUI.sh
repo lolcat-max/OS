@@ -269,4 +269,4 @@ echo "ISO size:"
 ls -lh "$ISO_OUT"
 echo
 echo "Boot with QEMU:"
-echo "qemu-system-x86_64 -m 2G -cdrom \"$ISO_OUT\" -boot d -enable-kvm -cpu host -smp 2 -vga virtio -serial mon:stdio"
+echo "qemu-system-x86_64 -m 4G -cdrom \"$ISO_OUT\" -boot d -enable-kvm -cpu host -smp 2 -vga virtio -serial mon:stdio"
