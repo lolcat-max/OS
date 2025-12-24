@@ -62,11 +62,13 @@ make defconfig
 ./scripts/config --enable CONFIG_DRM_KMS_HELPER
 ./scripts/config --enable CONFIG_DRM_VIRTIO_GPU
 
-make olddefconfig
+./scripts/config --enable CONFIG_DRM_SIMPLEDRM
+./scripts/config --enable CONFIG_FB
+./scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
 
-# Build kernel + modules
-make -j"$JOBS" bzImage
-make -j"$JOBS" modules
+make olddefconfig
+make -j"$JOBS" bzImage modules
+
 
 ###############################################################################
 # 3) Root filesystem (Wayland + Sway)
