@@ -129,6 +129,8 @@ sudo chroot "$ROOTFS_DIR" chown user:user /home/user/.bash_profile
 mkdir -p "$ISO_DIR"/{boot,rootfs}
 cp "$WORK_DIR/linux/arch/x86/boot/bzImage" "$ISO_DIR/boot/vmlinuz"
 sudo rsync -a "$ROOTFS_DIR/" "$ISO_DIR/rootfs/"
+sudo apt-get install -y busybox-static
+BUSYBOX_HOST=$(command -v busybox)
 
 # Put static BusyBox in initramfs root and provide /bin/sh so /init can run
 BUSYBOX_HOST="$(command -v busybox || true)"
@@ -137,9 +139,17 @@ if [ -z "$BUSYBOX_HOST" ]; then
   BUSYBOX_HOST="/bin/busybox"
 fi
 
+# For initramfs /bin/sh etc.
 sudo cp "$BUSYBOX_HOST" "$ISO_DIR/busybox"
 sudo chmod +x "$ISO_DIR/busybox"
 sudo mkdir -p "$ISO_DIR/bin" "$ISO_DIR/sbin"
+sudo ln -sf /busybox "$ISO_DIR/bin/sh"
+sudo ln -sf /busybox "$ISO_DIR/sbin/switch_root"
+
+# For embedded rootfs: make sure /bin/busybox exists there too
+sudo mkdir -p "$ROOTFS_DIR/bin"
+sudo cp "$BUSYBOX_HOST" "$ROOTFS_DIR/bin/busybox"
+sudo chmod +x "$ROOTFS_DIR/bin/busybox"
 
 # The kernel executes /init; the shebang needs /bin/sh in the initramfs
 sudo ln -sf /busybox "$ISO_DIR/bin/sh"
@@ -150,40 +160,47 @@ sudo ln -sf /busybox "$ISO_DIR/bin/cp"
 sudo ln -sf /busybox "$ISO_DIR/bin/ln"
 sudo ln -sf /busybox "$ISO_DIR/sbin/switch_root"
 
-# Init script: bind-mount embedded /rootfs as /newroot, mount /run tmpfs, then switch_root
+# Init script: use /rootfs directly as the new root
 cat <<'EOF' | sudo tee "$ISO_DIR/init" >/dev/null
 #!/bin/sh
-set -e
 
-mkdir -p /dev /proc /sys /run
-mount -t devtmpfs devtmpfs /dev
+# Mount essential filesystems
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
 
-# NEW ROOT MUST BE A REAL MOUNTPOINT
-mkdir -p /newroot
-mount -t tmpfs tmpfs /newroot
+# Prepare rootfs
+cd /rootfs
+mkdir -p dev proc sys run tmp
 
-# Copy embedded Debian rootfs
-cp -a /rootfs/. /newroot/
+# Mount filesystems in new root
+mount -t proc proc proc
+mount -t sysfs sysfs sys
+mount -t devtmpfs devtmpfs dev
+mount -t tmpfs tmpfs run
+mount -t tmpfs tmpfs tmp
 
-# Prepare mountpoints inside new root
-mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run
+# Verify init exists
+if [ ! -x /rootfs/sbin/init ]; then
+    echo "FATAL: /rootfs/sbin/init not found!"
+    exec /bin/sh
+fi
 
-mount --move /dev  /newroot/dev
-mount --move /proc /newroot/proc
-mount --move /sys  /newroot/sys
-mount -t tmpfs tmpfs /newroot/run
+# Clean old root (required for switch_root)
+# Note: we must be outside of old root
+cd /rootfs
+for i in /bin /sbin /busybox /init /lib /lib64 /usr /etc; do
+    [ -e "$i" ] && rm -rf "$i" 2>/dev/null || true
+done
 
-echo "initramfs: switching to real root" > /newroot/dev/kmsg 2>/dev/null || true
-
-exec switch_root /newroot /sbin/init
+# Use chroot + exec as an alternative to switch_root
+exec chroot . /sbin/init
 EOF
 sudo chmod +x "$ISO_DIR/init"
 
 # Build initrd
 cd "$ISO_DIR"
-sudo find init busybox bin sbin rootfs | cpio -o -H newc | gzip > boot/initrd.img
+sudo find . -path ./boot -prune -o -print | cpio -o -H newc | gzip > boot/initrd.img
 
 ###############################################################################
 # 7) GRUB config (ISO only)
