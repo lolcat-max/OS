@@ -5726,7 +5726,7 @@ static void start_run_execution(int slot, int argc, const char* argv[], Window* 
     RunContext* ctx = &run_contexts[slot];
     ctx->vm.start_execution(ctx->prog, argc, argv, ctx->ahci_base, ctx->port, win);
     
-    // ← ADD THIS LINE:
+    // â† ADD THIS LINE:
     ctx->vm.bound_window = win;
     
     ctx->active = true;
@@ -5736,7 +5736,7 @@ static void start_exec_execution(int slot, int argc, const char* argv[], Window*
     ExecContext* ctx = &exec_contexts[slot];
     ctx->vm.start_execution(ctx->prog, argc, argv, 0, 0, win);
     
-    // ← ADD THIS LINE:
+    // â† ADD THIS LINE:
     ctx->vm.bound_window = win;
     
     ctx->active = true;
